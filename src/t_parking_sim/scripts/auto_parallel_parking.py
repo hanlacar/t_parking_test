@@ -308,7 +308,7 @@ class AutoParallelParking(Node):
             'footprint_clearance': 0.06,
             'minimum_reverse_length': 0.30,
             'maximum_cusps': 2,
-            'minimum_turning_radius': 0.946,
+            'minimum_turning_radius': 1.10,
             'curvature_tolerance_factor': 1.20,
             'occupied_threshold': 50,
             'exit_mode': 'forward',
@@ -1264,7 +1264,7 @@ class AutoParallelParking(Node):
 
         # Leg A: up the start corridor, heading +odom_x (odom yaw 0).  It
         # deliberately stops short of the lane line: the corner is a 90 deg
-        # turn and this vehicle needs 0.946 m of turning radius, so trying to
+        # turn and this vehicle needs 1.10 m of turning radius, so trying to
         # pivot at the lane line itself wedges it against the slot mouth.
         x = current[0] + hop
         while x < corner_entry_x - 0.5 * hop:
@@ -1926,7 +1926,7 @@ class AutoParallelParking(Node):
         # Measure curvature over a physical window rather than adjacent grid
         # samples: three nearly coincident Hybrid-A* poses amplify map-grid
         # quantization, and a Reeds-Shepp cusp has undefined curvature.  A
-        # 0.15 m window stays well inside the 0.946 m minimum turning radius.
+        # 0.15 m window stays well inside the 1.10 m minimum turning radius.
         max_curvature = 0.0
         poses = path.poses
         curvature_window = 0.15

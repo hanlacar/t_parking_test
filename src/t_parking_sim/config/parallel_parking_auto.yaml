@@ -72,7 +72,7 @@ parallel_parking_auto:
     staging_via_odom_y: 0.0
     staging_hop_distance: 3.0
     # The corner from the start corridor into the lane is a 90 deg turn and
-    # the vehicle needs 0.946 m of turning radius, so the corridor leg stops
+    # the vehicle needs 1.10 m of turning radius, so the corridor leg stops
     # at corner_entry_odom_x (world y = 9.50, already past the corridor wall
     # which ends at world y = 8.56) and the next waypoint is placed on the far
     # side of the corner, lined up with the lane.  Turning at the lane line
@@ -104,7 +104,7 @@ parallel_parking_auto:
     # back into it; that is what makes the entry a real parallel-parking
     # manoeuvre instead of a wide forward arc into an oversized bay.  The
     # lateral shift from the lane to the slot centre is about 1.5 m, which
-    # needs ~1.5 m of longitudinal run at the 0.946 m turning radius, so
+    # needs ~1.9 m of longitudinal run at the 1.10 m turning radius, so
     # these all leave comfortable margin.
     approach_offset_candidates: [1.80, 2.20, 2.60]
     # Gap kept between the vehicle's nose and the end of the slot it reversed
@@ -142,7 +142,9 @@ parallel_parking_auto:
     # Smac produced a snaking path, which pure pursuit stalls on
     # ("Failed to make progress"), so those are rejected rather than driven.
     maximum_cusps: 2
-    minimum_turning_radius: 0.946
+    # 28 deg steering: 0.58/tan(0.4887) = 1.091 m, rounded up for margin.
+    # Must stay equal to nav2_params.yaml's planner value.
+    minimum_turning_radius: 1.10
     curvature_tolerance_factor: 1.20
     occupied_threshold: 50
 

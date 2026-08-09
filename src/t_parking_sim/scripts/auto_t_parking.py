@@ -297,7 +297,7 @@ class AutoTParking(Node):
             'wheel_inside_confirm_count': 5,
             'wheel_check_period': 0.10,
             'stop_confirm_count': 3,
-            'minimum_turning_radius': 0.946,
+            'minimum_turning_radius': 1.10,
             'curvature_tolerance_factor': 1.20,
             'minimum_reverse_length': 0.30,
             'maximum_cusps': 2,
@@ -1967,7 +1967,7 @@ class AutoTParking(Node):
         # samples.  Three nearly coincident Hybrid-A* poses amplify map-grid
         # quantization, and a Reeds-Shepp cusp is a stop/direction change where
         # curvature is undefined.  A 0.15 m window on each side remains well
-        # below this vehicle's 0.946 m minimum turning radius while rejecting
+        # below this vehicle's 1.10 m minimum turning radius while rejecting
         # real over-curvature.
         max_curvature = 0.0
         poses = path.poses

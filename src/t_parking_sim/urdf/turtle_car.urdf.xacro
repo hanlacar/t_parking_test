@@ -11,7 +11,11 @@
   <xacro:property name="kingpin_width" value="0.32"/>
   <xacro:property name="wheel_radius" value="0.095"/>
   <xacro:property name="wheel_width" value="0.055"/>
-  <xacro:property name="steering_limit" value="0.55"/>
+  <!-- Real vehicle maximum steering angle: 28 deg.  The Ackermann plugin
+       and both steering joint limits read this one property, and nav2's
+       minimum_turning_radius must match wheel_base/tan(steering_limit)
+       = 0.58/tan(0.4887) = 1.091 m (configured as 1.10 for margin). -->
+  <xacro:property name="steering_limit" value="0.4887"/>
   <xacro:property name="steering_link_radius" value="0.020"/>
   <xacro:property name="steering_link_height" value="0.040"/>
   <!-- Ahead of the front tyre envelope (x=0.385), inside the x=0.450 bumper. -->

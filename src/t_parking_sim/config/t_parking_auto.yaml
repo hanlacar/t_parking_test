@@ -82,7 +82,9 @@ t_parking_auto:
     wheel_inside_confirm_count: 5
     wheel_check_period: 0.10
     stop_confirm_count: 3
-    minimum_turning_radius: 0.946
+    # 28 deg steering: 0.58/tan(0.4887) = 1.091 m, rounded up for margin.
+    # Must stay equal to nav2_params.yaml's planner value.
+    minimum_turning_radius: 1.10
     curvature_tolerance_factor: 1.20
     minimum_reverse_length: 0.30
     # Reject overlapping multi-switch paths that RPP can oscillate across.
