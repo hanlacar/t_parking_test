@@ -1,0 +1,317 @@
+controller_server:
+  ros__parameters:
+    use_sim_time: true
+    enable_stamped_cmd_vel: false
+    controller_frequency: 20.0
+    costmap_update_timeout: 0.50
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["goal_checker", "parking_goal_checker", "cusp_goal_checker"]
+    controller_plugins: ["FollowPath", "ParkingFollowPath"]
+    use_realtime_priority: false
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.10
+      movement_time_allowance: 15.0
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.15
+
+    parking_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true
+      xy_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.08
+
+    # Intermediate stop used only to separate overlapping forward / reverse
+    # runs.  Final parking still uses the strict parking_goal_checker above.
+    cusp_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.40
+
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.40
+      lookahead_dist: 0.35
+      min_lookahead_dist: 0.20
+      max_lookahead_dist: 0.50
+      lookahead_time: 1.5
+      rotate_to_heading_angular_vel: 0.45
+      transform_tolerance: 0.20
+      use_velocity_scaled_lookahead_dist: true
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.40
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.946
+      regulated_linear_scaling_min_speed: 0.08
+      cost_scaling_dist: 0.22
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 5.0
+      use_fixed_curvature_lookahead: false
+      use_rotate_to_heading: false
+      allow_reversing: true
+      max_angular_accel: 1.0
+      stateful: true
+
+    ParkingFollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.25
+      lookahead_dist: 0.25
+      min_lookahead_dist: 0.15
+      max_lookahead_dist: 0.35
+      lookahead_time: 1.0
+      rotate_to_heading_angular_vel: 0.45
+      transform_tolerance: 0.20
+      use_velocity_scaled_lookahead_dist: true
+      min_approach_linear_velocity: 0.08
+      approach_velocity_scaling_dist: 0.30
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.946
+      regulated_linear_scaling_min_speed: 0.12
+      cost_scaling_dist: 0.22
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 5.0
+      use_fixed_curvature_lookahead: true
+      curvature_lookahead_dist: 0.25
+      # Keep a virtual carrot beyond the final pose.  This lets an Ackermann
+      # vehicle converge laterally and in yaw instead of switching commands
+      # around the final path sample when it finishes slightly off-center.
+      interpolate_curvature_after_goal: true
+      use_rotate_to_heading: false
+      allow_reversing: true
+      max_angular_accel: 1.0
+      stateful: true
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: true
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_footprint
+      rolling_window: true
+      width: 4
+      height: 4
+      resolution: 0.05
+      footprint: "[[0.45, 0.225], [0.45, -0.225], [-0.45, -0.225], [-0.45, 0.225]]"
+      footprint_padding: 0.025
+      transform_tolerance: 0.30
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        # Deliberately the raw scans, not /scan_static: local obstacle
+        # avoidance must react to a person stepping out, and the rear lidar is
+        # what makes the reversing leg of the manoeuvre safe.
+        observation_sources: "front_scan rear_scan"
+        front_scan:
+          topic: /scan
+          data_type: "LaserScan"
+          clearing: true
+          marking: true
+          max_obstacle_height: 0.50
+          obstacle_min_range: 0.10
+          obstacle_max_range: 9.0
+          raytrace_min_range: 0.10
+          raytrace_max_range: 12.0
+        rear_scan:
+          topic: /scan_rear
+          data_type: "LaserScan"
+          clearing: true
+          marking: true
+          max_obstacle_height: 0.50
+          obstacle_min_range: 0.10
+          obstacle_max_range: 9.0
+          raytrace_min_range: 0.10
+          raytrace_max_range: 12.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # See the global costmap note: 0.55 m closed the slot mouth off.
+        inflation_radius: 0.25
+        cost_scaling_factor: 5.0
+
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: true
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: map
+      robot_base_frame: base_footprint
+      resolution: 0.05
+      track_unknown_space: true
+      footprint: "[[0.45, 0.225], [0.45, -0.225], [-0.45, -0.225], [-0.45, 0.225]]"
+      footprint_padding: 0.025
+      transform_tolerance: 0.30
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+        subscribe_to_updates: true
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        # Global planning sees only the dynamic-filtered scan: a pedestrian
+        # crossing the lane must not bend the whole global path.  The rear
+        # lidar is dropped here entirely -- it only matters for the reversing
+        # leg, which the local costmap covers.
+        observation_sources: "front_scan"
+        front_scan:
+          topic: /scan_static
+          data_type: "LaserScan"
+          clearing: true
+          marking: true
+          max_obstacle_height: 0.50
+          obstacle_min_range: 0.10
+          obstacle_max_range: 9.0
+          raytrace_min_range: 0.10
+          raytrace_max_range: 12.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # 0.55 m of inflation on both sides of a 1.5 m slot leaves a 0.4 m
+        # corridor, narrower than the 0.45 m vehicle width, so the planner had
+        # to bow around a gap it could not legally enter.
+        inflation_radius: 0.30
+        # Gentler cost gradient, so small costmap changes no longer shift the
+        # cheapest path sideways between replans.
+        cost_scaling_factor: 2.5
+
+      always_send_full_costmap: true
+
+planner_server:
+  ros__parameters:
+    use_sim_time: true
+    # Was 5.0: replanning five times a second returned a slightly different
+    # Reeds-Shepp solution on every tick, and the controller chasing those
+    # successive solutions is what showed up as a visibly wavy path.
+    expected_planner_frequency: 1.0
+    costmap_update_timeout: 1.0
+    planner_plugins: ["GridBased", "ForwardExit"]
+
+    GridBased:
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      tolerance: 0.15
+      downsample_costmap: false
+      downsampling_factor: 1
+      allow_unknown: false
+      max_iterations: -1
+      max_on_approach_iterations: 1000
+      max_planning_time: 5.0
+      motion_model_for_search: "REEDS_SHEPP"
+      angle_quantization_bins: 72
+      analytic_expansion_ratio: 3.5
+      # Was 3.0: the reversing turn from the lane into the slot is itself
+      # roughly 4-4.5 m long (lane heading to slot heading, plus the
+      # straight run into the bay). With the cap at 3.0 m, the search could
+      # only cover the final stretch with one smooth closed-form
+      # Reeds-Shepp curve; everything before that had to be stitched
+      # together from discrete angle_quantization_bins (5 deg) lattice
+      # primitives, and the seam between the two showed up as exactly the
+      # heading overshoot-then-correct wobble seen right at the slot mouth
+      # (logged vehicle yaw dips past -1.62 rad, springs back to -1.32,
+      # then settles to -1.69 rad over about 2 m, instead of moving
+      # monotonically to -1.571 rad). Raising the cap lets one analytic
+      # curve span the whole turn.
+      analytic_expansion_max_length: 6.0
+      analytic_expansion_max_cost: 200.0
+      analytic_expansion_max_cost_override: false
+      minimum_turning_radius: 0.946
+      reverse_penalty: 2.0
+      # Was 0.0: zero cost for an extra direction switch gave the search no
+      # reason to prefer a single continuous reverse curve over one with an
+      # extra forward/reverse correction, so it never avoided an available
+      # smoother candidate on cusp count alone. Comparable in magnitude to
+      # reverse_penalty/cost_penalty below so it discourages an unneeded
+      # cusp without blocking the one reverse switch a back-in manoeuvre
+      # actually needs.
+      change_penalty: 1.0
+      non_straight_penalty: 1.05
+      cost_penalty: 2.0
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: false
+      smooth_path: true
+      debug_visualizations: false
+
+    # Parking remains on GridBased / REEDS_SHEPP.  This separate planner is
+    # used only after the wheels-inside parking stop, so its Dubins search can
+    # never produce a reverse segment or a direction cusp.
+    ForwardExit:
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      tolerance: 0.10
+      downsample_costmap: false
+      downsampling_factor: 1
+      # The course-entrance area near the vehicle's spawn pose is
+      # self-occluded at the very start of the run and never re-observed
+      # afterwards, so it stays marked NO_INFORMATION (cost 255) in the
+      # costmap even though it is the open lane the vehicle already drove
+      # through. allow_unknown:false made every forward-right exit
+      # candidate reject with "no valid path found" purely because the
+      # goal sits in unexplored space, not because it is obstructed.
+      allow_unknown: true
+      max_iterations: -1
+      max_on_approach_iterations: 1000
+      max_planning_time: 5.0
+      motion_model_for_search: "DUBIN"
+      angle_quantization_bins: 72
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+      analytic_expansion_max_cost: 200.0
+      analytic_expansion_max_cost_override: false
+      minimum_turning_radius: 0.946
+      reverse_penalty: 2.0
+      # Was 0.0: zero cost for an extra direction switch gave the search no
+      # reason to prefer a single continuous reverse curve over one with an
+      # extra forward/reverse correction near the slot mouth, which is what
+      # produced the S-shaped entries. Comparable in magnitude to
+      # reverse_penalty/cost_penalty below so it discourages an unneeded
+      # cusp without blocking the one reverse switch a back-in manoeuvre
+      # actually needs.
+      change_penalty: 1.0
+      non_straight_penalty: 1.05
+      cost_penalty: 2.0
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: false
+      smooth_path: true
+      debug_visualizations: false
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: true
+    enable_stamped_cmd_vel: false
+    smoothing_frequency: 20.0
+    stamp_smoothed_velocity_with_smoothing_time: false
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.40, 0.0, 0.55]
+    min_velocity: [-0.30, 0.0, -0.55]
+    max_accel: [0.70, 0.0, 1.0]
+    max_decel: [-0.90, 0.0, -1.2]
+    odom_topic: /odom
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0

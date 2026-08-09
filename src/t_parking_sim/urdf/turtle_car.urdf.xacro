@@ -1,0 +1,263 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="turtle_car">
+  <!-- Vehicle dimensions (metres unless noted otherwise). -->
+  <xacro:property name="vehicle_length" value="0.90"/>
+  <xacro:property name="vehicle_width" value="0.45"/>
+  <xacro:property name="body_length" value="0.75"/>
+  <xacro:property name="body_width" value="0.38"/>
+  <xacro:property name="body_height" value="0.15"/>
+  <xacro:property name="wheel_base" value="0.58"/>
+  <xacro:property name="wheel_track" value="0.38"/>
+  <xacro:property name="kingpin_width" value="0.32"/>
+  <xacro:property name="wheel_radius" value="0.095"/>
+  <xacro:property name="wheel_width" value="0.055"/>
+  <xacro:property name="steering_limit" value="0.55"/>
+  <xacro:property name="steering_link_radius" value="0.020"/>
+  <xacro:property name="steering_link_height" value="0.040"/>
+  <!-- Ahead of the front tyre envelope (x=0.385), inside the x=0.450 bumper. -->
+  <xacro:property name="laser_x" value="0.40"/>
+  <xacro:property name="laser_z_from_ground" value="0.065"/>
+  <xacro:property name="laser_radius" value="0.025"/>
+  <xacro:property name="laser_height" value="0.040"/>
+
+  <!-- Total model mass is approximately 21.05 kg. -->
+  <xacro:property name="chassis_mass" value="18.0"/>
+  <xacro:property name="wheel_mass" value="0.60"/>
+  <xacro:property name="steering_mass" value="0.15"/>
+  <xacro:property name="laser_mass" value="0.10"/>
+
+  <xacro:property name="wheel_i_axial"
+                  value="${0.5 * wheel_mass * wheel_radius * wheel_radius}"/>
+  <xacro:property name="wheel_i_radial"
+                  value="${wheel_mass * (3.0 * wheel_radius * wheel_radius + wheel_width * wheel_width) / 12.0}"/>
+  <xacro:property name="chassis_ixx"
+                  value="${chassis_mass * (body_width * body_width + body_height * body_height) / 12.0}"/>
+  <xacro:property name="chassis_iyy"
+                  value="${chassis_mass * (body_length * body_length + body_height * body_height) / 12.0}"/>
+  <xacro:property name="chassis_izz"
+                  value="${chassis_mass * (body_length * body_length + body_width * body_width) / 12.0}"/>
+  <xacro:property name="steering_i_axial"
+                  value="${0.5 * steering_mass * steering_link_radius * steering_link_radius}"/>
+  <xacro:property name="steering_i_radial"
+                  value="${steering_mass * (3.0 * steering_link_radius * steering_link_radius + steering_link_height * steering_link_height) / 12.0}"/>
+  <xacro:property name="laser_i_axial"
+                  value="${0.5 * laser_mass * laser_radius * laser_radius}"/>
+  <xacro:property name="laser_i_radial"
+                  value="${laser_mass * (3.0 * laser_radius * laser_radius + laser_height * laser_height) / 12.0}"/>
+
+  <material name="turtle_teal">
+    <color rgba="0.02 0.72 0.55 1.0"/>
+  </material>
+  <material name="dark_tire">
+    <color rgba="0.035 0.04 0.045 1.0"/>
+  </material>
+  <material name="metal">
+    <color rgba="0.38 0.42 0.44 1.0"/>
+  </material>
+  <material name="laser_black">
+    <color rgba="0.04 0.05 0.05 1.0"/>
+  </material>
+
+  <xacro:macro name="wheel_link" params="name">
+    <link name="${name}">
+      <inertial>
+        <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
+        <mass value="${wheel_mass}"/>
+        <inertia ixx="${wheel_i_radial}" ixy="0" ixz="0"
+                 iyy="${wheel_i_radial}" iyz="0" izz="${wheel_i_axial}"/>
+      </inertial>
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <material name="dark_tire"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </collision>
+    </link>
+  </xacro:macro>
+
+  <xacro:macro name="steering_link" params="name">
+    <link name="${name}">
+      <inertial>
+        <mass value="${steering_mass}"/>
+        <inertia ixx="${steering_i_radial}" ixy="0" ixz="0"
+                 iyy="${steering_i_radial}" iyz="0" izz="${steering_i_axial}"/>
+      </inertial>
+      <visual>
+        <geometry>
+          <cylinder radius="${steering_link_radius}" length="${steering_link_height}"/>
+        </geometry>
+        <material name="metal"/>
+      </visual>
+    </link>
+  </xacro:macro>
+
+  <!-- Root at the tyre/ground contact plane. -->
+  <link name="base_footprint">
+    <!--
+      Gazebo's URDF-to-SDF converter requires an inertial block when this
+      fixed root is explicitly preserved. It has no geometry or collision.
+    -->
+    <inertial>
+      <mass value="0.05"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0"
+               iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+
+  <link name="base_link">
+    <inertial>
+      <mass value="0.20"/>
+      <inertia ixx="0.0005" ixy="0" ixz="0"
+               iyy="0.0005" iyz="0" izz="0.0005"/>
+    </inertial>
+  </link>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="chassis_link">
+    <inertial>
+      <mass value="${chassis_mass}"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="${chassis_ixx}" ixy="0" ixz="0"
+               iyy="${chassis_iyy}" iyz="0" izz="${chassis_izz}"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <box size="${body_length} ${body_width} ${body_height}"/>
+      </geometry>
+      <material name="turtle_teal"/>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${body_length} ${body_width} ${body_height}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="chassis_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="chassis_link"/>
+    <!-- Body bottom is at the wheel axle height, safely above the ground. -->
+    <origin xyz="0 0 ${body_height / 2.0}" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:steering_link name="front_left_steering_link"/>
+  <xacro:steering_link name="front_right_steering_link"/>
+
+  <joint name="front_left_steering_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_left_steering_link"/>
+    <origin xyz="${wheel_base / 2.0} ${kingpin_width / 2.0} 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="${-steering_limit}" upper="${steering_limit}"
+           effort="20" velocity="0.6"/>
+    <dynamics damping="15.0" friction="0.01"/>
+  </joint>
+
+  <joint name="front_right_steering_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_right_steering_link"/>
+    <origin xyz="${wheel_base / 2.0} ${-kingpin_width / 2.0} 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="${-steering_limit}" upper="${steering_limit}"
+           effort="20" velocity="0.6"/>
+    <dynamics damping="15.0" friction="0.01"/>
+  </joint>
+
+  <xacro:wheel_link name="front_left_wheel_link"/>
+  <xacro:wheel_link name="front_right_wheel_link"/>
+  <xacro:wheel_link name="rear_left_wheel_link"/>
+  <xacro:wheel_link name="rear_right_wheel_link"/>
+
+  <!-- Offset the front wheel centres from the 0.32 m kingpins to a 0.38 m track. -->
+  <joint name="front_left_wheel_joint" type="continuous">
+    <parent link="front_left_steering_link"/>
+    <child link="front_left_wheel_link"/>
+    <origin xyz="0 ${(wheel_track - kingpin_width) / 2.0} 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="30" velocity="30"/>
+    <dynamics damping="0.02" friction="0.002"/>
+  </joint>
+
+  <joint name="front_right_wheel_joint" type="continuous">
+    <parent link="front_right_steering_link"/>
+    <child link="front_right_wheel_link"/>
+    <origin xyz="0 ${-(wheel_track - kingpin_width) / 2.0} 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="30" velocity="30"/>
+    <dynamics damping="0.02" friction="0.002"/>
+  </joint>
+
+  <joint name="rear_left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="rear_left_wheel_link"/>
+    <origin xyz="${-wheel_base / 2.0} ${wheel_track / 2.0} 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="50" velocity="30"/>
+    <dynamics damping="0.02" friction="0.002"/>
+  </joint>
+
+  <joint name="rear_right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="rear_right_wheel_link"/>
+    <origin xyz="${-wheel_base / 2.0} ${-wheel_track / 2.0} 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="50" velocity="30"/>
+    <dynamics damping="0.02" friction="0.002"/>
+  </joint>
+
+  <link name="laser_link">
+    <inertial>
+      <mass value="${laser_mass}"/>
+      <inertia ixx="${laser_i_radial}" ixy="0" ixz="0"
+               iyy="${laser_i_radial}" iyz="0" izz="${laser_i_axial}"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <cylinder radius="${laser_radius}" length="${laser_height}"/>
+      </geometry>
+      <material name="laser_black"/>
+    </visual>
+  </link>
+
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser_link"/>
+    <origin xyz="${laser_x} 0 ${laser_z_from_ground - wheel_radius}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Exact centre-symmetric counterpart of the front lidar. -->
+  <link name="rear_laser_link">
+    <inertial>
+      <mass value="${laser_mass}"/>
+      <inertia ixx="${laser_i_radial}" ixy="0" ixz="0"
+               iyy="${laser_i_radial}" iyz="0" izz="${laser_i_axial}"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <cylinder radius="${laser_radius}" length="${laser_height}"/>
+      </geometry>
+      <material name="laser_black"/>
+    </visual>
+  </link>
+
+  <joint name="rear_laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="rear_laser_link"/>
+    <origin xyz="${-laser_x} 0 ${laser_z_from_ground - wheel_radius}"
+            rpy="0 0 ${pi}"/>
+  </joint>
+
+  <xacro:include filename="turtle_car.gazebo.xacro"/>
+</robot>

@@ -1,0 +1,201 @@
+parallel_parking_auto:
+  ros__parameters:
+    use_sim_time: true
+    target_slot: "auto"
+    auto_start: false
+    execute: true
+
+    # ------------------------------------------------------------------
+    # Slot geometry, expressed in the odom frame.
+    #
+    # The vehicle spawns at world (9.75, -0.50, yaw=1.5708) and the gz
+    # odometry plugin puts the odom origin exactly there, so odom is the
+    # world frame translated AND rotated by 90 deg.  Converting a world
+    # point therefore needs both parts -- a plain offset is wrong:
+    #
+    #   p_odom = R(-yaw0) . (p_world - t0),  t0 = (9.75, -0.50)
+    #   yaw0 = 1.5708  =>  cos(-yaw0) = 0, sin(-yaw0) = -1
+    #
+    #   odom_x =  world_y + 0.50
+    #   odom_y =  9.75 - world_x          <-- note the sign flip
+    #   odom_yaw = world_yaw - 1.5708
+    #
+    # Because odom_y negates world_x, the west slot (small world x) has the
+    # LARGER odom_y, and every min/max pair swaps.  The bounds below were
+    # produced by transforming all four corners and re-taking min/max.
+    #
+    # Source geometry, read from worlds/t_parking_exam.sdf:
+    #   slot mouth    = parallel_slots_lane_edge_paint   world y = 12.02
+    #   inner wall    = parallel_slots_outer_boundary    world y = 13.50
+    #   west end      = parallel_slot_1_west_paint       world x =  0.15
+    #   divider       = parallel_upper_slot_divider      world x =  5.00 (0.08 wide)
+    #   east end      = parallel_slot_2_east_paint       world x =  9.85
+    #
+    # Axis meaning after the rotation (this is NOT the T-bay convention):
+    #   odom x = slot DEPTH   (min_x = mouth, max_x = inner wall)
+    #   odom y = slot LENGTH  (along the driving lane)
+    #   yaw = 1.5708 = travelling west in world = +odom_y
+    # ------------------------------------------------------------------
+
+    # West slot.  Occupied when /parking_practice/obstacle_layout ends in "C".
+    slot_1:
+      odom_x: 13.26      # depth centre: (12.52 + 14.00) / 2
+      odom_y: 7.18       # length centre: (4.79 + 9.57) / 2
+      yaw: 1.57079632679
+      min_x: 12.52       # mouth,      world y = 12.02
+      max_x: 14.00       # inner wall, world y = 13.50
+      min_y: 4.79        # world x = 4.96 (divider west face)
+      max_y: 9.57        # world x = 0.18 (west paint inner edge)
+    # East slot.  Occupied when the layout ends in "D".
+    slot_2:
+      odom_x: 13.26
+      odom_y: 2.32       # length centre: (-0.07 + 4.71) / 2
+      yaw: 1.57079632679
+      min_x: 12.52
+      max_x: 14.00
+      min_y: -0.07       # world x = 9.82 (east paint inner edge)
+      max_y: 4.71        # world x = 5.04 (divider east face)
+
+    # Driving lane in front of the slots, odom depth axis only.
+    # world y in [8.50, 12.02]  ->  odom x in [9.00, 12.52].
+    lane_min_x: 9.00
+    lane_max_x: 12.52
+
+    # Staging route.  The SLAM map only reaches a few metres ahead --
+    # scan_filter truncates /scan_static at 10 m and the start corridor
+    # self-occludes -- while GridBased plans with allow_unknown:false, so the
+    # 20 m drive to the slots cannot be planned in one request from the start
+    # pose.  The route is therefore driven in hops, each one short enough to
+    # stay inside the map the vehicle has already built, with SLAM extending
+    # it at every stop.  staging_via_odom_y is the lateral line held while
+    # driving up the corridor (0.0 = straight out of the spawn pose).
+    staging_via_odom_y: 0.0
+    staging_hop_distance: 3.0
+    # The corner from the start corridor into the lane is a 90 deg turn and
+    # the vehicle needs 0.946 m of turning radius, so the corridor leg stops
+    # at corner_entry_odom_x (world y = 9.50, already past the corridor wall
+    # which ends at world y = 8.56) and the next waypoint is placed on the far
+    # side of the corner, lined up with the lane.  Turning at the lane line
+    # instead wedges the vehicle against the slot mouth at odom x = 12.52.
+    corner_entry_odom_x: 10.00
+    corner_exit_odom_y: 3.00
+    # Radius of the left arc that carries the vehicle round the corner.  A
+    # single goal on the far side of the corner let Smac answer with a cusped
+    # manoeuvre (measured cusps=2, reverse 0.665 m) that pure pursuit stalled
+    # on at the slot mouth, so the 45 deg point of this arc is pinned as an
+    # extra goal in the same plan request.  Clamped up to
+    # minimum_turning_radius if set lower.
+    corner_arc_radius: 1.30
+    # Transit hops use the faster controller and the loose goal checker; the
+    # parking manoeuvre itself keeps ParkingFollowPath / parking_goal_checker.
+    transit_controller_id: "FollowPath"
+    transit_goal_checker_id: "goal_checker"
+
+    # Lateral standoff from the slot mouth line while alongside the slot.
+    # lane_x = slot.min_x - lane_offset, so 0.80 leaves the vehicle's right
+    # side 0.575 m short of the mouth -- normal parallel-parking spacing.
+    lane_offset_candidates: [0.80]
+    # Staging drives all the way onto the first candidate approach pose, so
+    # the later alignment onto the selected one is at most a few tens of
+    # centimetres along the same lane line.
+    staging_final_gap: 0.0
+    # How far past the PARKED pose the approach pose sits.  The vehicle must
+    # overshoot its target spot so that reversing is the only sensible way
+    # back into it; that is what makes the entry a real parallel-parking
+    # manoeuvre instead of a wide forward arc into an oversized bay.  The
+    # lateral shift from the lane to the slot centre is about 1.5 m, which
+    # needs ~1.5 m of longitudinal run at the 0.946 m turning radius, so
+    # these all leave comfortable margin.
+    approach_offset_candidates: [1.80, 2.20, 2.60]
+    # Gap kept between the vehicle's nose and the end of the slot it reversed
+    # in through.  The vehicle parks just inside that end rather than in the
+    # middle of the 4.78 m slot: aiming at the longitudinal centre demands a
+    # ~5 m reverse that Smac only solves with a three-cusp snake, which pure
+    # pursuit then stalls on ("Failed to make progress").
+    slot_end_clearance: 0.35
+    # Reject any entry path longer than this multiple of the straight-line
+    # approach-to-parked distance; a real back-in stays close to that line,
+    # while "reverse 0.5 m then loop 7 m forward into the open bay" does not.
+    entry_loop_length_factor: 2.2
+    # Gate pose between approach and parked (see _build_entry_poses).
+    entry_angle: 0.55
+    entry_depth: 0.35
+    entry_lead: 1.00
+    # Forward exit target, measured past the far end of the slot.
+    exit_lead_candidates: [1.20, 1.80, 2.50]
+
+    # Minimum gap between the vehicle side and both the inner wall and the
+    # mouth line at the parked pose.  Slot depth is 1.48 m and the vehicle is
+    # 0.45 m wide, so parking on the depth centre leaves 0.515 m per side.
+    slot_depth_clearance: 0.35
+
+    vehicle_length: 0.90
+    vehicle_width: 0.45
+    footprint_clearance: 0.06
+
+    # Entry acceptance.  The decisive test is "the first drive segment after
+    # the approach pose is REVERSE" (see minimum_reverse_length below);
+    # maximum_cusps is only an upper bound, because backing in and then
+    # straightening up costs one or two direction changes.
+    minimum_reverse_length: 0.30
+    # Two direction changes is a back-in plus a straighten-up.  Three means
+    # Smac produced a snaking path, which pure pursuit stalls on
+    # ("Failed to make progress"), so those are rejected rather than driven.
+    maximum_cusps: 2
+    minimum_turning_radius: 0.946
+    curvature_tolerance_factor: 1.20
+    occupied_threshold: 50
+
+    # Exit.  ForwardExit is the DUBIN planner already defined in
+    # nav2_params.yaml; DUBIN cannot emit a reverse segment at all, so
+    # "no reversing" is guaranteed by the planner rather than checked after
+    # the fact.  The reverse-distance test below stays as a second layer.
+    exit_mode: "forward"
+    exit_planner_id: "ForwardExit"
+    require_forward_only_exit: true
+    max_reverse_distance_during_exit: 0.01
+    maximum_exit_cusps: 0
+    exit_position_tolerance: 0.25
+    exit_yaw_tolerance: 0.25
+
+    wheel_frames:
+      - "front_left_wheel_link"
+      - "front_right_wheel_link"
+      - "rear_left_wheel_link"
+      - "rear_right_wheel_link"
+    wheel_radius: 0.095
+    wheel_base: 0.58
+    wheel_track: 0.38
+    # A wheel centre must clear the slot edge by wheel_radius + margin, which
+    # is 0.295 m from the vehicle centreline -- stricter than the 0.225 m
+    # footprint half-width, so all four wheels inside implies the whole
+    # footprint is inside the slot.
+    wheel_inside_margin: 0.01
+    # Containment alone is not enough here.  The slot is 4.78 x 1.48 m for a
+    # 0.90 x 0.45 m vehicle, so a car still ~25 deg across the slot already
+    # has all four wheel centres inside the rectangle; without this the run
+    # stops parked crooked.  0.20 rad (11.5 deg) sits comfortably outside
+    # parking_goal_checker's 0.08 rad yaw tolerance.
+    parked_yaw_tolerance: 0.20
+    wheel_inside_confirm_count: 5
+    wheel_check_period: 0.10
+    stop_confirm_count: 3
+
+    system_wait_timeout: 120.0
+    map_wait_timeout: 120.0
+    layout_wait_timeout: 20.0
+    scan_timeout: 2.0
+    rear_emergency_stop_distance: 0.15
+    rear_emergency_sector_deg: 30.0
+    map_observation_settle_time: 3.0
+    action_timeout: 45.0
+    follow_path_timeout: 180.0
+    parking_cancel_timeout: 5.0
+    parking_stop_grace_timeout: 2.0
+    stop_wait_timeout: 120.0
+    freeze_slam_during_execution: true
+
+    planner_id: "GridBased"
+    controller_id: "ParkingFollowPath"
+    goal_checker_id: "parking_goal_checker"
+    progress_checker_id: "progress_checker"

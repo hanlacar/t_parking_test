@@ -1,0 +1,554 @@
+<?xml version="1.0"?>
+<sdf version="1.10">
+  <world name="t_parking_exam">
+    <physics name="parking_physics" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- Gazebo Sim 8 system plugins, verified from the local installation. -->
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <scene>
+      <ambient>0.45 0.45 0.45 1</ambient>
+      <background>0.72 0.80 0.88 1</background>
+      <shadows>true</shadows>
+    </scene>
+
+    <!--
+      The 1/5-scale car spawns at x=-5.0.  Gazebo's default camera starts near
+      the world origin, which made the correctly spawned car look absent when
+      this world was reached through the full auto-parking launch chain.
+      This view includes both the start pose and the complete T bay.
+    -->
+    <gui fullscreen="false">
+      <plugin name="3D View" filename="GzScene3D">
+        <gz-gui>
+          <title>3D View</title>
+          <property type="bool" key="showTitleBar">0</property>
+          <property type="string" key="state">docked</property>
+        </gz-gui>
+        <engine>ogre2</engine>
+        <scene>scene</scene>
+        <camera_pose>-15 -14 32 0 0.88 0.72</camera_pose>
+      </plugin>
+      <plugin name="World control" filename="WorldControl">
+        <play_pause>true</play_pause>
+        <step>true</step>
+      </plugin>
+      <plugin name="Entity tree" filename="EntityTree"/>
+    </gui>
+
+    <light name="sun" type="directional">
+      <pose>0 0 12 0 0 0</pose>
+      <cast_shadows>true</cast_shadows>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.45 0.25 -0.86</direction>
+    </light>
+
+    <light name="parking_fill_light" type="point">
+      <pose>1.5 3.5 6 0 0 0</pose>
+      <cast_shadows>false</cast_shadows>
+      <diffuse>0.55 0.55 0.55 1</diffuse>
+      <specular>0.05 0.05 0.05 1</specular>
+      <attenuation>
+        <range>20</range>
+        <constant>0.5</constant>
+        <linear>0.02</linear>
+        <quadratic>0.002</quadratic>
+      </attenuation>
+    </light>
+
+    <!-- The top of the asphalt is exactly z=0. -->
+    <model name="asphalt_ground">
+      <static>true</static>
+      <pose>0.5 6.5 -0.05 0 0 0</pose>
+      <link name="ground_link">
+        <collision name="ground_collision">
+          <geometry>
+            <box>
+              <size>32 30 0.10</size>
+            </box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>1.2</mu>
+                <mu2>1.2</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="ground_visual">
+          <geometry>
+            <box>
+              <size>32 30 0.10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.09 0.10 0.11 1</ambient>
+            <diffuse>0.14 0.15 0.16 1</diffuse>
+            <specular>0.02 0.02 0.02 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!--
+      Main lane: x=[-7, 7], y=[-1.75, 1.75].
+      Each curb is 0.12 m thick and 0.090 m high. The 0.065 m lidar beam
+      intersects its side face. The left curb deliberately leaves x=[0, 3] open.
+    -->
+    <model name="main_right_boundary">
+      <static>true</static>
+      <pose>0 -1.75 0.045 0 0 0</pose>
+      <link name="boundary_link">
+        <collision name="boundary_collision">
+          <geometry><box><size>14.0 0.12 0.090</size></box></geometry>
+        </collision>
+        <visual name="boundary_visual">
+          <geometry><box><size>14.0 0.12 0.090</size></box></geometry>
+          <material>
+            <ambient>0.95 0.75 0.05 1</ambient>
+            <diffuse>1.0 0.82 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="main_left_boundary_west">
+      <static>true</static>
+      <pose>-3.5 1.75 0.045 0 0 0</pose>
+      <link name="boundary_link">
+        <collision name="boundary_collision">
+          <geometry><box><size>7.0 0.12 0.090</size></box></geometry>
+        </collision>
+        <visual name="boundary_visual">
+          <geometry><box><size>7.0 0.12 0.090</size></box></geometry>
+          <material>
+            <ambient>0.95 0.75 0.05 1</ambient>
+            <diffuse>1.0 0.82 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="main_lane_upper_east_boundary">
+      <static>true</static>
+      <pose>5.015 1.75 0.045 0 0 0</pose>
+      <link name="boundary_link">
+        <collision name="boundary_collision">
+          <geometry><box><size>3.97 0.12 0.090</size></box></geometry>
+        </collision>
+        <visual name="boundary_visual">
+          <geometry><box><size>3.97 0.12 0.090</size></box></geometry>
+          <material>
+            <ambient>0.95 0.75 0.05 1</ambient>
+            <diffuse>1.0 0.82 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="main_lane_east_end_boundary">
+      <static>true</static>
+      <pose>7.03 0 0.045 0 0 0</pose>
+      <link name="boundary_link">
+        <collision name="boundary_collision">
+          <geometry><box><size>0.12 3.44 0.090</size></box></geometry>
+        </collision>
+        <visual name="boundary_visual">
+          <geometry><box><size>0.12 3.44 0.090</size></box></geometry>
+          <material>
+            <ambient>0.95 0.75 0.05 1</ambient>
+            <diffuse>1.0 0.82 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- T bay on the vehicle's left: x=[0, 3], y=[1.75, 6.75]. -->
+    <model name="parking_bay_west_boundary">
+      <static>true</static>
+      <pose>0 4.25 0.045 0 0 0</pose>
+      <link name="boundary_link">
+        <collision name="boundary_collision">
+          <geometry><box><size>0.12 5.0 0.090</size></box></geometry>
+        </collision>
+        <visual name="boundary_visual">
+          <geometry><box><size>0.12 5.0 0.090</size></box></geometry>
+          <material>
+            <ambient>0.95 0.75 0.05 1</ambient>
+            <diffuse>1.0 0.82 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="parking_bay_east_boundary">
+      <static>true</static>
+      <pose>3.0 4.25 0.045 0 0 0</pose>
+      <link name="boundary_link">
+        <collision name="boundary_collision">
+          <geometry><box><size>0.12 5.0 0.090</size></box></geometry>
+        </collision>
+        <visual name="boundary_visual">
+          <geometry><box><size>0.12 5.0 0.090</size></box></geometry>
+          <material>
+            <ambient>0.95 0.75 0.05 1</ambient>
+            <diffuse>1.0 0.82 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!--
+      Continuous physical curb across the inner end of both parking spaces.
+      Its inner face is y=6.75 and its ends meet both side boundaries.
+    -->
+    <model name="parking_bay_rear_boundary">
+      <static>true</static>
+      <pose>1.5 6.81 0.045 0 0 0</pose>
+      <link name="rear_boundary_link">
+        <collision name="rear_boundary_collision">
+          <geometry><box><size>3.12 0.12 0.090</size></box></geometry>
+        </collision>
+        <visual name="rear_boundary_visual">
+          <geometry><box><size>3.12 0.12 0.090</size></box></geometry>
+          <material>
+            <ambient>0.95 0.75 0.05 1</ambient>
+            <diffuse>1.0 0.82 0.08 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Independent course: northbound right leg, left turn, westbound upper leg. -->
+    <model name="parallel_vertical_lane_left_boundary">
+      <static>true</static><pose>8.0 3.375 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>0.12 10.37 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>0.12 10.37 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_vertical_lane_right_boundary">
+      <static>true</static><pose>11.5 5.125 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>0.12 13.87 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>0.12 13.87 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_start_zone_boundary">
+      <static>true</static><pose>9.75 -1.75 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>3.62 0.12 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>3.62 0.12 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_upper_lane_bottom_boundary">
+      <static>true</static><pose>4.0 8.5 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>8.12 0.12 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>8.12 0.12 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_upper_lane_left_boundary">
+      <static>true</static><pose>0.0 12.75 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>0.12 1.62 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>0.12 1.62 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+
+    <!-- Five-metre westbound run-out after the two parallel spaces. -->
+    <model name="parallel_upper_lane_west_extension_top_boundary">
+      <static>true</static><pose>-2.515 12.0 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>4.97 0.12 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>4.97 0.12 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_upper_lane_west_extension_bottom_boundary">
+      <static>true</static><pose>-2.515 8.5 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>4.97 0.12 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>4.97 0.12 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_upper_lane_west_end_boundary">
+      <static>true</static><pose>-5.03 10.25 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>0.12 3.44 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>0.12 3.44 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_upper_lane_top_east_boundary">
+      <static>true</static><pose>10.75 12.0 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>1.62 0.12 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>1.62 0.12 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_slots_outer_boundary">
+      <static>true</static><pose>5.0 13.5 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>10.12 0.12 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>10.12 0.12 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_slots_east_end_boundary">
+      <static>true</static><pose>10.0 12.75 0.045 0 0 0</pose>
+      <link name="boundary_link"><collision name="boundary_collision"><geometry><box><size>0.12 1.62 0.090</size></box></geometry></collision><visual name="boundary_visual"><geometry><box><size>0.12 1.62 0.090</size></box></geometry><material><ambient>0.95 0.75 0.05 1</ambient><diffuse>1 0.82 0.08 1</diffuse></material></visual></link>
+    </model>
+
+    <!-- Two 5.0 x 1.5 m visual-only parallel spaces, open toward the lane. -->
+    <model name="parallel_upper_slot_divider">
+      <static>true</static><pose>5.0 12.75 0.016 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.08 1.50 0.028</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_slots_lane_edge_paint">
+      <static>true</static><pose>5.0 12.02 0.016 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>10.0 0.06 0.028</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_slot_1_west_paint">
+      <static>true</static><pose>0.15 12.75 0.016 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.06 1.50 0.028</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_slot_2_east_paint">
+      <static>true</static><pose>9.85 12.75 0.016 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.06 1.50 0.028</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+
+    <!-- Parallel-mode start markings, aligned for northbound travel. -->
+    <model name="parallel_start_stop_line">
+      <static>true</static><pose>9.75 0.25 0.016 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>3.10 0.12 0.028</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><emissive>0.2 0.2 0.2 1</emissive></material></visual></link>
+    </model>
+    <model name="parallel_start_arrow_shaft">
+      <static>true</static><pose>9.75 1.25 0.0035 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.12 1.15 0.003</size></box></geometry><material><ambient>0.95 0.85 0.05 1</ambient><diffuse>1 0.90 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_start_arrow_left">
+      <static>true</static><pose>9.57 1.90 0.0035 0 0 0.65</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.55 0.12 0.003</size></box></geometry><material><ambient>0.95 0.85 0.05 1</ambient><diffuse>1 0.90 0.08 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_start_arrow_right">
+      <static>true</static><pose>9.93 1.90 0.0035 0 0 -0.65</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.55 0.12 0.003</size></box></geometry><material><ambient>0.95 0.85 0.05 1</ambient><diffuse>1 0.90 0.08 1</diffuse></material></visual></link>
+    </model>
+
+    <!-- Visual-only white guides, 0.10 m inside the yellow collision faces. -->
+    <model name="main_lane_east_end_inner_white">
+      <static>true</static><pose>6.87 0 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.08 3.20 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_start_inner_white">
+      <static>true</static><pose>9.75 -1.60 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>3.10 0.08 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_vertical_left_inner_white">
+      <static>true</static><pose>8.15 3.425 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.08 10.05 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_vertical_right_inner_white">
+      <static>true</static><pose>11.35 5.125 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.08 13.45 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_upper_bottom_inner_white">
+      <static>true</static><pose>1.50 8.65 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>13.0 0.08 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_upper_east_inner_white">
+      <static>true</static><pose>10.75 11.85 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>1.50 0.08 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_slots_outer_inner_white">
+      <static>true</static><pose>5.0 13.35 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>10.0 0.08 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_extension_top_inner_white">
+      <static>true</static><pose>-2.50 11.85 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>5.0 0.08 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+    <model name="parallel_extension_west_inner_white">
+      <static>true</static><pose>-4.88 10.25 0.014 0 0 0</pose>
+      <link name="paint_link"><visual name="paint_visual"><geometry><box><size>0.08 3.20 0.024</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual></link>
+    </model>
+
+    <!-- Painted main-lane boundary lines. They are visual-only static models. -->
+    <model name="main_right_paint">
+      <static>true</static>
+      <pose>0 -1.60 0.014 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>14.0 0.08 0.024</size></box></geometry>
+          <material>
+            <ambient>0.95 0.95 0.95 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.15 0.15 0.15 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="main_left_paint_west">
+      <static>true</static>
+      <pose>-3.5 1.60 0.014 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>7.0 0.08 0.024</size></box></geometry>
+          <material>
+            <ambient>0.95 0.95 0.95 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.15 0.15 0.15 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="main_left_paint_east">
+      <static>true</static>
+      <pose>5.015 1.60 0.014 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>3.97 0.08 0.024</size></box></geometry>
+          <material>
+            <ambient>0.95 0.95 0.95 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.15 0.15 0.15 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Painted T-bay outline, slightly inside the collision curbs. -->
+    <model name="parking_bay_west_paint">
+      <static>true</static>
+      <pose>0.15 4.25 0.014 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>0.08 5.0 0.024</size></box></geometry>
+          <material>
+            <ambient>0.95 0.95 0.95 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.15 0.15 0.15 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="parking_bay_east_paint">
+      <static>true</static>
+      <pose>2.85 4.25 0.014 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>0.08 5.0 0.024</size></box></geometry>
+          <material>
+            <ambient>0.95 0.95 0.95 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.15 0.15 0.15 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="parking_bay_inner_paint">
+      <static>true</static>
+      <pose>1.5 6.60 0.014 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>3.0 0.08 0.024</size></box></geometry>
+          <material>
+            <ambient>0.95 0.95 0.95 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.15 0.15 0.15 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!--
+      Visual-only divider at x=1.5. Its 0.004 m thickness leaves the lower
+      surface 0.002 m above the asphalt, avoiding z-fighting without becoming
+      a physical obstacle.
+    -->
+    <model name="parking_bay_center_divider">
+      <static>true</static>
+      <pose>1.5 4.25 0.006 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>0.08 5.0 0.008</size></box></geometry>
+          <material>
+            <ambient>0.95 0.95 0.95 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.15 0.15 0.15 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Start line ahead of the initial vehicle pose x=-5.0. -->
+    <model name="start_line">
+      <static>true</static>
+      <pose>-2.75 0 0.016 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>0.12 3.10 0.028</size></box></geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.2 0.2 0.2 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Inner confirmation line, 0.50 m in front of the back curb. -->
+    <model name="parking_confirmation_line">
+      <static>true</static>
+      <pose>1.5 6.25 0.016 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>2.65 0.10 0.028</size></box></geometry>
+          <material>
+            <ambient>1 1 1 1</ambient>
+            <diffuse>1 1 1 1</diffuse>
+            <emissive>0.2 0.2 0.2 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- A three-segment +X direction arrow. -->
+    <model name="direction_arrow_shaft">
+      <static>true</static>
+      <pose>-1.75 0 0.0035 0 0 0</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>1.15 0.12 0.003</size></box></geometry>
+          <material>
+            <ambient>0.95 0.85 0.05 1</ambient>
+            <diffuse>1.0 0.90 0.08 1</diffuse>
+            <emissive>0.12 0.10 0.01 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="direction_arrow_head_left">
+      <static>true</static>
+      <pose>-1.10 0.18 0.0035 0 0 -0.65</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>0.55 0.12 0.003</size></box></geometry>
+          <material>
+            <ambient>0.95 0.85 0.05 1</ambient>
+            <diffuse>1.0 0.90 0.08 1</diffuse>
+            <emissive>0.12 0.10 0.01 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="direction_arrow_head_right">
+      <static>true</static>
+      <pose>-1.10 -0.18 0.0035 0 0 0.65</pose>
+      <link name="paint_link">
+        <visual name="paint_visual">
+          <geometry><box><size>0.55 0.12 0.003</size></box></geometry>
+          <material>
+            <ambient>0.95 0.85 0.05 1</ambient>
+            <diffuse>1.0 0.90 0.08 1</diffuse>
+            <emissive>0.12 0.10 0.01 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

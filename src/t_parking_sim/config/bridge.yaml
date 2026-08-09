@@ -1,0 +1,56 @@
+# Gazebo Sim -> ROS clock
+- ros_topic_name: /clock
+  gz_topic_name: /clock
+  ros_type_name: rosgraph_msgs/msg/Clock
+  gz_type_name: gz.msgs.Clock
+  direction: GZ_TO_ROS
+  qos_profile: CLOCK
+
+# Gazebo Sim -> ROS front-bumper lidar.
+# The explicit override prevents Gazebo's scoped sensor name from leaking into
+# LaserScan.header.frame_id.
+- ros_topic_name: /scan
+  gz_topic_name: /scan
+  ros_type_name: sensor_msgs/msg/LaserScan
+  gz_type_name: gz.msgs.LaserScan
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+  frame_id: laser_link
+
+# Gazebo Sim -> ROS rear-bumper lidar.  Its joint yaw is pi, so angle zero
+# points directly behind the vehicle while the LaserScan remains sensor-local.
+- ros_topic_name: /scan_rear
+  gz_topic_name: /scan_rear
+  ros_type_name: sensor_msgs/msg/LaserScan
+  gz_type_name: gz.msgs.LaserScan
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+  frame_id: rear_laser_link
+
+# Ackermann odometry and its odom -> base_footprint transform.
+- ros_topic_name: /odom
+  gz_topic_name: /odom
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /tf
+  gz_topic_name: /tf
+  ros_type_name: tf2_msgs/msg/TFMessage
+  gz_type_name: gz.msgs.Pose_V
+  direction: GZ_TO_ROS
+
+# Gazebo's real steering and wheel joint states feed robot_state_publisher.
+- ros_topic_name: /joint_states
+  gz_topic_name: /joint_states
+  ros_type_name: sensor_msgs/msg/JointState
+  gz_type_name: gz.msgs.Model
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+
+# ROS teleoperation -> Gazebo Ackermann controller.
+- ros_topic_name: /cmd_vel
+  gz_topic_name: /cmd_vel
+  ros_type_name: geometry_msgs/msg/Twist
+  gz_type_name: gz.msgs.Twist
+  direction: ROS_TO_GZ
