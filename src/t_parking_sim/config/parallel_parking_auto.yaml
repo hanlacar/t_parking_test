@@ -123,6 +123,13 @@ parallel_parking_auto:
     entry_lead: 1.00
     # Forward exit target, measured past the far end of the slot.
     exit_lead_candidates: [1.20, 1.80, 2.50]
+    # Depth of the exit target, measured from the slot mouth into the lane.
+    # Larger than lane_offset on purpose: the approach hugs the slot so the
+    # back-in stays short, but leaving along that same line keeps the vehicle
+    # 0.8 m from the mouth and runs it into the narrowing west extension,
+    # where pure pursuit's collision check aborted the exit with 1.2 m to go.
+    # 1.60 puts the target near the middle of the 3.5 m lane.
+    exit_lane_offset: 1.60
 
     # Minimum gap between the vehicle side and both the inner wall and the
     # mouth line at the parked pose.  Slot depth is 1.48 m and the vehicle is
@@ -181,6 +188,31 @@ parallel_parking_auto:
     parked_yaw_tolerance: 0.20
     wheel_inside_confirm_count: 5
     wheel_check_period: 0.10
+    # Intermediate direction runs stop at a Reeds-Shepp cusp, which pure
+    # pursuit cannot converge onto: the vehicle reverses cleanly to ~0.31 m
+    # from the cusp pose and then oscillates its commanded direction 2-3
+    # times a second at ~0 m/s until the progress checker aborts.  Accept the
+    # run once it is this close, or once it has stopped closing the gap for
+    # cusp_stall_timeout while within twice that distance.  The next run is
+    # planned from the cusp and pure pursuit picks it up from wherever the
+    # vehicle stands, and only the final pose is accuracy-critical -- that
+    # one is still verified by the wheel-inside monitor.
+    # The re-plan that actually gets driven starts from where the vehicle
+    # stopped rather than exactly on the approach pose, so Smac prefixes a
+    # short forward nudge and spends an extra direction change recovering.
+    # Bound that lead-in instead of demanding a literally reverse-first
+    # segment, and give the re-plan a small extra cusp budget -- those cusps
+    # are now tractable because of cusp_arrival_tolerance above.
+    entry_lead_in_forward_max: 0.30
+    replan_extra_cusps: 2
+    cusp_arrival_tolerance: 0.35
+    # Consecutive cusp poses in a parallel park sit almost on top of each
+    # other and differ mainly in heading, so both arrival tests check yaw as
+    # well.  With a position-only test the forward run that straightens the
+    # vehicle was skipped as "already there" and the car finished 35 deg
+    # across the slot with all four wheels nominally inside.
+    cusp_yaw_tolerance: 0.30
+    cusp_stall_timeout: 4.0
     stop_confirm_count: 3
 
     system_wait_timeout: 120.0

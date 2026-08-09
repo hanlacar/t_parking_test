@@ -303,6 +303,7 @@ class AutoParallelParking(Node):
             'entry_lead': 1.00,
             'entry_loop_length_factor': 2.2,
             'exit_lead_candidates': [1.20, 1.80, 2.50],
+            'exit_lane_offset': 1.60,
             'slot_depth_clearance': 0.35,
             'vehicle_length': 0.90, 'vehicle_width': 0.45,
             'footprint_clearance': 0.06,
@@ -328,6 +329,11 @@ class AutoParallelParking(Node):
             'parked_yaw_tolerance': 0.20,
             'wheel_inside_confirm_count': 5,
             'wheel_check_period': 0.10,
+            'cusp_arrival_tolerance': 0.35,
+            'cusp_yaw_tolerance': 0.30,
+            'entry_lead_in_forward_max': 0.30,
+            'replan_extra_cusps': 2,
+            'cusp_stall_timeout': 4.0,
             'stop_confirm_count': 3,
             'system_wait_timeout': 120.0,
             'map_wait_timeout': 120.0,
@@ -1528,6 +1534,20 @@ class AutoParallelParking(Node):
                 return direction
         return 0
 
+    @staticmethod
+    def _forward_lead_in(path: Path, metrics: PathMetrics) -> float:
+        """Return how far the path drives forward before its first reverse."""
+        lead_in = 0.0
+        for index, direction in enumerate(metrics.directions):
+            if direction < 0:
+                break
+            lead_in += math.hypot(
+                path.poses[index + 1].pose.position.x
+                - path.poses[index].pose.position.x,
+                path.poses[index + 1].pose.position.y
+                - path.poses[index].pose.position.y)
+        return lead_in
+
     def _prepare_executable_entry(
             self, candidate: EntryCandidate
     ) -> Optional[Tuple[Path, PathMetrics]]:
@@ -1561,15 +1581,27 @@ class AutoParallelParking(Node):
             return None
         path = self._dedupe_stationary_poses(path)
         metrics = self._analyze_path(path, candidate.named_poses['parked'])
-        direction = self._first_drive_direction(metrics)
+        lead_in = self._forward_lead_in(path, metrics)
+        maximum_lead_in = float(
+            self.get_parameter('entry_lead_in_forward_max').value)
         self._log_info(
-            f'[ENTRY REPLAN] first_segment='
-            f'{"reverse" if direction < 0 else "forward"} '
+            f'[ENTRY REPLAN] forward_lead_in={lead_in:.3f}m '
             f'first_reverse_index={metrics.first_reverse_index} '
             f'reverse={metrics.reverse_length:.3f}m '
             f'forward={metrics.forward_length:.3f}m '
             f'cusps={metrics.cusp_count}')
-        if direction >= 0:
+        # The candidate was validated as reverse-first from the approach pose.
+        # This re-plan starts from where the vehicle actually stopped, a few
+        # centimetres off, so Smac routinely prefixes a short forward nudge and
+        # spends an extra direction change recovering.  Demanding literally
+        # "segment 0 is reverse" rejected genuine back-ins whose reverse began
+        # one stitching-scale step later, so bound the lead-in distance
+        # instead: a parallel park may creep forward a little before backing
+        # in, but it may not drive in forwards.
+        if metrics.first_reverse_index < 0 or lead_in > maximum_lead_in:
+            self._log_error(
+                f're-planned entry drives {lead_in:.3f}m forward before any '
+                f'reverse (limit {maximum_lead_in:.3f}m)')
             return None
         if metrics.reverse_length < float(
                 self.get_parameter('minimum_reverse_length').value):
@@ -1577,7 +1609,9 @@ class AutoParallelParking(Node):
                 f're-planned entry reverses only {metrics.reverse_length:.3f}m')
             return None
         valid, reason = self._validate_entry_path(
-            candidate.slot, candidate.named_poses, path, metrics)
+            candidate.slot, candidate.named_poses, path, metrics,
+            maximum_cusps=int(self.get_parameter('maximum_cusps').value)
+            + int(self.get_parameter('replan_extra_cusps').value))
         if not valid:
             self._log_error(f're-planned entry rejected: {reason}')
             return None
@@ -1585,7 +1619,8 @@ class AutoParallelParking(Node):
 
     def _validate_entry_path(
             self, slot: Slot, named: Dict[str, PoseStamped], path: Path,
-            metrics: PathMetrics) -> Tuple[bool, str]:
+            metrics: PathMetrics,
+            maximum_cusps: Optional[int] = None) -> Tuple[bool, str]:
         # Loop guard.  A path that backs up a token 0.5 m and then swings 7 m
         # forward into the open bay satisfies every per-segment test while
         # being a wide forward entry in disguise.  A real parallel park stays
@@ -1600,7 +1635,8 @@ class AutoParallelParking(Node):
                 f'path length {metrics.total_length:.3f}m exceeds '
                 f'{limit:.3f}m for a {direct:.3f}m approach-to-parked span '
                 '(loops instead of backing in)')
-        maximum_cusps = int(self.get_parameter('maximum_cusps').value)
+        if maximum_cusps is None:
+            maximum_cusps = int(self.get_parameter('maximum_cusps').value)
         if metrics.cusp_count > maximum_cusps:
             return False, (
                 f'cusp count {metrics.cusp_count} exceeds safe maximum '
@@ -1704,7 +1740,15 @@ class AutoParallelParking(Node):
         planner_id = str(self.get_parameter('exit_planner_id').value)
         leads = [float(value) for value in self.get_parameter(
             'exit_lead_candidates').value]
-        lane_x = slot.min_x - lane_offset
+        # Aim the exit at the middle of the lane, not at the line the vehicle
+        # drove in on.  lane_offset keeps the approach close to the slot so the
+        # back-in is short, but leaving along that same line runs the vehicle
+        # 0.8 m from the slot mouth into the narrowing west extension, where
+        # pure pursuit's own collision check stopped it (error_code 104) with
+        # 1.2 m still to go.
+        del lane_offset
+        lane_x = slot.min_x - float(
+            self.get_parameter('exit_lane_offset').value)
         for lead in leads:
             if self._abort_requested():
                 return None
@@ -2246,6 +2290,30 @@ class AutoParallelParking(Node):
             segment = Path()
             segment.header = path.header
             segment.poses = path.poses[first:last + 1]
+            if run_number < len(runs):
+                current = self._current_map_pose()
+                end_pose = segment.poses[-1].pose
+                end = end_pose.position
+                tolerance = float(
+                    self.get_parameter('cusp_arrival_tolerance').value)
+                yaw_tolerance = float(
+                    self.get_parameter('cusp_yaw_tolerance').value)
+                # Position alone is not enough.  Consecutive cusp poses in a
+                # parallel park sit almost on top of each other and differ
+                # mainly in heading, so a position-only test skipped the
+                # forward run whose whole job is to straighten the vehicle and
+                # left it parked 35 deg across the slot with all four wheels
+                # nominally inside.
+                near = current is not None and math.hypot(
+                    current[0] - end.x, current[1] - end.y) <= tolerance
+                facing = current is not None and abs(normalize_angle(
+                    current[2]
+                    - yaw_from_quaternion(end_pose.orientation))) <= yaw_tolerance
+                if near and facing:
+                    self._log_info(
+                        f'FollowPath segment {run_number}/{len(runs)} skipped: '
+                        'the vehicle already stands on its cusp pose')
+                    continue
             self._log_info(
                 f'FollowPath segment {run_number}/{len(runs)} '
                 f'direction={"reverse" if direction < 0 else "forward"} '
@@ -2317,6 +2385,8 @@ class AutoParallelParking(Node):
         deadline = time.monotonic() + float(
             self.get_parameter('follow_path_timeout').value)
         next_wheel_check = time.monotonic()
+        cusp_state = {'best': float('inf'), 'since': time.monotonic(),
+                      'armed': False}
         while not result_future.done():
             if self._abort_requested():
                 if self._context_ok():
@@ -2354,6 +2424,16 @@ class AutoParallelParking(Node):
                         goal_handle.cancel_goal_async()
                     self._emergency_stop()
                     return False
+            if run_number < run_count:
+                arrived, reason = self._cusp_run_complete(path, cusp_state)
+                if arrived:
+                    self._log_info(
+                        f'run {run_number}/{run_count} treated as complete: '
+                        f'{reason}')
+                    if not self._cancel_parking_follow_path(
+                            goal_handle, result_future):
+                        return False
+                    return True
             now = time.monotonic()
             if monitor_slot is not None and now >= next_wheel_check:
                 next_wheel_check = now + float(self.get_parameter(
@@ -2390,9 +2470,60 @@ class AutoParallelParking(Node):
             f'error_code={result.error_code}')
         return result.error_code == FollowPath.Result.NONE
 
+    def _cusp_run_complete(
+            self, path: Path, state: Dict[str, float]) -> Tuple[bool, str]:
+        """Decide whether an intermediate direction run has done its job.
+
+        A Reeds-Shepp cusp is a stop-and-reverse point, and pure pursuit
+        cannot converge onto one with an Ackermann vehicle: measured on the
+        entry manoeuvre, the vehicle reverses cleanly down to 0.31 m from the
+        cusp pose and then oscillates, flipping the commanded direction 2-3
+        times a second at ~0 m/s until the progress checker aborts the goal.
+        The controller, the smoother and the vehicle all agree during that
+        window (commanded == smoothed == measured), so nothing downstream is
+        at fault -- the last 30 cm onto a cusp is simply not trackable.
+
+        Reaching the cusp exactly does not matter either: the next run is
+        planned from it, and pure pursuit picks that path up from wherever
+        the vehicle actually stands.  Only the final run's pose matters, and
+        that one is still verified by the wheel-inside monitor.
+        """
+        current = self._current_map_pose()
+        if current is None:
+            return False, ''
+        target = path.poses[-1].pose.position
+        distance = math.hypot(current[0] - target.x, current[1] - target.y)
+        tolerance = float(self.get_parameter('cusp_arrival_tolerance').value)
+        # Only arm once the vehicle has actually been outside the tolerance.
+        # Cancelling a goal in the first fraction of a second is refused by the
+        # action server ("cancel request was not accepted"), which then fails
+        # the whole run -- and a short run can start already inside it.
+        if distance > tolerance:
+            state['armed'] = True
+        if not state.get('armed'):
+            return False, ''
+        yaw_error = abs(normalize_angle(
+            current[2] - yaw_from_quaternion(path.poses[-1].pose.orientation)))
+        yaw_tolerance = float(self.get_parameter('cusp_yaw_tolerance').value)
+        if distance <= tolerance and yaw_error <= yaw_tolerance:
+            return True, (
+                f'within {distance:.3f}m and {yaw_error:.3f}rad of the '
+                'cusp pose')
+        now = time.monotonic()
+        if distance < state['best'] - 0.02:
+            state['best'] = distance
+            state['since'] = now
+            return False, ''
+        stall = float(self.get_parameter('cusp_stall_timeout').value)
+        if (now - state['since'] >= stall
+                and distance <= 2.0 * tolerance):
+            return True, (
+                f'no progress for {stall:.1f}s at {distance:.3f}m from the '
+                'cusp pose')
+        return False, ''
+
     def _cancel_parking_follow_path(self, goal_handle, result_future) -> bool:
-        self._log_info(
-            'all wheels confirmed inside; cancelling the active FollowPath')
+        self._log_info('cancelling the active FollowPath')
         cancel_future = goal_handle.cancel_goal_async()
         timeout = float(self.get_parameter('parking_cancel_timeout').value)
         response = self._wait_future(cancel_future, timeout)
