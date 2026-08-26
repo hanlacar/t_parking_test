@@ -1,3 +1,27 @@
+amcl:
+  ros__parameters:
+    use_sim_time: true
+    base_frame_id: base_footprint
+    global_frame_id: map
+    odom_frame_id: odom
+    scan_topic: /scan
+    tf_broadcast: true
+    # Gazebo Ackermann publishes the simulation pose as noise-free odometry.
+    # Do not inject the real-robot motion noise defaults into this exact source.
+    alpha1: 0.0
+    alpha2: 0.0
+    alpha3: 0.0
+    alpha4: 0.0
+    set_initial_pose: true
+    always_reset_initial_pose: false
+    initial_pose:
+      # A map made from the full_course start has map == initial odom.
+      # The world pose (-5, 0, 0) is therefore map pose (0, 0, 0).
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+
 controller_server:
   ros__parameters:
     use_sim_time: true
@@ -10,7 +34,7 @@ controller_server:
     failure_tolerance: 0.3
     progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["goal_checker", "parking_goal_checker", "cusp_goal_checker"]
-    controller_plugins: ["FollowPath", "ParkingFollowPath"]
+    controller_plugins: ["FollowPath", "ParkingFollowPath", "ParkingForward", "ParkingReverse"]
     use_realtime_priority: false
 
     progress_checker:
@@ -35,8 +59,13 @@ controller_server:
     cusp_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
       stateful: true
-      xy_goal_tolerance: 0.10
-      yaw_goal_tolerance: 0.40
+      # The real-size reverse arc must start at the actual forward/reverse
+      # seam; keep position strict. Hybrid-A* quantizes heading in 5 degree
+      # bins, so the positional straight can end at a +/-0.0873 rad pose yaw.
+      # A 0.10 rad yaw tolerance accepts that one-bin representation without
+      # allowing the old 0.40 rad premature direction switch.
+      xy_goal_tolerance: 0.03
+      yaw_goal_tolerance: 0.10
 
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
@@ -54,7 +83,7 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 1.10
+      regulated_linear_scaling_min_radius: 1.52
       regulated_linear_scaling_min_speed: 0.08
       cost_scaling_dist: 0.22
       cost_scaling_gain: 1.0
@@ -81,7 +110,7 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 1.10
+      regulated_linear_scaling_min_radius: 1.52
       regulated_linear_scaling_min_speed: 0.12
       cost_scaling_dist: 0.22
       cost_scaling_gain: 1.0
@@ -91,6 +120,84 @@ controller_server:
       # Keep a virtual carrot beyond the final pose.  This lets an Ackermann
       # vehicle converge laterally and in yaw instead of switching commands
       # around the final path sample when it finishes slightly off-center.
+      interpolate_curvature_after_goal: true
+      use_rotate_to_heading: false
+      allow_reversing: true
+      max_angular_accel: 1.0
+      stateful: true
+
+    # Parking-only instances. Their RPP parameters intentionally match
+    # ParkingFollowPath exactly; only the controller-instance gear differs.
+    ParkingForward:
+      plugin: "t_parking_sim/DirectionLockedRPP"
+      locked_direction: 1
+      segment_state_topic: "/t_parking/active_segment"
+      desired_linear_vel: 0.25
+      lookahead_dist: 0.25
+      min_lookahead_dist: 0.15
+      max_lookahead_dist: 0.35
+      lookahead_time: 1.0
+      rotate_to_heading_angular_vel: 0.45
+      transform_tolerance: 0.20
+      use_velocity_scaled_lookahead_dist: true
+      min_approach_linear_velocity: 0.08
+      approach_velocity_scaling_dist: 0.30
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 1.52
+      regulated_linear_scaling_min_speed: 0.12
+      cost_scaling_dist: 0.22
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 5.0
+      use_fixed_curvature_lookahead: true
+      curvature_lookahead_dist: 0.25
+      interpolate_curvature_after_goal: true
+      use_rotate_to_heading: false
+      allow_reversing: true
+      max_angular_accel: 1.0
+      stateful: true
+
+    ParkingReverse:
+      plugin: "t_parking_sim/DirectionLockedRPP"
+      locked_direction: -1
+      segment_state_topic: "/t_parking/active_segment"
+      # Reverse-only geometry controller. Existing RPP speed, constraints,
+      # collision checking, and lookahead parameters below remain unchanged.
+      reverse_wheel_base: 0.77
+      reverse_hard_steering_limit_deg: 27.0
+      reverse_profile_window: 0.25
+      reverse_lateral_gain: 0.35
+      reverse_heading_gain: 0.80
+      reverse_lateral_correction_limit_deg: 3.0
+      # The validated 0.450 1/m arc needs 19.13 deg feed-forward.  Live
+      # lateral correction requested 22.13 deg but the old 1.5 deg margin
+      # clipped it at 20.63 deg; retain ample margin below the 27 deg hard cap.
+      reverse_soft_limit_margin_deg: 3.0
+      # Zero selects the path-derived max-profile + margin limit.
+      reverse_soft_limit_override_deg: 0.0
+      desired_linear_vel: 0.25
+      lookahead_dist: 0.25
+      min_lookahead_dist: 0.15
+      max_lookahead_dist: 0.35
+      lookahead_time: 1.0
+      rotate_to_heading_angular_vel: 0.45
+      transform_tolerance: 0.20
+      use_velocity_scaled_lookahead_dist: true
+      min_approach_linear_velocity: 0.08
+      approach_velocity_scaling_dist: 0.30
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 1.52
+      regulated_linear_scaling_min_speed: 0.12
+      cost_scaling_dist: 0.22
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 5.0
+      use_fixed_curvature_lookahead: true
+      curvature_lookahead_dist: 0.25
       interpolate_curvature_after_goal: true
       use_rotate_to_heading: false
       allow_reversing: true
@@ -109,7 +216,9 @@ local_costmap:
       width: 4
       height: 4
       resolution: 0.05
-      footprint: "[[0.45, 0.225], [0.45, -0.225], [-0.45, -0.225], [-0.45, 0.225]]"
+      # base_footprint is the axle midpoint. Physical centre is +0.020 m,
+      # hence the measured 1.33 x 0.78 m envelope is asymmetric in x.
+      footprint: "[[0.685, 0.39], [0.685, -0.39], [-0.645, -0.39], [-0.645, 0.39]]"
       footprint_padding: 0.025
       transform_tolerance: 0.30
       plugins: ["obstacle_layer", "inflation_layer"]
@@ -126,7 +235,7 @@ local_costmap:
           data_type: "LaserScan"
           clearing: true
           marking: true
-          max_obstacle_height: 0.50
+          max_obstacle_height: 1.00
           obstacle_min_range: 0.10
           obstacle_max_range: 9.0
           raytrace_min_range: 0.10
@@ -136,7 +245,7 @@ local_costmap:
           data_type: "LaserScan"
           clearing: true
           marking: true
-          max_obstacle_height: 0.50
+          max_obstacle_height: 1.00
           obstacle_min_range: 0.10
           obstacle_max_range: 9.0
           raytrace_min_range: 0.10
@@ -160,7 +269,7 @@ global_costmap:
       robot_base_frame: base_footprint
       resolution: 0.05
       track_unknown_space: true
-      footprint: "[[0.45, 0.225], [0.45, -0.225], [-0.45, -0.225], [-0.45, 0.225]]"
+      footprint: "[[0.685, 0.39], [0.685, -0.39], [-0.645, -0.39], [-0.645, 0.39]]"
       footprint_padding: 0.025
       transform_tolerance: 0.30
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -173,17 +282,26 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        # Global planning sees only the dynamic-filtered scan: a pedestrian
-        # crossing the lane must not bend the whole global path.  The rear
-        # lidar is dropped here entirely -- it only matters for the reversing
-        # leg, which the local costmap covers.
-        observation_sources: "front_scan"
+        # Saved maps do not contain the randomly spawned parking obstacles.
+        # Feed both raw 360-degree lidars to the global layer so slot
+        # occupancy is based on live geometry, not the obstacle-layout label.
+        observation_sources: "front_scan rear_scan"
         front_scan:
-          topic: /scan_static
+          topic: /scan
           data_type: "LaserScan"
           clearing: true
           marking: true
-          max_obstacle_height: 0.50
+          max_obstacle_height: 1.00
+          obstacle_min_range: 0.10
+          obstacle_max_range: 9.0
+          raytrace_min_range: 0.10
+          raytrace_max_range: 12.0
+        rear_scan:
+          topic: /scan_rear
+          data_type: "LaserScan"
+          clearing: true
+          marking: true
+          max_obstacle_height: 1.00
           obstacle_min_range: 0.10
           obstacle_max_range: 9.0
           raytrace_min_range: 0.10
@@ -238,7 +356,8 @@ planner_server:
       analytic_expansion_max_length: 6.0
       analytic_expansion_max_cost: 200.0
       analytic_expansion_max_cost_override: false
-      minimum_turning_radius: 1.10
+      # 0.77 / tan(27 deg) = 1.511 m; round upward, never below physics.
+      minimum_turning_radius: 1.52
       reverse_penalty: 2.0
       # Was 0.0: zero cost for an extra direction switch gave the search no
       # reason to prefer a single continuous reverse curve over one with an
@@ -281,7 +400,12 @@ planner_server:
       analytic_expansion_max_length: 3.0
       analytic_expansion_max_cost: 200.0
       analytic_expansion_max_cost_override: false
-      minimum_turning_radius: 1.10
+      # Keep a conservative lattice-generation margin above the measured
+      # 1.511 m physical radius.  With 1.52 here, the 0.05 m Smac lattice
+      # rasterized its Dubins arc at 0.681 1/m (effective 1.47 m), while the
+      # strict post-plan validator correctly limits it to 1/1.52=0.658 1/m.
+      # This changes only ForwardExit path generation; RPP remains untouched.
+      minimum_turning_radius: 1.70
       reverse_penalty: 2.0
       # Was 0.0: zero cost for an extra direction switch gave the search no
       # reason to prefer a single continuous reverse curve over one with an

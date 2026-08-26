@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Plan and execute a Nav2-only T parking and entrance-return cycle."""
 
+import copy
 from dataclasses import dataclass
 import math
 import threading
@@ -31,10 +32,15 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from slam_toolbox.srv import Pause
-from std_msgs.msg import ColorRGBA, String
+from std_msgs.msg import Bool, ColorRGBA, Float32, Int32, Int32MultiArray, String
 from std_srvs.srv import Trigger
 import tf2_ros
 from visualization_msgs.msg import Marker, MarkerArray
+
+
+SLOT_UNKNOWN = 'UNKNOWN'
+SLOT_FREE = 'FREE'
+SLOT_OCCUPIED = 'OCCUPIED'
 
 
 @dataclass
@@ -83,6 +89,16 @@ class ForwardExitCandidate:
     path: Path
     metrics: PathMetrics
     turn_direction: str
+
+
+@dataclass(frozen=True)
+class DirectionSegment:
+    """An inclusive pose slice with one physically confirmed direction."""
+
+    first_pose: int
+    last_pose: int
+    direction: int
+    length: float
 
 
 def yaw_from_quaternion(quaternion) -> float:
@@ -139,27 +155,55 @@ class AutoTParking(Node):
             Path, '/t_parking/reverse_path', transient_qos)
         self.marker_publisher = self.create_publisher(
             MarkerArray, '/t_parking/markers', transient_qos)
+        self.segment_state_publisher = self.create_publisher(
+            Int32MultiArray, '/t_parking/active_segment', transient_qos)
         # A zero-only safety output for cancellation, failure, and settling
-        # after Nav2 has completed a FollowPath goal.  Nav2's Jazzy bringup
-        # remaps the controller output to /cmd_vel_nav, so clear both the
-        # upstream smoother input and the final Gazebo bridge input.  Clearing
-        # only /cmd_vel is temporary because the velocity smoother continues
-        # republishing its last non-zero sample until its timeout expires.
+        # after Nav2 has completed a FollowPath goal.  This clears the
+        # velocity smoother input; the smoother then feeds the sole
+        # Twist-to-lidar adapter.  This node must never publish /cmd_vel
+        # directly because /lidar_* is the final shared vehicle command.
         self.nav_stop_publisher = self.create_publisher(
             Twist, '/cmd_vel_nav', 10)
-        self.stop_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Private request consumed by cmd_vel_to_lidar_cmd.  Only genuine
+        # safety faults set it; normal segment/cusp/final stops remain
+        # /lidar_drive=0 with /lidar_stop=false.
+        self.emergency_stop_request_publisher = self.create_publisher(
+            Bool, '/t_parking/emergency_stop_request', 10)
 
         self.map_msg: Optional[OccupancyGrid] = None
         self.global_costmap: Optional[Costmap] = None
         self.local_costmap: Optional[Costmap] = None
         self.odom_msg: Optional[Odometry] = None
+        self.front_scan_msg: Optional[LaserScan] = None
         self.scan_received_at = 0.0
         self.rear_scan_msg: Optional[LaserScan] = None
         self.rear_scan_received_at = 0.0
+        self.front_scan_count = 0
+        self.rear_scan_count = 0
+        self.global_costmap_count = 0
+        self.local_costmap_count = 0
+        self.obstacle_observation_ready = False
         self.cmd_vel_nonzero_seen = False
         self.cmd_vel_direction: Optional[str] = None
         self.last_cmd_vel = Twist()
+        self.last_cmd_vel_nav = Twist()
+        self.last_cmd_vel_control = Twist()
+        self.last_lidar_drive = 0.0
+        self.last_lidar_wheel = 0
+        self.last_command_trace = 0.0
+        self.reverse_motion_start_logged = False
+        self.reverse_steering_start_logged = False
         self.minimum_exit_linear_x = float('inf')
+        self.active_direction_segment: Optional[DirectionSegment] = None
+        self.active_segment_number = 0
+        self.active_segment_stats: Optional[Dict[str, float]] = None
+        self.segment_execution_stats: List[Dict[str, float]] = []
+        self._last_direction_sign: Dict[str, int] = {}
+        self.active_segment_path: Optional[Path] = None
+        self.last_direction_diagnostic: Dict[str, float] = {}
+        self.last_stop_elapsed = 0.0
+        self.last_stop_linear_speed = float('inf')
+        self.last_stop_angular_speed = float('inf')
         self.data_lock = threading.Lock()
         self.readiness_lock = threading.Lock()
         self.readiness_cache: Dict[str, bool] = {}
@@ -186,6 +230,19 @@ class AutoTParking(Node):
             callback_group=self.callback_group)
         self.create_subscription(
             Twist, '/cmd_vel', self._cmd_vel_callback, 10,
+            callback_group=self.callback_group)
+        self.create_subscription(
+            Twist, '/cmd_vel_nav', self._cmd_vel_nav_callback, 10,
+            callback_group=self.callback_group)
+        self.create_subscription(
+            Twist, '/t_parking/cmd_vel_control',
+            self._cmd_vel_control_callback, 10,
+            callback_group=self.callback_group)
+        self.create_subscription(
+            Float32, '/lidar_drive', self._lidar_drive_callback, 10,
+            callback_group=self.callback_group)
+        self.create_subscription(
+            Int32, '/lidar_wheel', self._lidar_wheel_callback, 10,
             callback_group=self.callback_group)
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=30.0))
@@ -257,7 +314,7 @@ class AutoTParking(Node):
 
     def _declare_parameters(self) -> None:
         defaults = {
-            'target_slot': 'auto', 'auto_start': False, 'execute': False,
+            'target_slot': 'auto', 'auto_start': True, 'execute': True,
             'return_to_entrance': True,
             'stop_when_all_wheels_inside': True,
             'exit_mode': 'forward_right',
@@ -265,15 +322,15 @@ class AutoTParking(Node):
             'require_forward_only_exit': True,
             'require_right_turn_exit': True,
             'max_reverse_distance_during_exit': 0.01,
-            'road_center_y': 0.0, 'road_min_y': -1.75,
-            'road_max_y': 1.75, 'approach_lead': 0.50,
-            # Must stay at or above vehicle_length: pulling up less than one
-            # car length past the slot forces a reverse arc too sharp to clear
-            # the slot's side wall.
-            'setup_offset_candidates': [0.90, 1.15, 1.40, 1.65],
+            'road_center_y': 0.0, 'road_min_y': -2.16,
+            'road_max_y': 2.16, 'approach_lead': 0.50,
+            # R-slot_half_width = 1.52-0.915 = 0.605 m is the geometry-based
+            # nominal setup for the expanded real-vehicle bay.
+            'setup_offset_candidates': [0.60, 0.75, 0.90, 1.05],
             'wall_clearance': 0.08,
             'entry_depth_candidates': [0.10, 0.20, 0.30],
-            'vehicle_length': 0.90, 'vehicle_width': 0.45,
+            'vehicle_length': 1.33, 'vehicle_width': 0.78,
+            'vehicle_center_x_offset': 0.020,
             'footprint_clearance': 0.06,
             'rear_clearance': 0.70,
             # Lower bound on the rear-bumper-to-curb gap, independent of
@@ -290,20 +347,23 @@ class AutoTParking(Node):
             'wheel_frames': [
                 'front_left_wheel_link', 'front_right_wheel_link',
                 'rear_left_wheel_link', 'rear_right_wheel_link'],
-            'wheel_radius': 0.095,
-            'wheel_base': 0.58,
-            'wheel_track': 0.38,
+            'wheel_radius': 0.14,
+            'wheel_base': 0.77,
+            'wheel_track': 0.67,
             'wheel_inside_margin': 0.01,
             'wheel_inside_confirm_count': 5,
             'wheel_check_period': 0.10,
             'stop_confirm_count': 3,
-            'minimum_turning_radius': 1.10,
-            'curvature_tolerance_factor': 1.20,
+            'minimum_turning_radius': 1.52,
+            'curvature_tolerance_factor': 1.00,
             'minimum_reverse_length': 0.30,
             'maximum_cusps': 2,
             'occupied_threshold': 50,
             'system_wait_timeout': 120.0, 'map_wait_timeout': 120.0,
             'scan_timeout': 2.0,
+            'obstacle_observation_frames': 10,
+            'costmap_observation_updates': 3,
+            'obstacle_observation_settle_time': 1.0,
             'rear_emergency_stop_distance': 0.15,
             'rear_emergency_sector_deg': 30.0,
             'observation_odom_x': 6.50,
@@ -324,9 +384,10 @@ class AutoTParking(Node):
             'entrance_return_position_tolerance': 0.10,
             'entrance_return_yaw_tolerance': 0.12,
             'maximum_exit_cusps': 4,
-            'forward_clear_distance_candidates': [0.45, 0.55, 0.65, 0.75],
-            'right_turn_lead_candidates': [0.15, 0.25, 0.35],
-            'lane_merge_distance_candidates': [0.80, 1.00, 1.20],
+            'forward_clear_distance_candidates': [0.02, 0.07, 0.12, 0.17],
+            'right_turn_lead_candidates': [0.00, 0.05, 0.10],
+            'lane_merge_distance_candidates': [0.80],
+            'exit_planning_turn_radius': 1.70,
             'final_position_tolerance': 0.08,
             'final_yaw_tolerance': 0.12,
             # Upper bound only: the strict sustained-odometry stop check
@@ -335,6 +396,8 @@ class AutoTParking(Node):
             'stop_wait_timeout': 120.0,
             'planner_id': 'GridBased',
             'controller_id': 'ParkingFollowPath',
+            'forward_controller_id': 'ParkingForward',
+            'reverse_controller_id': 'ParkingReverse',
             'goal_checker_id': 'parking_goal_checker',
             'progress_checker_id': 'progress_checker',
             'freeze_slam_during_execution': True,
@@ -342,8 +405,12 @@ class AutoTParking(Node):
         for name, default in defaults.items():
             self.declare_parameter(name, default)
         slot_defaults = {
-            'slot_1': (5.75, 4.25, -math.pi / 2, 5.0, 6.5, 1.75, 6.75),
-            'slot_2': (7.25, 4.25, -math.pi / 2, 6.5, 8.0, 1.75, 6.75),
+            'slot_1': (
+                5.585, 4.875, -math.pi / 2,
+                4.67, 6.50, 2.16, 7.59),
+            'slot_2': (
+                7.415, 4.875, -math.pi / 2,
+                6.50, 8.33, 2.16, 7.59),
         }
         fields = ('odom_x', 'odom_y', 'yaw', 'min_x', 'max_x', 'min_y', 'max_y')
         for slot_name, values in slot_defaults.items():
@@ -397,7 +464,7 @@ class AutoTParking(Node):
         return self._safe_log('info', message)
 
     def _log_warn(self, message: str) -> bool:
-        return self._safe_log('warn', message)
+        return self._safe_log('warning', message)
 
     def _log_error(self, message: str) -> bool:
         return self._safe_log('error', message)
@@ -428,18 +495,24 @@ class AutoTParking(Node):
     def _global_costmap_callback(self, msg: Costmap) -> None:
         with self.data_lock:
             self.global_costmap = msg
+            self.global_costmap_count += 1
 
     def _local_costmap_callback(self, msg: Costmap) -> None:
         with self.data_lock:
             self.local_costmap = msg
+            self.local_costmap_count += 1
 
-    def _scan_callback(self, _msg: LaserScan) -> None:
-        self.scan_received_at = time.monotonic()
+    def _scan_callback(self, msg: LaserScan) -> None:
+        with self.data_lock:
+            self.front_scan_msg = msg
+            self.scan_received_at = time.monotonic()
+            self.front_scan_count += 1
 
     def _rear_scan_callback(self, msg: LaserScan) -> None:
         with self.data_lock:
             self.rear_scan_msg = msg
             self.rear_scan_received_at = time.monotonic()
+            self.rear_scan_count += 1
 
     def _odom_callback(self, msg: Odometry) -> None:
         with self.data_lock:
@@ -450,9 +523,13 @@ class AutoTParking(Node):
             return
         with self.data_lock:
             self.last_cmd_vel = msg
+            diagnostic_log = self._record_direction_sample_locked(
+                'cmd_vel', float(msg.linear.x))
             if self.motion_phase == 'forward_exit':
                 self.minimum_exit_linear_x = min(
                     self.minimum_exit_linear_x, float(msg.linear.x))
+        if diagnostic_log:
+            self._log_info(diagnostic_log)
         moving = (
             abs(msg.linear.x) > 1.0e-4
             or abs(msg.linear.y) > 1.0e-4
@@ -462,13 +539,153 @@ class AutoTParking(Node):
         if not self.cmd_vel_nonzero_seen:
             self.cmd_vel_nonzero_seen = True
             self._log_info(
-                'first non-zero /cmd_vel received: '
+                '[T-PARK] first non-zero /cmd_vel received: '
                 f'linear.x={msg.linear.x:.3f}m/s '
                 f'angular.z={msg.angular.z:.3f}rad/s')
         direction = 'reverse' if msg.linear.x < 0.0 else 'forward'
         if direction != self.cmd_vel_direction:
             self.cmd_vel_direction = direction
             self._log_info(f'/cmd_vel motion state: {direction}')
+
+    def _cmd_vel_nav_callback(self, msg: Twist) -> None:
+        if not self._runtime_ok():
+            return
+        with self.data_lock:
+            self.last_cmd_vel_nav = msg
+            diagnostic_log = self._record_direction_sample_locked(
+                'cmd_vel_nav', float(msg.linear.x))
+        if diagnostic_log:
+            self._log_info(diagnostic_log)
+
+    def _cmd_vel_control_callback(self, msg: Twist) -> None:
+        if not self._runtime_ok():
+            return
+        with self.data_lock:
+            self.last_cmd_vel_control = msg
+            diagnostic_log = self._record_direction_sample_locked(
+                'cmd_vel_control', float(msg.linear.x))
+            log_reverse_start = (
+                self.active_direction_segment is not None
+                and self.active_direction_segment.direction < 0
+                and msg.linear.x < -0.01
+                and not self.reverse_motion_start_logged)
+            if log_reverse_start:
+                self.reverse_motion_start_logged = True
+        if diagnostic_log:
+            self._log_info(diagnostic_log)
+        self._trace_command_chain(
+            'REVERSE_MOTION_START' if log_reverse_start else '')
+
+    def _lidar_drive_callback(self, msg: Float32) -> None:
+        if not self._runtime_ok():
+            return
+        value = float(msg.data)
+        with self.data_lock:
+            self.last_lidar_drive = value
+            diagnostic_log = self._record_direction_sample_locked(
+                'lidar_drive', value)
+        if diagnostic_log:
+            self._log_info(diagnostic_log)
+
+    def _lidar_wheel_callback(self, msg: Int32) -> None:
+        if not self._runtime_ok():
+            return
+        value = int(msg.data)
+        with self.data_lock:
+            self.last_lidar_wheel = value
+            stats = self.active_segment_stats
+            if stats is not None:
+                stats['lidar_wheel_samples'] += 1
+                stats['max_abs_lidar_wheel'] = max(
+                    stats['max_abs_lidar_wheel'], abs(value))
+                saturated = abs(value) >= 27
+                if saturated:
+                    stats['lidar_wheel_saturation_samples'] += 1
+                    if not stats['lidar_wheel_saturation_active']:
+                        stats['lidar_wheel_saturation_events'] += 1
+                stats['lidar_wheel_saturation_active'] = saturated
+                sign = 1 if value > 0 else -1 if value < 0 else 0
+                previous = stats['last_lidar_wheel_nonzero_sign']
+                if sign and previous and sign != previous:
+                    stats['lidar_wheel_sign_reversals'] += 1
+                if sign:
+                    stats['last_lidar_wheel_nonzero_sign'] = sign
+            log_reverse_steering = (
+                self.active_direction_segment is not None
+                and self.active_direction_segment.direction < 0
+                and self.last_cmd_vel_control.linear.x < -0.01
+                and value != 0
+                and not self.reverse_steering_start_logged)
+            if log_reverse_steering:
+                self.reverse_steering_start_logged = True
+        if log_reverse_steering:
+            self._trace_command_chain('REVERSE_STEERING_ACTIVE')
+
+    def _trace_command_chain(self, force_label: str = '') -> None:
+        """Log one synchronized view of every command conversion stage."""
+        now = time.monotonic()
+        with self.data_lock:
+            segment = self.active_direction_segment
+            if not force_label and (
+                    segment is None or now - self.last_command_trace < 0.5):
+                return
+            self.last_command_trace = now
+            cmd_nav = copy.deepcopy(self.last_cmd_vel_nav)
+            cmd_control = copy.deepcopy(self.last_cmd_vel_control)
+            drive = self.last_lidar_drive
+            wheel = self.last_lidar_wheel
+            cmd_vel = copy.deepcopy(self.last_cmd_vel)
+            segment_number = self.active_segment_number
+            direction = 0 if segment is None else segment.direction
+        label = force_label or 'RUNNING'
+        self._log_info(
+            '[COMMAND TRACE] '
+            f'state={label} segment={segment_number} '
+            f'direction={"REVERSE" if direction < 0 else "FORWARD" if direction > 0 else "NONE"} '
+            f'cmd_vel_nav=({cmd_nav.linear.x:+.4f},{cmd_nav.angular.z:+.4f}) '
+            f'cmd_vel_control=({cmd_control.linear.x:+.4f},{cmd_control.angular.z:+.4f}) '
+            f'lidar_drive={drive:+.1f} lidar_wheel={wheel:+d} '
+            f'cmd_vel=({cmd_vel.linear.x:+.4f},{cmd_vel.angular.z:+.4f})')
+
+    def _record_direction_sample_locked(
+            self, source: str, value: float) -> Optional[str]:
+        """Count nonzero command samples that oppose the active path run."""
+        segment = self.active_direction_segment
+        stats = self.active_segment_stats
+        if segment is None or stats is None:
+            return None
+        epsilon = 0.01
+        sign = 1 if value > epsilon else -1 if value < -epsilon else 0
+        previous_sign = self._last_direction_sign.get(source, 0)
+        self._last_direction_sign[source] = sign
+        if sign == 0 or sign == segment.direction:
+            return None
+        sample_key = f'{source}_wrong_samples'
+        event_key = f'{source}_wrong_events'
+        stats[sample_key] += 1
+        new_event = previous_sign != sign
+        if new_event:
+            stats[event_key] += 1
+        event_count = stats[event_key]
+        sample_count = stats[sample_key]
+        # Log each new wrong-sign run, while still counting every bad sample.
+        if not new_event:
+            return None
+        diagnostic = dict(self.last_direction_diagnostic)
+        detail = ''
+        if diagnostic:
+            detail = (
+                f' path_index={int(diagnostic.get("path_index", -1))} '
+                f'robot=({diagnostic.get("robot_x", float("nan")):.3f},'
+                f'{diagnostic.get("robot_y", float("nan")):.3f},'
+                f'{diagnostic.get("robot_yaw", float("nan")):.3f}) '
+                f'diagnostic_carrot_base_x='
+                f'{diagnostic.get("carrot_base_x", float("nan")):+.3f}')
+        return (
+            '[T-PARK][DIRECTION ERROR] '
+            f'expected={"REVERSE" if segment.direction < 0 else "FORWARD"} '
+            f'{source}={value:+.3f} segment={self.active_segment_number} '
+            f'event={event_count} bad_samples={sample_count}{detail}')
 
     def _auto_start_once(self) -> None:
         if not self.auto_start or not self._runtime_ok():
@@ -525,8 +742,17 @@ class AutoTParking(Node):
             self.target_slot = str(self.get_parameter('target_slot').value)
             self.execute_path = bool(self.get_parameter('execute').value)
             self.cancel_requested.clear()
+            self._set_emergency_stop_request(False)
             self.cmd_vel_nonzero_seen = False
             self.cmd_vel_direction = None
+            self.active_direction_segment = None
+            self.active_segment_number = 0
+            self.active_segment_stats = None
+            self.active_segment_path = None
+            self.segment_execution_stats = []
+            self._last_direction_sign = {}
+            self.last_direction_diagnostic = {}
+            self.obstacle_observation_ready = False
             self.course_entrance_pose = None
             self.parking_wheels_inside = False
             self.wheel_inside_confirm_count = 0
@@ -594,6 +820,16 @@ class AutoTParking(Node):
                 self._fail('wheel TF and base-footprint geometry are unavailable')
                 return
 
+            self._publish_status('WAIT_OBSTACLE_OBSERVATION')
+            if not self._wait_for_stable_obstacle_observation():
+                if self._abort_requested():
+                    self._cancelled()
+                else:
+                    self._fail(
+                        'front/rear lidar and costmaps did not provide a '
+                        'stable obstacle observation window')
+                return
+
             self._publish_status('WAIT_MAP')
             available_slots = self._wait_for_map_and_slots()
             if not available_slots:
@@ -625,18 +861,9 @@ class AutoTParking(Node):
                     return
                 self._fail('all setup/depth candidates were rejected')
                 return
-            # Fewest cusps first, then the smoothest curve.  Preferring the
-            # largest setup_offset instead was tried and is wrong for this
-            # bay: measured max_curvature rises with the offset (0.90 -> 0.542,
-            # 1.15 -> 0.605, 1.40 -> 1.176, 1.65 -> 1.181 1/m), because pulling
-            # further past the slot forces a sharper swing back to line up with
-            # it.  The 1.65 path validated but sat at 93% of the curvature
-            # limit, and RegulatedPurePursuitController could not track it --
-            # it drifted onto the slot's west wall and stopped on its own
-            # collision check.  The real fix for turning in too early is the
-            # raised setup_offset_candidates floor (>= one vehicle length), not
-            # the selection order; with every candidate now at or above that
-            # floor, the gentlest arc is also the one that gets driven.
+            # Fewest cusps first, then the smoothest curve. Pulling farther
+            # beyond the geometry-derived setup point forces a sharper swing
+            # back, so the gentlest valid candidate is the one to execute.
             self.selected_candidate = min(
                 candidates,
                 key=lambda item: (
@@ -733,7 +960,7 @@ class AutoTParking(Node):
                 self._log_warn(
                     'vehicle still moving after parking-goal cancellation; '
                     'sending zero-velocity safety pulse')
-                self._emergency_stop()
+                self._emergency_stop(emergency=True)
                 if not self._wait_until_stopped(float(
                         self.get_parameter('stop_wait_timeout').value)):
                     self._fail(
@@ -1155,6 +1382,11 @@ class AutoTParking(Node):
         forward_x = math.cos(slot.yaw)
         forward_y = math.sin(slot.yaw)
         half_length = 0.5 * float(self.get_parameter('vehicle_length').value)
+        center_x = float(self.get_parameter(
+            'vehicle_center_x_offset').value)
+        # The car reverses into the bay.  base_footprint is the axle midpoint,
+        # so the measured rear-bumper extent is half_length-center_x.
+        rear_extent = half_length - center_x
         minimum_clearance = (
             float(self.get_parameter('curb_inflation_radius').value)
             + float(self.get_parameter('wheel_radius').value))
@@ -1163,10 +1395,10 @@ class AutoTParking(Node):
         target_x, target_y = slot.odom_x, slot.odom_y
         if abs(forward_x) >= abs(forward_y):
             far_edge = slot.min_x if forward_x > 0.0 else slot.max_x
-            target_x = far_edge + forward_x * (half_length + clearance)
+            target_x = far_edge + forward_x * (rear_extent + clearance)
         else:
             far_edge = slot.min_y if forward_y > 0.0 else slot.max_y
-            target_y = far_edge + forward_y * (half_length + clearance)
+            target_y = far_edge + forward_y * (rear_extent + clearance)
         return target_x, target_y
 
     def _update_wheels_inside(self, slot: Slot) -> bool:
@@ -1231,31 +1463,36 @@ class AutoTParking(Node):
         deadline = time.monotonic() + float(
             self.get_parameter('map_wait_timeout').value)
         observation_attempted = False
+        last_states = None
         while time.monotonic() < deadline and not self._abort_requested():
-            availability = {
-                slot.name: self._slot_is_available(slot) for slot in self.slots}
+            states = {slot.name: self._slot_state(slot) for slot in self.slots}
+            state_tuple = tuple(states[slot.name] for slot in self.slots)
+            if state_tuple != last_states:
+                self._log_info(
+                    '[SLOT CHECK]\n' + '\n'.join(
+                        f'{slot.name}: {states[slot.name]}'
+                        for slot in self.slots))
+                last_states = state_tuple
             available = [
-                slot for slot in self.slots if availability[slot.name]]
+                slot for slot in self.slots
+                if states[slot.name] == SLOT_FREE]
             if available:
-                lines = ['[SLOT CHECK]']
-                lines.extend(
-                    f'{slot.name}: '
-                    f'{"FREE" if availability[slot.name] else "OCCUPIED"}'
-                    for slot in self.slots)
-                self._log_info('\n'.join(lines))
                 return available
-            # From the protected initial pose, the low entrance curb occludes
-            # the deep half of both slots from the horizontal lidar beam.  An
-            # executing run may therefore make one common, forward Nav2
-            # observation pass before slot selection.  Plan-only mode never
-            # enters this branch and remains motionless.
-            if self.execute_path and not observation_attempted:
+            # If a saved map still leaves either bay unknown, an executing run
+            # may make one common, forward Nav2 observation pass before slot
+            # selection. Plan-only mode never enters this branch and remains
+            # motionless.
+            if (self.execute_path and not observation_attempted
+                    and SLOT_UNKNOWN in states.values()):
                 observation_attempted = True
                 self._publish_status('MAP_PARKING_BAY')
                 if not self._observe_parking_bay():
                     return []
                 if not self._interruptible_sleep(float(self.get_parameter(
                         'map_observation_settle_time').value)):
+                    return []
+                self.obstacle_observation_ready = False
+                if not self._wait_for_stable_obstacle_observation():
                     return []
                 continue
             if not self._interruptible_sleep(0.5):
@@ -1292,10 +1529,73 @@ class AutoTParking(Node):
             'parking-bay observation pass complete; vehicle stopped')
         return True
 
-    def _slot_is_available(self, slot: Slot) -> bool:
+    def _wait_for_stable_obstacle_observation(self) -> bool:
+        """Require new lidar frames and costmap updates before slot selection."""
+        required_scans = max(1, int(self.get_parameter(
+            'obstacle_observation_frames').value))
+        required_costmaps = max(1, int(self.get_parameter(
+            'costmap_observation_updates').value))
+        settle_time = max(0.0, float(self.get_parameter(
+            'obstacle_observation_settle_time').value))
+        timeout = float(self.get_parameter('map_wait_timeout').value)
+        started = time.monotonic()
+        deadline = started + timeout
+        with self.data_lock:
+            first_front = self.front_scan_count
+            first_rear = self.rear_scan_count
+            first_global = self.global_costmap_count
+            first_local = self.local_costmap_count
+        front_delta = rear_delta = global_delta = local_delta = 0
+        while time.monotonic() < deadline and not self._abort_requested():
+            now = time.monotonic()
+            with self.data_lock:
+                front_delta = self.front_scan_count - first_front
+                rear_delta = self.rear_scan_count - first_rear
+                global_delta = self.global_costmap_count - first_global
+                local_delta = self.local_costmap_count - first_local
+                front_age = now - self.scan_received_at
+                rear_age = now - self.rear_scan_received_at
+            scan_timeout = float(self.get_parameter('scan_timeout').value)
+            sensor_tf_ready = (
+                self.tf_buffer.can_transform(
+                    'map', 'laser_link', Time(),
+                    timeout=Duration(seconds=0.05))
+                and self.tf_buffer.can_transform(
+                    'map', 'rear_laser_link', Time(),
+                    timeout=Duration(seconds=0.05)))
+            if (front_delta >= required_scans
+                    and rear_delta >= required_scans
+                    and global_delta >= required_costmaps
+                    and local_delta >= required_costmaps
+                    and front_age < scan_timeout
+                    and rear_age < scan_timeout
+                    and now - started >= settle_time
+                    and sensor_tf_ready):
+                self.obstacle_observation_ready = True
+                self._log_info(
+                    '[OBSTACLE OBSERVATION STABLE]\n'
+                    f'front_scan_frames={front_delta}\n'
+                    f'rear_scan_frames={rear_delta}\n'
+                    f'global_costmap_updates={global_delta}\n'
+                    f'local_costmap_updates={local_delta}\n'
+                    f'settle_time={now - started:.2f}s')
+                return True
+            if not self._interruptible_sleep(0.05):
+                return False
+        self._log_error(
+            'stable obstacle observation timeout: '
+            f'front={front_delta}/{required_scans} '
+            f'rear={rear_delta}/{required_scans} '
+            f'global_costmap={global_delta}/{required_costmaps} '
+            f'local_costmap={local_delta}/{required_costmaps}')
+        return False
+
+    def _slot_state(self, slot: Slot) -> str:
+        if not self.obstacle_observation_ready:
+            return SLOT_UNKNOWN
         final_pose = self._odom_pose_to_map(slot.odom_x, slot.odom_y, slot.yaw)
         if final_pose is None:
-            return False
+            return SLOT_UNKNOWN
         length = float(self.get_parameter('vehicle_length').value)
         width = float(self.get_parameter('vehicle_width').value)
         clearance = float(self.get_parameter('footprint_clearance').value)
@@ -1307,7 +1607,7 @@ class AutoTParking(Node):
             slot.min_y + 0.5 * length + clearance,
             slot.yaw)
         if entrance_pose is None:
-            return False
+            return SLOT_UNKNOWN
         samples = self._footprint_samples(
             final_pose, length + 2.0 * clearance, width + 2.0 * clearance)
         samples.extend(self._footprint_samples(
@@ -1321,7 +1621,7 @@ class AutoTParking(Node):
             map_msg = self.map_msg
             costmap = self.global_costmap
         if map_msg is None or costmap is None:
-            return False
+            return SLOT_UNKNOWN
         # Inflation costs describe whether the *robot centre* can occupy a
         # cell.  Applying them again at every footprint sample double-counts
         # the footprint and incorrectly rejects the otherwise clear 1.5 m
@@ -1330,14 +1630,31 @@ class AutoTParking(Node):
         for pose in (entrance_pose, final_pose, rear):
             cost_value = self._cost_value(
                 costmap, pose.pose.position.x, pose.pose.position.y)
-            if cost_value is None or cost_value == 255 or cost_value >= 253:
-                return False
+            if cost_value is None or cost_value == 255:
+                return SLOT_UNKNOWN
+            if cost_value >= 253:
+                return SLOT_OCCUPIED
+        # A spawned box is 0.45 m wide, so a lidar return on its front or side
+        # face need not land on the slot centre cell. Inspect lethal obstacle
+        # cells over the complete candidate footprint while deliberately
+        # ignoring non-lethal inflation costs (those would double-count the
+        # vehicle footprint and reject a geometrically open 1.5 m bay).
+        for x, y in samples:
+            cost_value = self._cost_value(costmap, x, y)
+            if cost_value is None or cost_value == 255:
+                return SLOT_UNKNOWN
+            if cost_value >= 253:
+                return SLOT_OCCUPIED
         occupied_threshold = int(self.get_parameter('occupied_threshold').value)
         for x, y in samples:
             map_value = self._occupancy_value(map_msg, x, y)
-            if map_value is None or map_value < 0 or map_value >= occupied_threshold:
-                return False
-        return self._final_footprint_inside_slot(slot, final_pose)
+            if map_value is None or map_value < 0:
+                return SLOT_UNKNOWN
+            if map_value >= occupied_threshold:
+                return SLOT_OCCUPIED
+        if not self._final_footprint_inside_slot(slot, final_pose):
+            return SLOT_OCCUPIED
+        return SLOT_FREE
 
     def _odom_pose_to_map(
             self, x: float, y: float, yaw: float) -> Optional[PoseStamped]:
@@ -1416,6 +1733,10 @@ class AutoTParking(Node):
                         named['approach'], named['setup'],
                         named['entry'], named['final']])
                     if path is None:
+                        self._log_error(
+                            f'reject {slot.name} offset={setup_offset:.2f} '
+                            f'depth={entry_depth:.2f}: '
+                            'ComputePathThroughPoses returned no path')
                         continue
                     metrics = self._analyze_path(path, named['final'])
                     minimum_reverse = float(
@@ -1423,7 +1744,7 @@ class AutoTParking(Node):
                     reverse_after_setup = self._reverse_length_after_pose(
                         path, metrics, named['setup'])
                     if reverse_after_setup < minimum_reverse:
-                        self._log_warn(
+                        self._log_info(
                             f'reject {slot.name} offset={setup_offset:.2f} '
                             f'depth={entry_depth:.2f}: reverse after setup '
                             f'{reverse_after_setup:.3f}m < {minimum_reverse:.3f}m')
@@ -1431,7 +1752,7 @@ class AutoTParking(Node):
                     valid, reason = self._validate_path(
                         slot, named, path, metrics)
                     if not valid:
-                        self._log_warn(
+                        self._log_info(
                             f'reject {slot.name} offset={setup_offset:.2f} '
                             f'depth={entry_depth:.2f}: {reason}')
                         continue
@@ -1479,7 +1800,7 @@ class AutoTParking(Node):
         send_future = self.plan_client.send_goal_async(goal)
         goal_handle = self._wait_future(send_future, 5.0)
         if goal_handle is None or not goal_handle.accepted:
-            self._log_warn('ComputePathThroughPoses goal not accepted')
+            self._log_error('ComputePathThroughPoses goal not accepted')
             return None
         self.active_plan_goal = goal_handle
         result_future = goal_handle.get_result_async()
@@ -1487,20 +1808,21 @@ class AutoTParking(Node):
             result_future, float(self.get_parameter('action_timeout').value))
         self.active_plan_goal = None
         if wrapped is None:
-            self._log_warn('ComputePathThroughPoses result wait failed/timed out')
+            self._log_error(
+                'ComputePathThroughPoses result wait failed/timed out')
             return None
         if wrapped.status != GoalStatus.STATUS_SUCCEEDED:
-            self._log_warn(
+            self._log_error(
                 f'ComputePathThroughPoses non-success status={wrapped.status}')
             return None
         result = wrapped.result
         if result.error_code != ComputePathThroughPoses.Result.NONE:
-            self._log_warn(
+            self._log_error(
                 f'ComputePathThroughPoses error={result.error_code}: '
                 f'{result.error_msg}')
             return None
         if not result.path.poses:
-            self._log_warn(
+            self._log_error(
                 'ComputePathThroughPoses succeeded but returned an empty path')
             return None
         return result.path
@@ -1637,34 +1959,29 @@ class AutoTParking(Node):
         heading = yaw_from_quaternion(stop.pose.orientation)
         forward = (math.cos(heading), math.sin(heading))
         right = (math.sin(heading), -math.cos(heading))
-        # This offset is a 45-degree chamfer standing in for a quarter-circle
-        # right turn: forward_offset = right_offset = radius traces the same
-        # start/end tangents as an arc of that radius.  If the offset is
-        # smaller than the vehicle's own minimum_turning_radius, the chamfer
-        # sits *inside* the smallest circle the vehicle can actually drive,
-        # so no forward-only arc connects turn_entry to merge on the correct
-        # side -- DUBIN then has to loop the long way around to satisfy both
-        # the position and the heading, which is exactly the oversized loop
-        # this exit path must not have.  Flooring the offset at
-        # minimum_turning_radius guarantees every candidate stays a
-        # physically reachable single turn.
         minimum_radius = float(
             self.get_parameter('minimum_turning_radius').value)
-        turn_offset = max(lane_merge, minimum_radius)
+        planning_radius = float(
+            self.get_parameter('exit_planning_turn_radius').value)
+        target = self._fresh_pose(self.course_entrance_pose)
+        target_dx = target.pose.position.x - turn_entry.pose.position.x
+        target_dy = target.pose.position.y - turn_entry.pose.position.y
+        # For a 90-degree right arc followed by a straight, expressed in the
+        # vehicle's frame at turn_entry:
+        #   target_delta = R * forward + (R + straight) * right.
+        # Solve R from the real entrance coordinate instead of forcing a
+        # fixed chamfer radius that leaves the merge line offset from the
+        # entrance and makes Dubins loop in the opposite direction.
+        turn_offset = target_dx * forward[0] + target_dy * forward[1]
+        rightward_distance = target_dx * right[0] + target_dy * right[1]
+        straight_after_turn = rightward_distance - turn_offset
+        if (turn_offset < max(minimum_radius, planning_radius)
+                or straight_after_turn < lane_merge):
+            return None
         merge = self._fresh_pose(turn_entry)
         merge.pose.position.x += turn_offset * (forward[0] + right[0])
         merge.pose.position.y += turn_offset * (forward[1] + right[1])
-        target = self._fresh_pose(self.course_entrance_pose)
-        dx = target.pose.position.x - merge.pose.position.x
-        dy = target.pose.position.y - merge.pose.position.y
-        if math.hypot(dx, dy) < 0.05:
-            return None
-        # A forward-only, no-reverse vehicle returning along the same single
-        # lane necessarily arrives heading opposite to its original outbound
-        # heading; forcing the originally-captured (outbound) yaw here would
-        # make every candidate a physically impossible 180-degree flip.
-        # Orient the final approach to match the actual direction of travel.
-        approach_yaw = math.atan2(dy, dx)
+        approach_yaw = normalize_angle(heading - math.pi / 2.0)
         set_pose_yaw(merge.pose, approach_yaw)
         merge.header.stamp = self.get_clock().now().to_msg()
         set_pose_yaw(target.pose, approach_yaw)
@@ -1938,40 +2255,51 @@ class AutoTParking(Node):
         return cleaned
 
     def _analyze_path(self, path: Path, final_pose: PoseStamped) -> PathMetrics:
-        total = forward = reverse = 0.0
-        directions = []
-        first_reverse = -1
-        for index, (previous, current) in enumerate(
-                zip(path.poses, path.poses[1:])):
+        total = 0.0
+        raw_directions = []
+        edge_lengths = []
+        for previous, current in zip(path.poses, path.poses[1:]):
             dx = current.pose.position.x - previous.pose.position.x
             dy = current.pose.position.y - previous.pose.position.y
             length = math.hypot(dx, dy)
+            edge_lengths.append(length)
             if length < 1e-6:
-                directions.append(0)
+                raw_directions.append(0)
                 continue
             yaw = yaw_from_quaternion(previous.pose.orientation)
             dot = dx * math.cos(yaw) + dy * math.sin(yaw)
-            direction = 1 if dot >= 0.0 else -1
-            directions.append(direction)
+            # A direction score very close to zero is inconclusive.  Do not
+            # turn one nearly lateral / quantized pose pair into a cusp.
+            direction = 0 if abs(dot) < 1.0e-4 else 1 if dot > 0.0 else -1
+            raw_directions.append(direction)
             total += length
-            if direction > 0:
-                forward += length
-            else:
-                reverse += length
-                if first_reverse < 0:
-                    first_reverse = index + 1
+        directions = self._stabilize_directions(
+            raw_directions, edge_lengths)
+        forward = sum(
+            length for length, direction in zip(edge_lengths, directions)
+            if direction > 0)
+        reverse = sum(
+            length for length, direction in zip(edge_lengths, directions)
+            if direction < 0)
+        first_reverse = next(
+            (index + 1 for index, direction in enumerate(directions)
+             if direction < 0), -1)
         nonzero = [value for value in directions if value]
         cusps = sum(a != b for a, b in zip(nonzero, nonzero[1:]))
 
         # Estimate curvature over a physical window instead of adjacent grid
         # samples.  Three nearly coincident Hybrid-A* poses amplify map-grid
         # quantization, and a Reeds-Shepp cusp is a stop/direction change where
-        # curvature is undefined.  A 0.15 m window on each side remains well
-        # below this vehicle's 1.10 m minimum turning radius while rejecting
-        # real over-curvature.
+        # curvature is undefined.  A 0.30 m window on each side remains well
+        # below this vehicle's 1.52 m minimum turning radius while rejecting
+        # real over-curvature.  The old 0.15 m window was only three 0.05 m
+        # map cells and
+        # reported a legal Dubins arc as 0.681 instead of 0.658 1/m from
+        # Hybrid-A* grid quantization.  The acceptance limit itself remains
+        # exactly 1 / minimum_turning_radius.
         max_curvature = 0.0
         poses = path.poses
-        curvature_window = 0.15
+        curvature_window = 0.30
         for middle_index in range(1, len(poses) - 1):
             previous_direction = self._nearest_direction(
                 directions, middle_index - 1, -1)
@@ -2020,6 +2348,59 @@ class AutoTParking(Node):
         return PathMetrics(
             total, forward, reverse, cusps, first_reverse,
             directions, max_curvature, position_error, yaw_error)
+
+    @staticmethod
+    def _stabilize_directions(
+            raw: Sequence[int], edge_lengths: Sequence[float]) -> List[int]:
+        """Suppress a one-pose direction glitch using path-spacing hysteresis."""
+        if not raw:
+            return []
+        directions = list(raw)
+        first_nonzero = next((value for value in directions if value), 0)
+        if first_nonzero == 0:
+            return directions
+        previous = first_nonzero
+        for index, value in enumerate(directions):
+            if value == 0:
+                directions[index] = previous
+            else:
+                previous = value
+
+        nonzero_lengths = sorted(
+            length for length in edge_lengths if length > 1.0e-6)
+        middle = len(nonzero_lengths) // 2
+        median_spacing = (
+            nonzero_lengths[middle]
+            if len(nonzero_lengths) % 2
+            else 0.5 * (
+                nonzero_lengths[middle - 1] + nonzero_lengths[middle]))
+        confirmation_length = max(0.10, 3.0 * median_spacing)
+
+        while True:
+            runs = []
+            start = 0
+            for index in range(1, len(directions) + 1):
+                if (index < len(directions)
+                        and directions[index] == directions[start]):
+                    continue
+                runs.append((start, index, directions[start]))
+                start = index
+            merged = False
+            for run_index, (first, last, _direction) in enumerate(runs):
+                run_length = sum(edge_lengths[first:last])
+                if last - first >= 3 and run_length >= confirmation_length:
+                    continue
+                # Only collapse an internal pulse bracketed by the same real
+                # direction.  A genuinely short terminal run is retained and
+                # rejected explicitly by the segment minimum-length check.
+                if (0 < run_index < len(runs) - 1
+                        and runs[run_index - 1][2] == runs[run_index + 1][2]):
+                    directions[first:last] = [runs[run_index - 1][2]] * (
+                        last - first)
+                    merged = True
+                    break
+            if not merged:
+                return directions
 
     @staticmethod
     def _nearest_direction(
@@ -2105,21 +2486,59 @@ class AutoTParking(Node):
             return False, 'global costmap or SLAM map unavailable'
         length = float(self.get_parameter('vehicle_length').value)
         width = float(self.get_parameter('vehicle_width').value)
+        center_x = float(self.get_parameter(
+            'vehicle_center_x_offset').value)
         occupied_threshold = int(
             self.get_parameter('occupied_threshold').value)
+        start_pose = path.poses[0]
+        start_position = start_pose.pose.position
+        start_yaw = yaw_from_quaternion(start_pose.pose.orientation)
+        start_cos = math.cos(start_yaw)
+        start_sin = math.sin(start_yaw)
+        start_shadow_margin = 0.05
+
+        def inside_start_footprint(x: float, y: float) -> bool:
+            """Return true only for cells hidden by the stationary vehicle."""
+            dx = x - start_position.x
+            dy = y - start_position.y
+            local_x = start_cos * dx + start_sin * dy
+            local_y = -start_sin * dx + start_cos * dy
+            return (
+                center_x - 0.5 * length - start_shadow_margin
+                <= local_x
+                <= center_x + 0.5 * length + start_shadow_margin
+                and abs(local_y) <= 0.5 * width + start_shadow_margin)
+
         for index, pose in enumerate(path.poses):
             center_cost = self._cost_value(
                 costmap, pose.pose.position.x, pose.pose.position.y)
-            if center_cost is None or center_cost == 255:
+            if center_cost is None:
+                return False, f'path center index {index} is outside costmap'
+            # The stationary vehicle self-occludes cells immediately under
+            # its current footprint. Nav2 has already accepted this live pose
+            # as the path start, so allow UNKNOWN only at a sample point that
+            # is physically under that initial footprint (plus one map cell).
+            # Every other point on the path still requires observed free
+            # space.  A static-map UNKNOWN cell is acceptable only after the
+            # live global obstacle layer has ray-cleared it to a known cost;
+            # a costmap UNKNOWN cell is never treated as traversable.
+            if (center_cost == 255
+                    and not inside_start_footprint(
+                        pose.pose.position.x, pose.pose.position.y)):
                 return False, f'path center index {index} is unknown'
-            if center_cost >= 253:
+            if 253 <= center_cost <= 254:
                 return False, f'path center index {index} is lethal/inscribed'
             for x, y in self._footprint_samples(pose, length, width):
                 map_value = self._occupancy_value(map_msg, x, y)
                 cost_value = self._cost_value(costmap, x, y)
-                if (map_value is None or map_value < 0
-                        or cost_value is None or cost_value == 255):
-                    return False, f'footprint index {index} reaches unknown'
+                if map_value is None or cost_value is None:
+                    return False, f'footprint index {index} is outside map bounds'
+                if (cost_value == 255
+                        and not inside_start_footprint(x, y)):
+                    return False, (
+                        f'footprint index {index} reaches unknown at '
+                        f'({x:.3f},{y:.3f}); map={map_value} '
+                        f'cost={cost_value}')
                 if map_value >= occupied_threshold or cost_value == 254:
                     return False, f'footprint index {index} overlaps obstacle'
         return True, 'valid'
@@ -2168,6 +2587,67 @@ class AutoTParking(Node):
                         f'the {slot.name} side wall (odom x={ox:.3f}, allowed '
                         f'{minimum_x:.3f}..{maximum_x:.3f})')
         return True, 'valid'
+
+    def _pose_wall_clearance(
+            self, slot: Slot, pose: PoseStamped,
+            transform) -> Optional[float]:
+        """Return footprint clearance to the two bay sides and back curb."""
+        tf_yaw = yaw_from_quaternion(transform.transform.rotation)
+        cosine = math.cos(tf_yaw)
+        sine = math.sin(tf_yaw)
+        length = float(self.get_parameter('vehicle_length').value)
+        width = float(self.get_parameter('vehicle_width').value)
+        minimum = float('inf')
+        for x, y in self._footprint_samples(
+                pose, length, width, edge_only=True):
+            ox = transform.transform.translation.x + cosine * x - sine * y
+            oy = transform.transform.translation.y + sine * x + cosine * y
+            if not slot.min_y <= oy <= slot.max_y:
+                continue
+            minimum = min(
+                minimum,
+                ox - slot.min_x,
+                slot.max_x - ox,
+                slot.max_y - oy,
+            )
+        return minimum if math.isfinite(minimum) else None
+
+    def _path_wall_clearance(
+            self, slot: Slot, path: Path) -> Optional[float]:
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'odom', 'map', Time(), timeout=Duration(seconds=0.5))
+        except tf2_ros.TransformException:
+            return None
+        clearances = [
+            value for pose in path.poses
+            if (value := self._pose_wall_clearance(
+                slot, pose, transform)) is not None
+        ]
+        return min(clearances) if clearances else None
+
+    def _update_actual_wall_clearance(self, slot: Slot) -> None:
+        current = self._current_map_pose()
+        if current is None:
+            return
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.pose.position.x = current[0]
+        pose.pose.position.y = current[1]
+        set_pose_yaw(pose.pose, current[2])
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'odom', 'map', Time(), timeout=Duration(seconds=0.05))
+        except tf2_ros.TransformException:
+            return
+        clearance = self._pose_wall_clearance(slot, pose, transform)
+        if clearance is None:
+            return
+        with self.data_lock:
+            if self.active_segment_stats is not None:
+                self.active_segment_stats['minimum_actual_wall_clearance'] = min(
+                    self.active_segment_stats['minimum_actual_wall_clearance'],
+                    clearance)
 
     def _setup_inside_road(self, pose: PoseStamped) -> bool:
         if self._abort_requested():
@@ -2243,6 +2723,8 @@ class AutoTParking(Node):
         resolution = 0.05
         half_length = 0.5 * length
         half_width = 0.5 * width
+        center_x = float(self.get_parameter(
+            'vehicle_center_x_offset').value)
         nx = max(2, math.ceil(length / resolution))
         ny = max(2, math.ceil(width / resolution))
         local_points = []
@@ -2251,7 +2733,7 @@ class AutoTParking(Node):
                 if edge_only and ix not in (0, nx) and iy not in (0, ny):
                     continue
                 local_points.append((
-                    -half_length + length * ix / nx,
+                    center_x - half_length + length * ix / nx,
                     -half_width + width * iy / ny))
         yaw = yaw_from_quaternion(pose.pose.orientation)
         cosine = math.cos(yaw)
@@ -2281,6 +2763,218 @@ class AutoTParking(Node):
         return self._execute_path_action(
             candidate.path, 1, 1, 1, monitor_slot=None, forward_exit=True)
 
+    @staticmethod
+    def _direction_segments(
+            path: Path, directions: Sequence[int]) -> List[DirectionSegment]:
+        if not directions or len(path.poses) != len(directions) + 1:
+            return []
+        segments = []
+        run_first = 0
+        run_direction = directions[0]
+        for edge_index in range(1, len(directions) + 1):
+            if (edge_index < len(directions)
+                    and directions[edge_index] == run_direction):
+                continue
+            length = sum(
+                math.hypot(
+                    path.poses[index + 1].pose.position.x
+                    - path.poses[index].pose.position.x,
+                    path.poses[index + 1].pose.position.y
+                    - path.poses[index].pose.position.y)
+                for index in range(run_first, edge_index))
+            segments.append(DirectionSegment(
+                run_first, edge_index, run_direction, length))
+            if edge_index < len(directions):
+                run_first = edge_index
+                run_direction = directions[edge_index]
+        return segments
+
+    def _validate_segment_geometry(
+            self, path: Path, segments: Sequence[DirectionSegment]) -> bool:
+        if not segments:
+            self._log_error('[T-PARK][SEGMENT] no executable segments')
+            return False
+        reconstructed = []
+        for segment_number, segment in enumerate(segments):
+            poses = path.poses[segment.first_pose:segment.last_pose + 1]
+            reconstructed.extend(poses if segment_number == 0 else poses[1:])
+        geometry_equal = (
+            len(reconstructed) == len(path.poses)
+            and all(actual.pose == expected.pose for actual, expected in zip(
+                reconstructed, path.poses)))
+        segment_length = sum(segment.length for segment in segments)
+        full_length = sum(
+            math.hypot(
+                current.pose.position.x - previous.pose.position.x,
+                current.pose.position.y - previous.pose.position.y)
+            for previous, current in zip(path.poses, path.poses[1:]))
+        length_difference = segment_length - full_length
+        self._log_info(
+            '[T-PARK][SEGMENT GEOMETRY]\n'
+            f'full_pose_count={len(path.poses)}\n'
+            f'reconstructed_pose_count={len(reconstructed)}\n'
+            f'full_length={full_length:.6f}m\n'
+            f'segment_length_sum={segment_length:.6f}m\n'
+            f'length_difference={length_difference:+.12f}m\n'
+            f'pose_geometry_equal={str(geometry_equal).lower()}')
+        if not geometry_equal or abs(length_difference) > 1.0e-9:
+            self._log_error(
+                '[T-PARK][SEGMENT] slicing changed the original path geometry')
+            return False
+
+        spacings = sorted(
+            math.hypot(
+                current.pose.position.x - previous.pose.position.x,
+                current.pose.position.y - previous.pose.position.y)
+            for previous, current in zip(path.poses, path.poses[1:])
+            if math.hypot(
+                current.pose.position.x - previous.pose.position.x,
+                current.pose.position.y - previous.pose.position.y) > 1.0e-6)
+        median_spacing = spacings[len(spacings) // 2] if spacings else 0.0
+        minimum_length = max(0.10, 3.0 * median_spacing)
+        for segment in segments:
+            if (segment.last_pose - segment.first_pose < 3
+                    or segment.length < minimum_length):
+                self._log_error(
+                    '[T-PARK][SEGMENT] fake/unsafe short segment: '
+                    f'poses={segment.first_pose}..{segment.last_pose} '
+                    f'length={segment.length:.3f}m '
+                    f'minimum={minimum_length:.3f}m')
+                return False
+        return True
+
+    def _fresh_segment_path(
+            self, path: Path, segment: DirectionSegment) -> Path:
+        """Copy one inclusive pose slice and refresh only ROS timestamps."""
+        result = Path()
+        result.header = copy.deepcopy(path.header)
+        stamp = self.get_clock().now().to_msg()
+        result.header.stamp = stamp
+        result.poses = copy.deepcopy(
+            path.poses[segment.first_pose:segment.last_pose + 1])
+        for pose in result.poses:
+            if not pose.header.frame_id:
+                pose.header.frame_id = result.header.frame_id
+            pose.header.stamp = stamp
+        return result
+
+    def _log_segment_start_relation(
+            self, path: Path, segment: DirectionSegment) -> None:
+        current = self._current_map_pose()
+        if current is None:
+            self._log_error(
+                '[T-PARK][SEGMENT] current map pose unavailable at start')
+            return
+        cosine = math.cos(current[2])
+        sine = math.sin(current[2])
+        points = []
+        for local_index, pose in enumerate(path.poses):
+            dx = pose.pose.position.x - current[0]
+            dy = pose.pose.position.y - current[1]
+            distance = math.hypot(dx, dy)
+            if distance < 0.02:
+                continue
+            base_x = cosine * dx + sine * dy
+            base_y = -sine * dx + cosine * dy
+            points.append((segment.first_pose + local_index, base_x, base_y))
+            if len(points) == 3:
+                break
+        relation = ', '.join(
+            f'index={index} base=({base_x:+.3f},{base_y:+.3f})'
+            for index, base_x, base_y in points)
+        self._log_info(
+            f'[T-PARK][SEGMENT {self.active_segment_number}] start relation: '
+            f'expected={"REVERSE" if segment.direction < 0 else "FORWARD"}; '
+            f'{relation or "no point beyond 0.02m"}')
+
+    def _begin_segment_monitor(
+            self, segment_number: int, segment: DirectionSegment,
+            path: Path, monitor_slot: Optional[Slot]) -> None:
+        expected_clearance = (
+            self._path_wall_clearance(monitor_slot, path)
+            if monitor_slot is not None and segment.direction < 0
+            else None)
+        stats = {
+            'segment': segment_number,
+            'direction': segment.direction,
+            'cmd_vel_nav_wrong_samples': 0,
+            'cmd_vel_nav_wrong_events': 0,
+            'cmd_vel_wrong_samples': 0,
+            'cmd_vel_wrong_events': 0,
+            'cmd_vel_control_wrong_samples': 0,
+            'cmd_vel_control_wrong_events': 0,
+            'lidar_drive_wrong_samples': 0,
+            'lidar_drive_wrong_events': 0,
+            'max_abs_lidar_wheel': 0.0,
+            'lidar_wheel_samples': 0,
+            'lidar_wheel_saturation_samples': 0,
+            'lidar_wheel_saturation_events': 0,
+            'lidar_wheel_saturation_active': False,
+            'lidar_wheel_sign_reversals': 0,
+            'last_lidar_wheel_nonzero_sign': 0,
+            'minimum_expected_wall_clearance': (
+                float('inf') if expected_clearance is None
+                else expected_clearance),
+            'minimum_actual_wall_clearance': float('inf'),
+        }
+        with self.data_lock:
+            self.active_direction_segment = segment
+            self.active_segment_number = segment_number
+            self.active_segment_stats = stats
+            self.active_segment_path = path
+            self._last_direction_sign = {}
+            self.last_direction_diagnostic = {}
+            self.reverse_motion_start_logged = False
+            self.reverse_steering_start_logged = False
+        if expected_clearance is not None:
+            self._log_info(
+                '[WALL CLEARANCE] '
+                f'expected_path_minimum={expected_clearance:.4f}m')
+
+    def _finish_segment_monitor(self) -> None:
+        with self.data_lock:
+            stats = self.active_segment_stats
+            self.active_direction_segment = None
+            self.active_segment_stats = None
+            self.active_segment_path = None
+            self._last_direction_sign = {}
+        if stats is None:
+            return
+        self.segment_execution_stats.append(dict(stats))
+        wheel_samples = max(1, int(stats['lidar_wheel_samples']))
+        saturation_ratio = (
+            100.0 * stats['lidar_wheel_saturation_samples'] / wheel_samples)
+        expected_clearance = stats['minimum_expected_wall_clearance']
+        actual_clearance = stats['minimum_actual_wall_clearance']
+        expected_text = (
+            f'{expected_clearance:.4f}m'
+            if math.isfinite(expected_clearance) else 'unavailable')
+        actual_text = (
+            f'{actual_clearance:.4f}m'
+            if math.isfinite(actual_clearance) else 'unavailable')
+        self._log_info(
+            f'[T-PARK][SEGMENT {stats["segment"]}] direction summary: '
+            f'cmd_vel_nav_wrong_samples={stats["cmd_vel_nav_wrong_samples"]} '
+            f'cmd_vel_nav_wrong_events={stats["cmd_vel_nav_wrong_events"]} '
+            f'cmd_vel_wrong_samples={stats["cmd_vel_wrong_samples"]} '
+            f'cmd_vel_wrong_events={stats["cmd_vel_wrong_events"]} '
+            f'cmd_vel_control_wrong_samples='
+            f'{stats["cmd_vel_control_wrong_samples"]} '
+            f'cmd_vel_control_wrong_events='
+            f'{stats["cmd_vel_control_wrong_events"]} '
+            f'lidar_drive_wrong_samples={stats["lidar_drive_wrong_samples"]} '
+            f'lidar_drive_wrong_events={stats["lidar_drive_wrong_events"]} '
+            f'max_abs_lidar_wheel={stats["max_abs_lidar_wheel"]:.3f} '
+            f'lidar_wheel_saturation_samples='
+            f'{stats["lidar_wheel_saturation_samples"]}/'
+            f'{stats["lidar_wheel_samples"]} '
+            f'saturation_ratio={saturation_ratio:.3f}% '
+            f'saturation_events={stats["lidar_wheel_saturation_events"]} '
+            f'steering_sign_reversals='
+            f'{stats["lidar_wheel_sign_reversals"]} '
+            f'minimum_expected_wall_clearance={expected_text} '
+            f'minimum_actual_wall_clearance={actual_text}')
+
     def _execute_segmented_path(
             self, path: Path, metrics: PathMetrics,
             monitor_slot: Optional[Slot]) -> bool:
@@ -2291,43 +2985,71 @@ class AutoTParking(Node):
         self.active_motion_path = path
         self.active_motion_metrics = metrics
         self.active_motion_final = path.poses[-1]
-        runs = []
-        run_start = 0
-        run_direction = directions[0] if directions[0] else 1
-        for index, direction in enumerate(directions):
-            effective = direction if direction else run_direction
-            if effective == run_direction:
-                continue
-            runs.append((run_start, index, run_direction))
-            run_start = index
-            run_direction = effective
-        runs.append((run_start, len(directions), run_direction))
-
-        for run_number, (first, last, direction) in enumerate(runs, start=1):
-            segment = Path()
-            segment.header = path.header
-            segment.poses = path.poses[first:last + 1]
+        segments = self._direction_segments(path, directions)
+        if not self._validate_segment_geometry(path, segments):
+            return False
+        self._log_info(
+            f'[T-PARK][SEGMENT]\ntotal poses: {len(path.poses)}\n'
+            f'segment count: {len(segments)}\n'
+            f'cusps: {max(0, len(segments) - 1)}\n'
+            f'max curvature: {metrics.max_curvature:.6f} 1/m')
+        for number, segment in enumerate(segments):
+            first_pose = path.poses[segment.first_pose]
+            last_pose = path.poses[segment.last_pose]
+            segment_path = self._fresh_segment_path(path, segment)
+            segment_metrics = self._analyze_path(segment_path, last_pose)
+            if number:
+                self._log_info(
+                    f'cusp {number}: pose index={segment.first_pose} '
+                    f'pose=({first_pose.pose.position.x:.3f},'
+                    f'{first_pose.pose.position.y:.3f},'
+                    f'{yaw_from_quaternion(first_pose.pose.orientation):.3f})')
             self._log_info(
-                f'FollowPath segment {run_number}/{len(runs)} '
-                f'direction={"reverse" if direction < 0 else "forward"} '
-                f'poses={len(segment.poses)} path_indices={first}..{last}')
-            if not self._execute_path_action(
-                    segment, run_number, len(runs), direction,
-                    monitor_slot=monitor_slot):
+                f'segment {number}: '
+                f'direction={"REVERSE" if segment.direction < 0 else "FORWARD"} '
+                f'poses={segment.first_pose}..{segment.last_pose} '
+                f'count={segment.last_pose - segment.first_pose + 1} '
+                f'length={segment.length:.3f}m '
+                f'start_yaw={yaw_from_quaternion(first_pose.pose.orientation):.3f} '
+                f'end_yaw={yaw_from_quaternion(last_pose.pose.orientation):.3f} '
+                f'max_curvature={segment_metrics.max_curvature:.6f} 1/m')
+
+        for run_number, segment in enumerate(segments, start=1):
+            segment_path = self._fresh_segment_path(path, segment)
+            self._begin_segment_monitor(
+                run_number - 1, segment, segment_path, monitor_slot)
+            self._log_info(
+                f'[T-PARK][SEGMENT {run_number - 1}]\n'
+                f'direction = '
+                f'{"REVERSE" if segment.direction < 0 else "FORWARD"}\n'
+                f'poses = {segment.first_pose}..{segment.last_pose}\n'
+                f'length = {segment.length:.3f}m')
+            self._log_segment_start_relation(segment_path, segment)
+            succeeded = self._execute_path_action(
+                segment_path, run_number, len(segments), segment.direction,
+                monitor_slot=monitor_slot)
+            self._finish_segment_monitor()
+            if not succeeded:
                 return False
             if monitor_slot is not None and self.parking_wheels_inside:
                 return True
-            if run_number < len(runs):
+            if run_number < len(segments):
                 # End one Nav2 action completely before giving RPP the next
-                # direction.  A single path whose forward and reverse runs
-                # overlap near a cusp can otherwise make pure pursuit choose
-                # alternating velocity signs at the same physical location.
-                self._emergency_stop()
+                # direction.  Do not publish a competing zero command here;
+                # controller_server and velocity_smoother own that chain.
+                self._log_info(
+                    '[T-PARK] cusp reached; waiting for vehicle stop...')
                 if not self._wait_until_stopped(float(
                         self.get_parameter('stop_wait_timeout').value)):
                     self._log_error(
                         'vehicle did not settle at FollowPath direction cusp')
                     return False
+                self._log_info(
+                    '[T-PARK] vehicle stopped at cusp: '
+                    f'linear_speed={self.last_stop_linear_speed:.4f}m/s '
+                    f'angular_speed={self.last_stop_angular_speed:.4f}rad/s '
+                    f'elapsed={self.last_stop_elapsed:.3f}s')
+                self._trace_command_chain('CUSP_REACHED')
         return True
 
     def _execute_path_action(
@@ -2339,7 +3061,7 @@ class AutoTParking(Node):
             if not healthy:
                 self._log_error(
                     f'reverse FollowPath inhibited: rear lidar {reason}')
-                self._emergency_stop()
+                self._emergency_stop(emergency=True)
                 return False
             self._log_info(
                 f'rear safety armed: nearest={rear_distance:.3f}m '
@@ -2349,14 +3071,37 @@ class AutoTParking(Node):
             return False
         goal = FollowPath.Goal()
         goal.path = path
-        goal.controller_id = str(self.get_parameter('controller_id').value)
+        with self.data_lock:
+            active_segment = self.active_direction_segment
+            active_segment_number = self.active_segment_number
+        if active_segment is None:
+            goal.controller_id = str(
+                self.get_parameter('controller_id').value)
+        else:
+            controller_parameter = (
+                'reverse_controller_id' if direction < 0
+                else 'forward_controller_id')
+            goal.controller_id = str(
+                self.get_parameter(controller_parameter).value)
+            segment_state = Int32MultiArray()
+            segment_state.data = [
+                int(active_segment_number), int(direction),
+                int(active_segment.first_pose), int(active_segment.last_pose)]
+            self._safe_publish(self.segment_state_publisher, segment_state)
+            self._log_info(
+                '[T-PARK][SEGMENT STATE] '
+                f'segment={active_segment_number} '
+                f'direction={"REVERSE" if direction < 0 else "FORWARD"} '
+                f'full_range={active_segment.first_pose}..'
+                f'{active_segment.last_pose} '
+                f'controller_id={goal.controller_id}')
         goal.goal_checker_id = (
             str(self.get_parameter('goal_checker_id').value)
             if run_number == run_count else 'cusp_goal_checker')
         goal.progress_checker_id = str(
             self.get_parameter('progress_checker_id').value)
         self._log_info(
-            f'FollowPath request {run_number}/{run_count}: '
+            f'[T-PARK] sending FollowPath goal {run_number}/{run_count}: '
             f'controller_id={goal.controller_id} '
             f'goal_checker_id={goal.goal_checker_id} '
             f'progress_checker_id={goal.progress_checker_id}')
@@ -2366,13 +3111,13 @@ class AutoTParking(Node):
             goal, feedback_callback=self._follow_feedback)
         goal_handle = self._wait_future(send_future, 5.0)
         if goal_handle is None or not goal_handle.accepted:
-            self._log_error(
-                'FollowPath goal rejected: '
+            self._log_info(
+                f'[T-PARK][SEGMENT {run_number - 1}] REJECTED: '
                 f'controller_id={goal.controller_id} '
                 f'goal_checker_id={goal.goal_checker_id}')
             return False
         self._log_info(
-            'FollowPath goal accepted: '
+            '[T-PARK] FollowPath goal accepted: '
             f'controller_id={goal.controller_id} '
             f'goal_checker_id={goal.goal_checker_id}')
         self.active_follow_goal = goal_handle
@@ -2386,11 +3131,12 @@ class AutoTParking(Node):
                     goal_handle.cancel_goal_async()
                 return False
             if time.monotonic() >= deadline:
-                self._log_error(
-                    'FollowPath execution timeout; cancelling goal')
+                self._log_info(
+                    f'[T-PARK][SEGMENT {run_number - 1}] TIMEOUT; '
+                    'cancelling FollowPath goal')
                 if self._context_ok():
                     goal_handle.cancel_goal_async()
-                self._emergency_stop()
+                self._emergency_stop(emergency=True)
                 return False
             if direction < 0:
                 healthy, rear_distance, reason = self._rear_scan_state()
@@ -2407,7 +3153,7 @@ class AutoTParking(Node):
                         f'REAR EMERGENCY STOP: {detail}; cancelling FollowPath')
                     if self._context_ok():
                         goal_handle.cancel_goal_async()
-                    self._emergency_stop()
+                    self._emergency_stop(emergency=True)
                     return False
             if forward_exit:
                 with self.data_lock:
@@ -2419,12 +3165,13 @@ class AutoTParking(Node):
                         'cancelling FollowPath')
                     if self._context_ok():
                         goal_handle.cancel_goal_async()
-                    self._emergency_stop()
+                    self._emergency_stop(emergency=True)
                     return False
             now = time.monotonic()
             if monitor_slot is not None and now >= next_wheel_check:
                 next_wheel_check = now + float(self.get_parameter(
                     'wheel_check_period').value)
+                self._update_actual_wall_clearance(monitor_slot)
                 if self._update_wheels_inside(monitor_slot):
                     self.parking_wheels_inside = True
                     self._publish_status('WHEELS_INSIDE')
@@ -2441,19 +3188,47 @@ class AutoTParking(Node):
             return False
         self.active_follow_goal = None
         result = wrapped.result
-        if monitor_slot is not None and run_number == run_count:
-            self._log_error(
-                'parking FollowPath reached its planned endpoint without '
-                'five consecutive all-wheel-inside confirmations')
-            return False
         if wrapped.status != GoalStatus.STATUS_SUCCEEDED:
-            self._log_error(
-                f'FollowPath status={wrapped.status} '
+            names = {
+                GoalStatus.STATUS_ABORTED: 'ABORTED',
+                GoalStatus.STATUS_CANCELED: 'CANCELED',
+            }
+            self._log_info(
+                f'[T-PARK][SEGMENT {run_number - 1}] '
+                f'{names.get(wrapped.status, f"STATUS_{wrapped.status}")}: '
                 f'error_code={result.error_code} '
                 f'error_msg={result.error_msg!r}')
             return False
+        if monitor_slot is not None and run_number == run_count:
+            # At parking speed the controller can report goal success on the
+            # same cycle that begins the wheel-containment confirmation
+            # window.  Keep applying the existing geometric test while the
+            # now-stationary vehicle settles; do not reject a valid final pose
+            # merely because five timer samples had not elapsed in motion.
+            period = float(self.get_parameter('wheel_check_period').value)
+            required = int(self.get_parameter(
+                'wheel_inside_confirm_count').value)
+            confirmation_deadline = time.monotonic() + period * (required + 2)
+            self._log_info(
+                'parking FollowPath reached endpoint; completing existing '
+                f'all-wheel-inside confirmation ({required} samples)')
+            while time.monotonic() < confirmation_deadline:
+                self._update_actual_wall_clearance(monitor_slot)
+                if self._update_wheels_inside(monitor_slot):
+                    self.parking_wheels_inside = True
+                    self._publish_status('WHEELS_INSIDE')
+                    self._log_info(
+                        'parking endpoint accepted after stationary '
+                        'all-wheel-inside confirmation')
+                    return True
+                if not self._interruptible_sleep(period):
+                    return False
+            self._log_error(
+                'parking FollowPath reached its planned endpoint but the '
+                'existing all-wheel-inside check did not confirm containment')
+            return False
         self._log_info(
-            f'FollowPath segment {run_number}/{run_count} result '
+            f'[T-PARK][SEGMENT {run_number - 1}] SUCCEEDED: '
             f'error_code={result.error_code} '
             f'error_msg={result.error_msg!r}')
         return result.error_code == FollowPath.Result.NONE
@@ -2461,10 +3236,41 @@ class AutoTParking(Node):
     def _cancel_parking_follow_path(self, goal_handle, result_future) -> bool:
         self._log_info(
             'all wheels confirmed inside; cancelling active parking FollowPath')
+
+        # The wheel-confirmation timer and controller goal checker can finish
+        # on the same control cycle.  Reaching the planned goal after all four
+        # wheels were already confirmed inside is success, not a failed
+        # cancellation.  Check this race before sending a redundant request.
+        if result_future.done():
+            wrapped = result_future.result()
+            self.active_follow_goal = None
+            if wrapped.status in (
+                    GoalStatus.STATUS_SUCCEEDED,
+                    GoalStatus.STATUS_CANCELED):
+                self._log_info(
+                    'parking FollowPath already terminated after wheels-inside '
+                    f'confirmation with status={wrapped.status}; accepted')
+                return True
+            self._log_error(
+                'parking FollowPath terminated unexpectedly after '
+                f'wheels-inside confirmation: status={wrapped.status}')
+            return False
+
         cancel_future = goal_handle.cancel_goal_async()
         timeout = float(self.get_parameter('parking_cancel_timeout').value)
         response = self._wait_future(cancel_future, timeout)
         if response is None or not response.goals_canceling:
+            # A successful result may win the race while the cancel request is
+            # in flight.  Accept it because wheel containment was confirmed
+            # before entering this function.
+            wrapped = self._wait_future(result_future, timeout)
+            self.active_follow_goal = None
+            if (wrapped is not None
+                    and wrapped.status == GoalStatus.STATUS_SUCCEEDED):
+                self._log_info(
+                    'parking FollowPath reached goal while cancel was in '
+                    'flight; wheels-inside confirmation already passed')
+                return True
             self._log_error(
                 'parking FollowPath cancel request was not accepted')
             return False
@@ -2477,12 +3283,15 @@ class AutoTParking(Node):
             self._log_error(
                 'parking FollowPath did not terminate after cancel response')
             return False
-        if wrapped.status != GoalStatus.STATUS_CANCELED:
+        if wrapped.status not in (
+                GoalStatus.STATUS_CANCELED,
+                GoalStatus.STATUS_SUCCEEDED):
             self._log_error(
                 f'parking FollowPath cancel ended with status={wrapped.status}')
             return False
         self._log_info(
-            'parking FollowPath result confirmed STATUS_CANCELED')
+            'parking FollowPath result confirmed '
+            f'status={wrapped.status} after wheels-inside confirmation')
         return True
 
     def _rear_scan_state(self) -> Tuple[bool, float, str]:
@@ -2534,6 +3343,7 @@ class AutoTParking(Node):
         if (path is None or metrics is None or final_pose is None
                 or current_pose is None):
             return
+        self._update_direction_diagnostic(current_pose)
         if self.motion_phase == 'parking' and not self.parking_wheels_inside:
             self._publish_status('EXECUTING_PARKING')
         positions = path.poses
@@ -2579,6 +3389,48 @@ class AutoTParking(Node):
             f'speed={feedback.speed:.3f}m/s path_index={nearest} '
             f'direction={"reverse" if direction < 0 else "forward"} '
             f'final_distance={final_distance:.3f}m')
+
+    def _update_direction_diagnostic(
+            self, current_pose: Tuple[float, float, float]) -> None:
+        """Approximate RPP's first distance-qualified transformed carrot."""
+        with self.data_lock:
+            path = self.active_segment_path
+            segment = self.active_direction_segment
+            odom = self.odom_msg
+        if path is None or segment is None or not path.poses:
+            return
+        nearest = min(
+            range(len(path.poses)),
+            key=lambda index: math.hypot(
+                path.poses[index].pose.position.x - current_pose[0],
+                path.poses[index].pose.position.y - current_pose[1]))
+        speed = 0.0 if odom is None else abs(float(
+            odom.twist.twist.linear.x))
+        # Mirrors the unchanged ParkingFollowPath limits/time in
+        # nav2_params.yaml solely for diagnostics; it does not affect control.
+        lookahead = max(0.15, min(0.35, speed * 1.0))
+        carrot_index = len(path.poses) - 1
+        for index in range(nearest, len(path.poses)):
+            pose = path.poses[index].pose.position
+            if math.hypot(
+                    pose.x - current_pose[0],
+                    pose.y - current_pose[1]) >= lookahead:
+                carrot_index = index
+                break
+        carrot = path.poses[carrot_index].pose.position
+        dx = carrot.x - current_pose[0]
+        dy = carrot.y - current_pose[1]
+        carrot_base_x = (
+            math.cos(current_pose[2]) * dx
+            + math.sin(current_pose[2]) * dy)
+        with self.data_lock:
+            self.last_direction_diagnostic = {
+                'path_index': float(segment.first_pose + nearest),
+                'robot_x': current_pose[0],
+                'robot_y': current_pose[1],
+                'robot_yaw': current_pose[2],
+                'carrot_base_x': carrot_base_x,
+            }
 
     def _current_map_pose(self) -> Optional[Tuple[float, float, float]]:
         if self._abort_requested():
@@ -2636,11 +3488,13 @@ class AutoTParking(Node):
         self._log_warn(
             f'vehicle still moving after {context}; '
             'sending zero-velocity safety pulse')
-        self._emergency_stop(final=context == 'final entrance leg')
+        self._emergency_stop(
+            final=context == 'final entrance leg', emergency=True)
         return self._wait_until_stopped(float(
             self.get_parameter('stop_wait_timeout').value))
 
     def _wait_until_stopped(self, timeout: float) -> bool:
+        started = time.monotonic()
         deadline = time.monotonic() + timeout
         stable_count = 0
         required = max(1, int(self.get_parameter('stop_confirm_count').value))
@@ -2651,6 +3505,14 @@ class AutoTParking(Node):
             if self._vehicle_stopped():
                 stable_count += 1
                 if stable_count >= required:
+                    with self.data_lock:
+                        odom = self.odom_msg
+                    if odom is not None:
+                        twist = odom.twist.twist
+                        self.last_stop_linear_speed = math.hypot(
+                            twist.linear.x, twist.linear.y)
+                        self.last_stop_angular_speed = abs(twist.angular.z)
+                    self.last_stop_elapsed = time.monotonic() - started
                     return True
             else:
                 stable_count = 0
@@ -2674,6 +3536,9 @@ class AutoTParking(Node):
             return
         candidate.path.header.stamp = self.get_clock().now().to_msg()
         self._safe_publish(self.path_publisher, candidate.path)
+        self._log_info(
+            f'[T-PARK] path generated: slot={candidate.slot.name} '
+            f'poses={len(candidate.path.poses)}')
         forward = Path()
         reverse = Path()
         forward.header = candidate.path.header
@@ -2764,8 +3629,15 @@ class AutoTParking(Node):
         yaw = yaw_from_quaternion(final.pose.orientation)
         half_l = 0.5 * float(self.get_parameter('vehicle_length').value)
         half_w = 0.5 * float(self.get_parameter('vehicle_width').value)
-        ordered = [(half_l, half_w), (half_l, -half_w),
-                   (-half_l, -half_w), (-half_l, half_w), (half_l, half_w)]
+        center_x = float(self.get_parameter(
+            'vehicle_center_x_offset').value)
+        ordered = [
+            (center_x + half_l, half_w),
+            (center_x + half_l, -half_w),
+            (center_x - half_l, -half_w),
+            (center_x - half_l, half_w),
+            (center_x + half_l, half_w),
+        ]
         del corners
         for local_x, local_y in ordered:
             point = Point()
@@ -2789,19 +3661,25 @@ class AutoTParking(Node):
                 except Exception:
                     pass
 
-    def _emergency_stop(self, final: bool = False) -> None:
+    def _set_emergency_stop_request(self, active: bool) -> None:
+        msg = Bool()
+        msg.data = active
+        self._safe_publish(self.emergency_stop_request_publisher, msg)
+
+    def _emergency_stop(
+            self, final: bool = False, emergency: bool = False) -> None:
         if not self._runtime_ok():
             return
+        if emergency:
+            self._set_emergency_stop_request(True)
         zero = Twist()
         for _ in range(5):
             if not self._safe_publish(self.nav_stop_publisher, zero):
                 return
-            if not self._safe_publish(self.stop_publisher, zero):
-                return
             if not self._interruptible_sleep(0.05, stop_on_cancel=False):
                 return
         if final:
-            self._log_info('final zero /cmd_vel and /cmd_vel_nav published')
+            self._log_info('final zero /cmd_vel_nav published')
 
     def _fail(self, reason: str) -> None:
         self._cancel_active_goals()

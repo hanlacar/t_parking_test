@@ -10,9 +10,9 @@ Kept:
   planner_server      /compute_path_through_poses  (owns global_costmap)
   controller_server   /follow_path                 (owns local_costmap)
   velocity_smoother   auto_t_parking.py publishes its stop command on
-                      /cmd_vel_nav, so this node is the only thing that
-                      turns that into /cmd_vel.  Removing it means the
-                      vehicle never stops.
+                      /cmd_vel_nav.  Its output topic is configurable so the
+                      T-parking launch can route the final Twist through the
+                      shared lidar command contract before Gazebo sees it.
   lifecycle_manager_navigation
 
 Dropped: bt_navigator, behavior_server, smoother_server, waypoint_follower,
@@ -20,7 +20,9 @@ docking_server, route_server, collision_monitor.
 
 collision_monitor used to be the publisher of /cmd_vel (velocity_smoother
 emitted /cmd_vel_smoothed into it).  With it gone, velocity_smoother's output
-is remapped straight onto /cmd_vel, which is what the Gazebo bridge consumes.
+is remapped onto cmd_vel_output_topic.  The default remains /cmd_vel for
+standalone and parallel-parking compatibility; T parking overrides it with a
+private topic consumed by cmd_vel_to_lidar_cmd.
 The costmaps are not separate nodes -- they live inside the planner and
 controller servers -- so they must not appear in node_names.
 """
@@ -40,6 +42,7 @@ def generate_launch_description():
         LaunchConfiguration('use_sim_time'), value_type=bool)
     params_file = LaunchConfiguration('params_file')
     log_level = LaunchConfiguration('log_level')
+    cmd_vel_output_topic = LaunchConfiguration('cmd_vel_output_topic')
 
     default_params = PathJoinSubstitution(
         [FindPackageShare('t_parking_sim'), 'config', 'nav2_params.yaml']
@@ -78,9 +81,7 @@ def generate_launch_description():
         parameters=[params_file, {'use_sim_time': use_sim_time}],
         remappings=remappings + [
             ('cmd_vel', 'cmd_vel_nav'),
-            # Without collision_monitor downstream, this node is the last
-            # stage of the chain and must publish /cmd_vel itself.
-            ('cmd_vel_smoothed', 'cmd_vel'),
+            ('cmd_vel_smoothed', cmd_vel_output_topic),
         ],
         **common,
     )
@@ -106,6 +107,10 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('log_level', default_value='info'),
+        DeclareLaunchArgument(
+            'cmd_vel_output_topic',
+            default_value='/cmd_vel',
+            description='Final velocity_smoother Twist output topic.'),
         controller_server,
         planner_server,
         velocity_smoother,

@@ -2,8 +2,8 @@ t_parking_auto:
   ros__parameters:
     use_sim_time: true
     target_slot: "auto"
-    auto_start: false
-    execute: false
+    auto_start: true
+    execute: true
     return_to_entrance: true
     stop_when_all_wheels_inside: true
     exit_mode: "forward_right"
@@ -15,41 +15,43 @@ t_parking_auto:
 
     # SDF world positions transformed into the initial odom frame.  The
     # initial world pose is (-5, 0, yaw=0), so odom_x = world_x + 5.
+    # Real-vehicle world slots are 1.83 m wide and 5.43 m deep.
     slot_1:
-      odom_x: 5.75
-      odom_y: 4.25
+      odom_x: 5.585
+      odom_y: 4.875
       yaw: -1.57079632679
-      min_x: 5.00
+      min_x: 4.67
       max_x: 6.50
-      min_y: 1.75
-      max_y: 6.75
+      min_y: 2.16
+      max_y: 7.59
     slot_2:
-      odom_x: 7.25
-      odom_y: 4.25
+      odom_x: 7.415
+      odom_y: 4.875
       yaw: -1.57079632679
       min_x: 6.50
-      max_x: 8.00
-      min_y: 1.75
-      max_y: 6.75
+      max_x: 8.33
+      min_y: 2.16
+      max_y: 7.59
 
     road_center_y: 0.0
-    road_min_y: -1.75
-    road_max_y: 1.75
+    road_min_y: -2.16
+    road_max_y: 2.16
     approach_lead: 0.50
-    # How far past the far edge of the slot the vehicle pulls up before
-    # reversing in.  Everything below one vehicle length (0.90 m) forces a
-    # reverse arc too sharp to clear the slot's side wall, so the old
-    # [0.40, 0.55, 0.70] range could only ever be driven by clipping the
-    # entrance corner.  The minimum is now the vehicle length itself.
-    setup_offset_candidates: [0.90, 1.15, 1.40, 1.65]
+    # Setup is measured beyond the slot's far side.  With a 1.83 m slot and
+    # 1.52 m turn radius, R-slot_half_width = 0.605 m places the first
+    # quarter-turn centre on the slot centreline. Larger values are sampled
+    # only as modest clearance alternatives; pulling a full vehicle length
+    # past the slot forces a physically impossible sharp swing back.
+    setup_offset_candidates: [0.60, 0.75, 0.90, 1.05]
     # Minimum gap between the vehicle footprint and the slot's side walls
     # anywhere inside the bay, checked over the whole entry path rather than
     # only at the final pose.
     wall_clearance: 0.08
     entry_depth_candidates: [0.10, 0.20, 0.30]
 
-    vehicle_length: 0.90
-    vehicle_width: 0.45
+    vehicle_length: 1.33
+    vehicle_width: 0.78
+    vehicle_center_x_offset: 0.020
     footprint_clearance: 0.06
     # Clearance from the rear bumper to the back curb used only when
     # computing how deep the final parking pose may go.  Must be larger
@@ -75,17 +77,16 @@ t_parking_auto:
       - "front_right_wheel_link"
       - "rear_left_wheel_link"
       - "rear_right_wheel_link"
-    wheel_radius: 0.095
-    wheel_base: 0.58
-    wheel_track: 0.38
+    wheel_radius: 0.14
+    wheel_base: 0.77
+    wheel_track: 0.67
     wheel_inside_margin: 0.01
     wheel_inside_confirm_count: 5
     wheel_check_period: 0.10
     stop_confirm_count: 3
-    # 28 deg steering: 0.58/tan(0.4887) = 1.091 m, rounded up for margin.
-    # Must stay equal to nav2_params.yaml's planner value.
-    minimum_turning_radius: 1.10
-    curvature_tolerance_factor: 1.20
+    # 0.77 / tan(27 deg) = 1.511 m; keep equal to Nav2's rounded-up value.
+    minimum_turning_radius: 1.52
+    curvature_tolerance_factor: 1.00
     minimum_reverse_length: 0.30
     # Reject overlapping multi-switch paths that RPP can oscillate across.
     maximum_cusps: 2
@@ -94,6 +95,11 @@ t_parking_auto:
     system_wait_timeout: 120.0
     map_wait_timeout: 120.0
     scan_timeout: 2.0
+    # Slot state remains UNKNOWN until both lidars and both Nav2 costmaps
+    # provide a fresh multi-frame observation window.
+    obstacle_observation_frames: 10
+    costmap_observation_updates: 3
+    obstacle_observation_settle_time: 1.0
     # Measured from the rear sensor face, centred on its rear-facing zero ray.
     rear_emergency_stop_distance: 0.15
     rear_emergency_sector_deg: 30.0
@@ -124,9 +130,15 @@ t_parking_auto:
     entrance_return_position_tolerance: 0.10
     entrance_return_yaw_tolerance: 0.12
     maximum_exit_cusps: 4
-    forward_clear_distance_candidates: [0.45, 0.55, 0.65, 0.75]
-    right_turn_lead_candidates: [0.15, 0.25, 0.35]
-    lane_merge_distance_candidates: [0.80, 1.00, 1.20]
+    # Start the turn shortly after the rear wheels clear the mouth.  The old
+    # extra 0.45-0.75 m pushed the turn too far south to connect a >=1.52 m
+    # right arc to the y=0 entrance line without a loop.
+    forward_clear_distance_candidates: [0.02, 0.07, 0.12, 0.17]
+    right_turn_lead_candidates: [0.00, 0.05, 0.10]
+    lane_merge_distance_candidates: [0.80]
+    # Match ForwardExit's conservative Smac lattice radius.  The physical
+    # minimum remains 1.511 m and the strict validator remains 1/1.52 1/m.
+    exit_planning_turn_radius: 1.70
     final_position_tolerance: 0.08
     final_yaw_tolerance: 0.12
     # Strict odometry settling allowance after Nav2 reports goal.
@@ -134,5 +146,7 @@ t_parking_auto:
 
     planner_id: "GridBased"
     controller_id: "ParkingFollowPath"
+    forward_controller_id: "ParkingForward"
+    reverse_controller_id: "ParkingReverse"
     goal_checker_id: "parking_goal_checker"
     progress_checker_id: "progress_checker"

@@ -60,7 +60,7 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from slam_toolbox.srv import Pause
-from std_msgs.msg import ColorRGBA, String
+from std_msgs.msg import ColorRGBA, Int32MultiArray, String
 from std_srvs.srv import Trigger
 import tf2_ros
 from visualization_msgs.msg import Marker, MarkerArray
@@ -172,6 +172,8 @@ class AutoParallelParking(Node):
             Path, '/parallel_parking/reverse_path', transient_qos)
         self.marker_publisher = self.create_publisher(
             MarkerArray, '/parallel_parking/markers', transient_qos)
+        self.segment_state_publisher = self.create_publisher(
+            Int32MultiArray, '/t_parking/active_segment', transient_qos)
         # Zero-only safety outputs.  Nav2's bringup remaps the controller
         # output to /cmd_vel_nav, so both the smoother input and the final
         # bridge input have to be cleared or the smoother keeps republishing
@@ -291,28 +293,29 @@ class AutoParallelParking(Node):
             'staging_hop_distance': 3.0,
             'corner_entry_odom_x': 10.00,
             'corner_exit_odom_y': 3.00,
-            'corner_arc_radius': 1.30,
+            'corner_arc_radius': 1.70,
+            'transit_planner_id': 'ForwardExit',
             'transit_controller_id': 'FollowPath',
             'transit_goal_checker_id': 'goal_checker',
             'lane_offset_candidates': [0.80],
             'staging_final_gap': 0.0,
-            'approach_offset_candidates': [1.80, 2.20, 2.60],
+            'approach_offset_candidates': [3.00, 3.30],
             'slot_end_clearance': 0.35,
-            'entry_angle': 0.55,
-            'entry_depth': 0.35,
-            'entry_lead': 1.00,
+            'entry_turning_radius': 1.70,
+            'entry_pose_spacing': 0.05,
             'entry_loop_length_factor': 2.2,
             'exit_lead_candidates': [1.20, 1.80, 2.50],
             'exit_lane_offset': 1.60,
             'slot_depth_clearance': 0.35,
-            'vehicle_length': 0.90, 'vehicle_width': 0.45,
+            'vehicle_length': 1.33, 'vehicle_width': 0.78,
+            'body_center_x': 0.020,
             'footprint_clearance': 0.06,
             'minimum_reverse_length': 0.30,
             'maximum_cusps': 2,
-            'minimum_turning_radius': 1.10,
-            'curvature_tolerance_factor': 1.20,
+            'minimum_turning_radius': 1.52,
+            'curvature_tolerance_factor': 1.00,
             'occupied_threshold': 50,
-            'exit_mode': 'forward',
+            'exit_mode': 'parked',
             'exit_planner_id': 'ForwardExit',
             'require_forward_only_exit': True,
             'max_reverse_distance_during_exit': 0.01,
@@ -322,9 +325,10 @@ class AutoParallelParking(Node):
             'wheel_frames': [
                 'front_left_wheel_link', 'front_right_wheel_link',
                 'rear_left_wheel_link', 'rear_right_wheel_link'],
-            'wheel_radius': 0.095,
-            'wheel_base': 0.58,
-            'wheel_track': 0.38,
+            'wheel_radius': 0.14,
+            'wheel_width': 0.11,
+            'wheel_base': 0.77,
+            'wheel_track': 0.67,
             'wheel_inside_margin': 0.01,
             'parked_yaw_tolerance': 0.20,
             'wheel_inside_confirm_count': 5,
@@ -350,6 +354,8 @@ class AutoParallelParking(Node):
             'freeze_slam_during_execution': True,
             'planner_id': 'GridBased',
             'controller_id': 'ParkingFollowPath',
+            'forward_controller_id': 'ParkingForward',
+            'reverse_controller_id': 'ParkingReverse',
             'goal_checker_id': 'parking_goal_checker',
             'progress_checker_id': 'progress_checker',
         }
@@ -697,18 +703,16 @@ class AutoParallelParking(Node):
                 self._publish_status('FINISHED')
                 return
 
-            # The validated plan starts at the approach pose.  Put the vehicle
-            # there, then re-plan from where it actually stopped so the path
-            # handed to FollowPath begins at the vehicle, and re-check that
-            # its first segment is still a reverse.
+            # The validated path starts at the approach pose. Align the actual
+            # vehicle there, then hand that same kinematic path to FollowPath.
             executable = self._prepare_executable_entry(candidate)
             if executable is None:
                 if self._abort_requested():
                     self._cancelled()
                 else:
                     self._fail(
-                        'the entry path re-planned from the approach pose no '
-                        'longer starts with a reverse segment')
+                        'the vehicle could not align with the validated '
+                        'reverse entry path')
                 return
             entry_path, entry_metrics = executable
 
@@ -743,9 +747,21 @@ class AutoParallelParking(Node):
                 self._fail('could not capture the parked map pose')
                 return
             self._log_pose('parked_pose', parked_pose)
+            if not self._footprint_inside_slot(slot, parked_pose):
+                self._fail(
+                    'all wheels were confirmed, but the final full-size '
+                    'vehicle footprint is outside the selected slot')
+                return
+            self._log_info(
+                '[PARKED FOOTPRINT] full 1.33m x 0.78m body is inside '
+                f'{slot.name}')
 
             if str(self.get_parameter('exit_mode').value) != 'forward':
-                self._publish_status('SUCCESS', 'exit_mode is not forward')
+                self._publish_status(
+                    'PARKING_SUCCESS',
+                    f'slot={slot.name} '
+                    f'entry_reverse={candidate.metrics.reverse_length:.3f}m '
+                    'all_wheels_inside=true body_inside=true stopped=true')
                 return
 
             self._publish_status('PLAN_EXIT')
@@ -1103,7 +1119,9 @@ class AutoParallelParking(Node):
         depth = self._parking_depth(slot)
         to_wall = slot.max_x - depth - half_width
         to_mouth = depth - half_width - slot.min_x
-        if min(to_wall, to_mouth) < required:
+        # The configured geometry lands exactly on 0.350 m; tolerate only
+        # floating-point representation noise, never a geometric shortfall.
+        if min(to_wall, to_mouth) + 1.0e-9 < required:
             self._log_error(
                 f'{slot.name} depth clearance too small: wall={to_wall:.3f}m '
                 f'mouth={to_mouth:.3f}m required={required:.3f}m')
@@ -1116,48 +1134,52 @@ class AutoParallelParking(Node):
     def _parking_longitudinal(self, slot: Slot) -> float:
         """Return the odom-y (along-lane) coordinate of the parked centre.
 
-        The vehicle reverses in from the high-odom_y end, so it parks just
-        inside that end rather than in the middle of the slot.  This slot is
-        4.78 m long for a 0.90 m vehicle: aiming at its longitudinal centre
-        would demand a ~5 m reverse, which Smac can only satisfy with a
-        three-cusp snake that pure pursuit then stalls on.  Parking where the
-        vehicle actually arrives is both the shorter manoeuvre and what a
-        driver does -- pull in behind the car ahead.
+        Prefer the slot centre. If a future shorter slot makes its centre
+        violate the configured entry-end clearance, shift only far enough to
+        retain that clearance for the full 1.33 m body.
         """
         end_clearance = float(self.get_parameter('slot_end_clearance').value)
         half_length = 0.5 * float(self.get_parameter('vehicle_length').value)
-        # Never past the slot's longitudinal centre: parking deeper than the
-        # centre is what forced the ~5 m reverse that Smac could only answer
-        # with a stalling three-cusp snake, and parking shallower than
-        # end_clearance would leave the nose hanging out of the slot.
+        # Never past the slot centre, and never closer to the entry end than
+        # the full-body half length plus the configured clearance.
         return min(slot.odom_y, slot.max_y - (half_length + end_clearance))
 
     def _build_entry_poses(
             self, slot: Slot, lane_offset: float,
             approach_offset: float) -> Optional[Dict[str, PoseStamped]]:
-        """Build the approach and parked poses for one candidate.
+        """Build poses on a bicycle-model reverse S-curve.
 
-        The approach pose sits in the lane, ``approach_offset`` metres *past*
-        the parked pose in the driving direction.  From there the parked pose
-        is behind and to the right, so reversing is the short way in and a
-        forward entry would have to loop around -- exactly the asymmetry that
-        makes the manoeuvre a parallel park rather than a slide-in.
+        Two equal, opposite-curvature reverse arcs translate the vehicle from
+        the lane into the slot while restoring the slot heading.  The gate is
+        the steering-transition point, not a manually tuned waypoint.
         """
         lane_x = slot.min_x - lane_offset
         park_y = self._parking_longitudinal(slot)
-        entry_angle = float(self.get_parameter('entry_angle').value)
-        entry_depth = float(self.get_parameter('entry_depth').value)
-        entry_lead = float(self.get_parameter('entry_lead').value)
+        park_x = self._parking_depth(slot)
+        radius = max(
+            float(self.get_parameter('minimum_turning_radius').value),
+            float(self.get_parameter('entry_turning_radius').value))
+        lateral_shift = park_x - lane_x
+        cosine = 1.0 - lateral_shift / (2.0 * radius)
+        if not -1.0 <= cosine <= 1.0:
+            self._log_error(
+                f'{slot.name} lateral shift {lateral_shift:.3f}m cannot be '
+                f'generated by two radius-{radius:.3f}m arcs')
+            return None
+        arc_angle = math.acos(cosine)
+        required_longitudinal = 2.0 * radius * math.sin(arc_angle)
+        if approach_offset + 1.0e-6 < required_longitudinal:
+            self._log_warn(
+                f'reject approach={approach_offset:.2f}: reverse S-curve '
+                f'needs {required_longitudinal:.3f}m at R={radius:.3f}m')
+            return None
         odom_poses = {
             'approach': (lane_x, park_y + approach_offset, slot.yaw),
-            # Gate pose: nose still in the lane, tail already swung into the
-            # slot mouth.  Planning approach -> parked directly lets Smac
-            # answer "reverse 0.5 m then loop 7 m forward into the open bay",
-            # which passes a first-segment test but is not a parallel park.
             'entry': (
-                slot.min_x + entry_depth, park_y + entry_lead,
-                normalize_angle(slot.yaw - entry_angle)),
-            'parked': (self._parking_depth(slot), park_y, slot.yaw),
+                lane_x + 0.5 * lateral_shift,
+                park_y + radius * math.sin(arc_angle),
+                normalize_angle(slot.yaw + arc_angle)),
+            'parked': (park_x, park_y, slot.yaw),
         }
         result = {}
         for name, values in odom_poses.items():
@@ -1166,6 +1188,84 @@ class AutoParallelParking(Node):
                 return None
             result[name] = pose
         return result
+
+    @staticmethod
+    def _integrate_bicycle_motion(
+            samples: List[Tuple[float, float, float]], distance: float,
+            curvature: float, spacing: float) -> None:
+        """Append exact constant-curvature bicycle poses.
+
+        ``distance`` is signed vehicle travel, so reverse motion is negative.
+        ``curvature`` is tan(steering)/wheelbase in the vehicle convention.
+        """
+        steps = max(1, math.ceil(abs(distance) / spacing))
+        step = distance / steps
+        x, y, yaw = samples[-1]
+        for _ in range(steps):
+            if abs(curvature) < 1.0e-9:
+                x += step * math.cos(yaw)
+                y += step * math.sin(yaw)
+            else:
+                next_yaw = yaw + curvature * step
+                x += (math.sin(next_yaw) - math.sin(yaw)) / curvature
+                y += (-math.cos(next_yaw) + math.cos(yaw)) / curvature
+                yaw = next_yaw
+            samples.append((x, y, normalize_angle(yaw)))
+
+    def _build_kinematic_entry_path(
+            self, slot: Slot, lane_offset: float,
+            approach_offset: float) -> Optional[Path]:
+        """Generate a reverse-only straight + S-curve at a physical radius."""
+        lane_x = slot.min_x - lane_offset
+        park_x = self._parking_depth(slot)
+        park_y = self._parking_longitudinal(slot)
+        radius = max(
+            float(self.get_parameter('minimum_turning_radius').value),
+            float(self.get_parameter('entry_turning_radius').value))
+        spacing = max(0.02, float(
+            self.get_parameter('entry_pose_spacing').value))
+        lateral_shift = park_x - lane_x
+        cosine = 1.0 - lateral_shift / (2.0 * radius)
+        if not -1.0 <= cosine <= 1.0:
+            return None
+        arc_angle = math.acos(cosine)
+        arc_length = radius * arc_angle
+        required_longitudinal = 2.0 * radius * math.sin(arc_angle)
+        straight_lead = approach_offset - required_longitudinal
+        if straight_lead < -1.0e-6:
+            return None
+
+        samples = [(lane_x, park_y + approach_offset, slot.yaw)]
+        if straight_lead > 1.0e-6:
+            self._integrate_bicycle_motion(
+                samples, -straight_lead, 0.0, spacing)
+        # Reverse toward the slot with right steering, then counter-steer left.
+        self._integrate_bicycle_motion(
+            samples, -arc_length, -1.0 / radius, spacing)
+        self._integrate_bicycle_motion(
+            samples, -arc_length, 1.0 / radius, spacing)
+
+        end_x, end_y, end_yaw = samples[-1]
+        if (math.hypot(end_x - park_x, end_y - park_y) > 1.0e-4
+                or abs(normalize_angle(end_yaw - slot.yaw)) > 1.0e-4):
+            self._log_error('kinematic entry integration endpoint mismatch')
+            return None
+        path = Path()
+        for x, y, yaw in samples:
+            pose = self._odom_pose_to_map(x, y, yaw)
+            if pose is None:
+                return None
+            path.poses.append(pose)
+        path.header = path.poses[0].header
+        wheel_base = float(self.get_parameter('wheel_base').value)
+        peak_steering = math.degrees(math.atan(wheel_base / radius))
+        self._log_info(
+            f'[KINEMATIC ENTRY] radius={radius:.3f}m '
+            f'arc_angle={arc_angle:.3f}rad '
+            f'peak_steering={peak_steering:.2f}deg '
+            f'required_longitudinal={required_longitudinal:.3f}m '
+            f'straight_lead={max(0.0, straight_lead):.3f}m')
+        return path
 
     @staticmethod
     def _offset_pose(pose: PoseStamped, longitudinal: float, lateral: float):
@@ -1270,7 +1370,7 @@ class AutoParallelParking(Node):
 
         # Leg A: up the start corridor, heading +odom_x (odom yaw 0).  It
         # deliberately stops short of the lane line: the corner is a 90 deg
-        # turn and this vehicle needs 1.10 m of turning radius, so trying to
+        # turn and this vehicle needs 1.52 m of turning radius, so trying to
         # pivot at the lane line itself wedges it against the slot mouth.
         x = current[0] + hop
         while x < corner_entry_x - 0.5 * hop:
@@ -1349,7 +1449,9 @@ class AutoParallelParking(Node):
             # along the hop, and re-planning from where it actually stopped
             # usually succeeds where the original path no longer applies.
             for attempt in (1, 2):
-                path = self._request_plan(targets)
+                path = self._request_plan(
+                    targets, planner_id=str(self.get_parameter(
+                        'transit_planner_id').value))
                 if path is None:
                     self._log_error(
                         f'staging hop {index}/{len(waypoints)} to odom '
@@ -1373,12 +1475,31 @@ class AutoParallelParking(Node):
         return True
 
     def _drive_path(self, path: Path, context: str) -> bool:
+        path = self._dedupe_stationary_poses(path)
         metrics = self._analyze_path(path, path.poses[-1])
+        directions = [value for value in metrics.directions if value]
+        curvature_limit = 1.0 / float(
+            self.get_parameter('minimum_turning_radius').value)
+        minimum_radius = (
+            1.0 / metrics.max_curvature
+            if metrics.max_curvature > 1.0e-6 else float('inf'))
         self._log_info(
             f'[{context.upper()}] poses={len(path.poses)} '
             f'total={metrics.total_length:.3f}m '
             f'reverse={metrics.reverse_length:.3f}m '
-            f'cusps={metrics.cusp_count}')
+            f'cusps={metrics.cusp_count} '
+            f'max_curvature={metrics.max_curvature:.3f} 1/m '
+            f'min_radius={minimum_radius:.3f}m')
+        if (not directions or any(value < 0 for value in directions)
+                or metrics.cusp_count != 0):
+            self._log_error(
+                f'{context} rejected: staging must be one forward-only run')
+            return False
+        if metrics.max_curvature > curvature_limit + 1.0e-3:
+            self._log_error(
+                f'{context} rejected: curvature {metrics.max_curvature:.3f} '
+                f'exceeds physical limit {curvature_limit:.3f} 1/m')
+            return False
         self.motion_phase = 'staging'
         if not self._execute_segmented_path(
                 path, metrics, monitor_slot=None,
@@ -1417,22 +1538,8 @@ class AutoParallelParking(Node):
                         f'approach={approach_offset:.2f}: approach footprint '
                         'leaves the driving lane')
                     continue
-                # Plan *from* the approach pose rather than from wherever the
-                # vehicle happens to be standing.  Planning from the current
-                # pose prepends the transit onto the approach pose, and that
-                # leading forward segment -- sometimes only a few centimetres
-                # of waypoint-stitching jitter -- is indistinguishable from a
-                # genuine forward entry, which made this test answer a
-                # question about the transit instead of about the manoeuvre.
-                # Anchor the plan at the approach pose instead of wherever
-                # the vehicle happens to stand: planning from the current
-                # pose prepends the transit, and that leading forward segment
-                # made this test answer a question about the transit rather
-                # than about the manoeuvre -- so the verdict flipped with the
-                # centimetres of where the staging drive happened to stop.
-                path = self._request_plan(
-                    [named['entry'], named['parked']],
-                    start_pose=named['approach'])
+                path = self._build_kinematic_entry_path(
+                    slot, lane_offset, approach_offset)
                 if path is None:
                     continue
                 path = self._dedupe_stationary_poses(path)
@@ -1551,7 +1658,7 @@ class AutoParallelParking(Node):
     def _prepare_executable_entry(
             self, candidate: EntryCandidate
     ) -> Optional[Tuple[Path, PathMetrics]]:
-        """Line the vehicle up with the approach pose and re-plan from it."""
+        """Line up on, then retain, the validated kinematic entry path."""
         approach = candidate.named_poses['approach']
         current = self._current_map_pose()
         if current is None:
@@ -1567,37 +1674,39 @@ class AutoParallelParking(Node):
             f'yaw_error={yaw_error:.3f}rad')
         if distance > 0.15 or yaw_error > 0.10:
             self._publish_status('ALIGN_ON_APPROACH')
-            path = self._request_plan([approach])
+            path = self._request_plan(
+                [approach], planner_id=str(self.get_parameter(
+                    'transit_planner_id').value))
             if path is None:
                 self._log_error('could not plan the approach alignment leg')
                 return None
             if not self._drive_path(path, 'approach alignment'):
                 return None
-
-        path = self._request_plan([
-            candidate.named_poses['entry'], candidate.named_poses['parked']])
-        if path is None:
-            self._log_error('could not re-plan the entry from the approach pose')
+            current = self._current_map_pose()
+            if current is None:
+                return None
+            distance = math.hypot(
+                current[0] - approach.pose.position.x,
+                current[1] - approach.pose.position.y)
+            yaw_error = abs(normalize_angle(
+                current[2] - yaw_from_quaternion(approach.pose.orientation)))
+        if distance > 0.20 or yaw_error > 0.15:
+            self._log_error(
+                f'approach alignment remains outside entry capture: '
+                f'distance={distance:.3f}m yaw_error={yaw_error:.3f}rad')
             return None
-        path = self._dedupe_stationary_poses(path)
+
+        path = candidate.path
         metrics = self._analyze_path(path, candidate.named_poses['parked'])
         lead_in = self._forward_lead_in(path, metrics)
         maximum_lead_in = float(
             self.get_parameter('entry_lead_in_forward_max').value)
         self._log_info(
-            f'[ENTRY REPLAN] forward_lead_in={lead_in:.3f}m '
+            f'[EXECUTABLE ENTRY] forward_lead_in={lead_in:.3f}m '
             f'first_reverse_index={metrics.first_reverse_index} '
             f'reverse={metrics.reverse_length:.3f}m '
             f'forward={metrics.forward_length:.3f}m '
             f'cusps={metrics.cusp_count}')
-        # The candidate was validated as reverse-first from the approach pose.
-        # This re-plan starts from where the vehicle actually stopped, a few
-        # centimetres off, so Smac routinely prefixes a short forward nudge and
-        # spends an extra direction change recovering.  Demanding literally
-        # "segment 0 is reverse" rejected genuine back-ins whose reverse began
-        # one stitching-scale step later, so bound the lead-in distance
-        # instead: a parallel park may creep forward a little before backing
-        # in, but it may not drive in forwards.
         if metrics.first_reverse_index < 0 or lead_in > maximum_lead_in:
             self._log_error(
                 f're-planned entry drives {lead_in:.3f}m forward before any '
@@ -1610,8 +1719,7 @@ class AutoParallelParking(Node):
             return None
         valid, reason = self._validate_entry_path(
             candidate.slot, candidate.named_poses, path, metrics,
-            maximum_cusps=int(self.get_parameter('maximum_cusps').value)
-            + int(self.get_parameter('replan_extra_cusps').value))
+            maximum_cusps=int(self.get_parameter('maximum_cusps').value))
         if not valid:
             self._log_error(f're-planned entry rejected: {reason}')
             return None
@@ -1970,7 +2078,7 @@ class AutoParallelParking(Node):
         # Measure curvature over a physical window rather than adjacent grid
         # samples: three nearly coincident Hybrid-A* poses amplify map-grid
         # quantization, and a Reeds-Shepp cusp has undefined curvature.  A
-        # 0.15 m window stays well inside the 1.10 m minimum turning radius.
+        # 0.15 m window stays well inside the 1.52 m minimum turning radius.
         max_curvature = 0.0
         poses = path.poses
         curvature_window = 0.15
@@ -2089,7 +2197,8 @@ class AutoParallelParking(Node):
             self, pose: PoseStamped, length: float, width: float,
             edge_only: bool = False) -> List[Tuple[float, float]]:
         resolution = 0.05
-        half_length = 0.5 * length
+        center_x = float(self.get_parameter('body_center_x').value)
+        min_length = center_x - 0.5 * length
         half_width = 0.5 * width
         nx = max(2, math.ceil(length / resolution))
         ny = max(2, math.ceil(width / resolution))
@@ -2099,7 +2208,7 @@ class AutoParallelParking(Node):
                 if edge_only and ix not in (0, nx) and iy not in (0, ny):
                     continue
                 local_points.append((
-                    -half_length + length * ix / nx,
+                    min_length + length * ix / nx,
                     -half_width + width * iy / ny))
         yaw = yaw_from_quaternion(pose.pose.orientation)
         cosine = math.cos(yaw)
@@ -2189,15 +2298,14 @@ class AutoParallelParking(Node):
 
         Unlike the T bay there is no entrance-side anchor here: the whole
         rectangle is legal parking space, so containment plus alignment is the
-        criterion.  The inset puts the required clearance at 0.295 m from the
-        vehicle centreline, which is already stricter than the 0.225 m
-        footprint half-width, so passing the wheel test also means the whole
-        footprint is inside the slot.
+        criterion. With half-track 0.335 m, the wheel-radius inset tests
+        0.485 m from the centreline, stricter than the 0.390 m body half-width.
+        The complete 1.33 x 0.78 m footprint is still checked independently
+        after the vehicle stops.
 
-        Alignment has to be checked separately.  The slot is 4.78 m long and
-        1.48 m deep for a 0.90 x 0.45 m vehicle, so a car still 25 deg across
-        the slot mid-manoeuvre already has all four wheels inside the
-        rectangle -- containment alone would stop it parked crooked.
+        Alignment has to be checked separately.  Even with the full-size
+        1.33 x 0.78 m body, wheel containment alone can become true while the
+        car is still diagonal, so containment alone must not end the run.
         """
         positions = self._wheel_centers_odom()
         if positions is None:
@@ -2260,7 +2368,11 @@ class AutoParallelParking(Node):
         self._log_info(
             'FollowPath forward exit: one DUBIN path, no direction cusp')
         return self._execute_path_action(
-            candidate.path, 1, 1, 1, monitor_slot=None, forward_exit=True)
+            candidate.path, 1, 1, 1, monitor_slot=None, forward_exit=True,
+            controller_id=str(self.get_parameter(
+                'forward_controller_id').value),
+            full_start_index=0,
+            full_end_index=len(candidate.path.poses) - 1)
 
     def _execute_segmented_path(
             self, path: Path, metrics: PathMetrics,
@@ -2321,7 +2433,8 @@ class AutoParallelParking(Node):
             if not self._execute_path_action(
                     segment, run_number, len(runs), direction,
                     monitor_slot=monitor_slot, controller_id=controller_id,
-                    goal_checker_id=goal_checker_id):
+                    goal_checker_id=goal_checker_id,
+                    full_start_index=first, full_end_index=last):
                 return False
             if monitor_slot is not None and self.parking_wheels_inside:
                 return True
@@ -2341,7 +2454,9 @@ class AutoParallelParking(Node):
             self, path: Path, run_number: int, run_count: int,
             direction: int, monitor_slot: Optional[Slot] = None,
             forward_exit: bool = False, controller_id: Optional[str] = None,
-            goal_checker_id: Optional[str] = None) -> bool:
+            goal_checker_id: Optional[str] = None,
+            full_start_index: int = 0,
+            full_end_index: int = 0) -> bool:
         if direction < 0:
             healthy, rear_distance, reason = self._rear_scan_state()
             if not healthy:
@@ -2356,9 +2471,15 @@ class AutoParallelParking(Node):
             return False
         goal = FollowPath.Goal()
         goal.path = path
-        goal.controller_id = str(
-            controller_id if controller_id is not None
-            else self.get_parameter('controller_id').value)
+        if controller_id is not None:
+            selected_controller = controller_id
+        elif direction < 0:
+            selected_controller = str(self.get_parameter(
+                'reverse_controller_id').value)
+        else:
+            selected_controller = str(self.get_parameter(
+                'forward_controller_id').value)
+        goal.controller_id = selected_controller
         # Transit hops pass a looser checker; the parking run keeps the strict
         # one, and intermediate cusps only need to stop cleanly.
         final_checker = (
@@ -2368,10 +2489,16 @@ class AutoParallelParking(Node):
             final_checker if run_number == run_count else 'cusp_goal_checker')
         goal.progress_checker_id = str(
             self.get_parameter('progress_checker_id').value)
+        segment_state = Int32MultiArray()
+        segment_state.data = [
+            int(run_number), int(direction),
+            int(full_start_index), int(full_end_index)]
+        self._safe_publish(self.segment_state_publisher, segment_state)
         self._log_info(
             f'FollowPath request {run_number}/{run_count}: '
             f'controller_id={goal.controller_id} '
-            f'goal_checker_id={goal.goal_checker_id}')
+            f'goal_checker_id={goal.goal_checker_id} '
+            f'path_indices={full_start_index}..{full_end_index}')
         if not self._runtime_ok():
             return False
         send_future = self.follow_client.send_goal_async(
@@ -2723,10 +2850,13 @@ class AutoParallelParking(Node):
         footprint.scale.x = 0.035
         footprint.color = ColorRGBA(r=0.1, g=1.0, b=0.2, a=1.0)
         yaw = yaw_from_quaternion(footprint_pose.pose.orientation)
-        half_l = 0.5 * float(self.get_parameter('vehicle_length').value)
+        length = float(self.get_parameter('vehicle_length').value)
+        center_x = float(self.get_parameter('body_center_x').value)
+        front_x = center_x + 0.5 * length
+        rear_x = center_x - 0.5 * length
         half_w = 0.5 * float(self.get_parameter('vehicle_width').value)
-        ordered = [(half_l, half_w), (half_l, -half_w),
-                   (-half_l, -half_w), (-half_l, half_w), (half_l, half_w)]
+        ordered = [(front_x, half_w), (front_x, -half_w),
+                   (rear_x, -half_w), (rear_x, half_w), (front_x, half_w)]
         for local_x, local_y in ordered:
             point = Point()
             point.x = (

@@ -19,11 +19,13 @@ def generate_launch_description():
     spawn_z = LaunchConfiguration("z")
     spawn_yaw = LaunchConfiguration("yaw")
     practice_mode = LaunchConfiguration("practice_mode")
+    spawn_parking_obstacles = LaunchConfiguration(
+        "spawn_parking_obstacles")
     debug_scan_filter = LaunchConfiguration("debug_scan_filter")
 
     package_share = FindPackageShare("t_parking_sim")
     default_world = PathJoinSubstitution(
-        [package_share, "worlds", "t_parking_exam.sdf"]
+        [package_share, "worlds", "t_parking_exam_real_vehicle.sdf"]
     )
     slam_params = PathJoinSubstitution(
         [package_share, "config", "slam_toolbox.yaml"]
@@ -48,6 +50,9 @@ def generate_launch_description():
             "z": spawn_z,
             "yaw": spawn_yaw,
             "practice_mode": practice_mode,
+            "spawn_parking_obstacles": spawn_parking_obstacles,
+            "mapping_lidar_override": "true",
+            "mapping_lidar_z": "0.15",
         }.items(),
     )
 
@@ -109,6 +114,11 @@ def generate_launch_description():
             DeclareLaunchArgument("z", default_value="0.0"),
             DeclareLaunchArgument("yaw", default_value="0.0"),
             DeclareLaunchArgument("practice_mode", default_value="t_parking"),
+            DeclareLaunchArgument(
+                "spawn_parking_obstacles",
+                default_value="false",
+                description="Keep the reference-map world free of slot obstacles.",
+            ),
             DeclareLaunchArgument(
                 "debug_scan_filter",
                 default_value="false",

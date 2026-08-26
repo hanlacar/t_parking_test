@@ -19,10 +19,13 @@ def generate_launch_description():
     spawn_z = LaunchConfiguration('z')
     spawn_yaw = LaunchConfiguration('yaw')
     practice_mode = LaunchConfiguration('practice_mode')
+    spawn_parking_obstacles = LaunchConfiguration(
+        'spawn_parking_obstacles')
+    cmd_vel_output_topic = LaunchConfiguration('cmd_vel_output_topic')
 
     package_share = FindPackageShare('t_parking_sim')
     default_world = PathJoinSubstitution(
-        [package_share, 'worlds', 't_parking_exam.sdf']
+        [package_share, 'worlds', 't_parking_exam_real_vehicle.sdf']
     )
     nav2_params = PathJoinSubstitution(
         [package_share, 'config', 'nav2_params.yaml']
@@ -47,6 +50,7 @@ def generate_launch_description():
             'z': spawn_z,
             'yaw': spawn_yaw,
             'practice_mode': practice_mode,
+            'spawn_parking_obstacles': spawn_parking_obstacles,
         }.items(),
     )
 
@@ -63,6 +67,7 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'params_file': nav2_params,
             'log_level': 'info',
+            'cmd_vel_output_topic': cmd_vel_output_topic,
         }.items(),
     )
 
@@ -91,6 +96,12 @@ def generate_launch_description():
             DeclareLaunchArgument('z', default_value='0.0'),
             DeclareLaunchArgument('yaw', default_value='0.0'),
             DeclareLaunchArgument('practice_mode', default_value='t_parking'),
+            DeclareLaunchArgument(
+                'spawn_parking_obstacles',
+                default_value='true',
+                description='Keep obstacles in online navigation sessions.'),
+            DeclareLaunchArgument(
+                'cmd_vel_output_topic', default_value='/cmd_vel'),
             mapping,
             # Let Gazebo, the robot, and online SLAM begin publishing first.
             TimerAction(period=3.0, actions=[navigation]),

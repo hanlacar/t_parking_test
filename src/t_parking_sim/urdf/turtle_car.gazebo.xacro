@@ -84,10 +84,10 @@
       <lidar>
         <scan>
           <horizontal>
-            <samples>1080</samples>
+            <samples>1440</samples>
             <resolution>1</resolution>
-            <min_angle>-2.35619</min_angle>
-            <max_angle>2.35619</max_angle>
+            <min_angle>${-pi}</min_angle>
+            <max_angle>${pi}</max_angle>
           </horizontal>
           <vertical>
             <samples>1</samples>
@@ -124,10 +124,10 @@
       <lidar>
         <scan>
           <horizontal>
-            <samples>1080</samples>
+            <samples>1440</samples>
             <resolution>1</resolution>
-            <min_angle>-2.35619</min_angle>
-            <max_angle>2.35619</max_angle>
+            <min_angle>${-pi}</min_angle>
+            <max_angle>${pi}</max_angle>
           </horizontal>
           <vertical>
             <samples>1</samples>
@@ -174,11 +174,31 @@
       <min_acceleration>-1.5</min_acceleration>
       <max_acceleration>1.5</max_acceleration>
       <topic>/cmd_vel</topic>
-      <odom_topic>/odom</odom_topic>
-      <tf_topic>/tf</tf_topic>
+      <!--
+        AckermannSteering integrates commanded wheel motion, so its odometry
+        continues through a physical collision.  Keep it available only as an
+        unbridged diagnostic source; it must not own ROS /odom or /tf.
+      -->
+      <odom_topic>/wheel_odom</odom_topic>
+      <tf_topic>/wheel_tf</tf_topic>
       <frame_id>odom</frame_id>
       <child_frame_id>base_footprint</child_frame_id>
       <steer_p_gain>10</steer_p_gain>
+    </plugin>
+
+    <!--
+      Ground-truth model odometry reads Gazebo's world pose component, including
+      collision response.  gazebo_pose_odom.py converts this absolute pose into
+      the spawn-relative odom frame used throughout the project.
+    -->
+    <plugin filename="gz-sim-odometry-publisher-system"
+            name="gz::sim::systems::OdometryPublisher">
+      <odom_frame>world</odom_frame>
+      <robot_base_frame>turtle_car</robot_base_frame>
+      <dimensions>2</dimensions>
+      <odom_publish_frequency>50</odom_publish_frequency>
+      <odom_topic>/gazebo_ground_truth/odom_absolute</odom_topic>
+      <tf_topic>/gazebo_ground_truth/tf_absolute</tf_topic>
     </plugin>
 
     <plugin filename="gz-sim-joint-state-publisher-system"

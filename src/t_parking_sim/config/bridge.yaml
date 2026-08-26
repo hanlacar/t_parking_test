@@ -27,17 +27,12 @@
   qos_profile: SENSOR_DATA
   frame_id: rear_laser_link
 
-# Ackermann odometry and its odom -> base_footprint transform.
-- ros_topic_name: /odom
-  gz_topic_name: /odom
+# Gazebo model-pose odometry. gazebo_pose_odom.py shifts and rotates this
+# absolute world pose into the vehicle's spawn-relative odom frame.
+- ros_topic_name: /gazebo_ground_truth/odom_absolute
+  gz_topic_name: /gazebo_ground_truth/odom_absolute
   ros_type_name: nav_msgs/msg/Odometry
   gz_type_name: gz.msgs.Odometry
-  direction: GZ_TO_ROS
-
-- ros_topic_name: /tf
-  gz_topic_name: /tf
-  ros_type_name: tf2_msgs/msg/TFMessage
-  gz_type_name: gz.msgs.Pose_V
   direction: GZ_TO_ROS
 
 # Gazebo's real steering and wheel joint states feed robot_state_publisher.

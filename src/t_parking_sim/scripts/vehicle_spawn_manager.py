@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 
-from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
@@ -19,23 +19,24 @@ from sensor_msgs.msg import JointState, LaserScan
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
-from tf2_ros import TransformBroadcaster
 
 
 class VehicleSpawnManager(Node):
+    MAPPING_REFLECTOR_NAME = 'mapping_lidar_reflectors'
     OBSTACLE_NAMES = (
         't_parking_random_obstacle', 'parallel_parking_random_obstacle')
-    # Slot centres taken from t_parking_exam.sdf.  The T bay spans x=[0, 3],
-    # y=[1.75, 6.75] and is halved by the divider at x=1.5.  The parallel
+    # Slot centres taken from t_parking_exam_real_vehicle.sdf.  The expanded
+    # T bay spans x=[-0.33, 3.33], y=[2.16, 7.59] and is halved at x=1.5.
+    # The parallel
     # spaces span y=[12.0, 13.5] between the walls at x=0 and x=10, halved by
-    # the divider at x=5.  Yaw puts the block's 0.90 m axis along each slot's
-    # long axis: +y for the T bay, +x for the parallel spaces.  z=0.125 is
-    # half the block height, so it rests on the ground plane at z=0.
+    # the divider at x=5.  Yaw puts the block's 1.33 m axis along each slot's
+    # long axis: +y for the T bay, +x for the parallel spaces.  Its measured
+    # body spans z=0.20..0.90 m, so the centre is z=0.55.
     SLOT_POSES = {
-        'A': (0.75, 4.25, 0.125, 0.0),
-        'B': (2.25, 4.25, 0.125, 0.0),
-        'C': (2.50, 12.75, 0.125, 1.57079632679),
-        'D': (7.50, 12.75, 0.125, 1.57079632679),
+        'A': (0.585, 4.875, 0.55, 0.0),
+        'B': (2.415, 4.875, 0.55, 0.0),
+        'C': (2.50, 12.75, 0.55, 1.57079632679),
+        'D': (7.50, 12.75, 0.55, 1.57079632679),
     }
     POSES = {
         't_parking': (-3.50, 0.0, 0.0, 0.0),
@@ -79,7 +80,6 @@ class VehicleSpawnManager(Node):
         # The safety mux remains the sole publisher to the Gazebo command topic.
         self.stop_pub = self.create_publisher(
             Twist, '/parking_navigation/cmd_vel_precision', 10)
-        self.tf_broadcaster = TransformBroadcaster(self)
         self.create_subscription(
             Clock, '/clock', self._clock_cb, qos_profile_sensor_data)
         desc_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -109,6 +109,7 @@ class VehicleSpawnManager(Node):
             'practice_mode': 't_parking', 'spawn_retry_count': 5,
             'spawn_retry_interval': 2.0, 'simulation_wait_timeout': 30.0,
             'spawn_verify_timeout': 15.0, 'spawn_settle_timeout': 5.0,
+            'spawn_parking_obstacles': True,
             'randomize_parking_obstacles': True,
             'parking_obstacle_seed': -1,
             'rerandomize_on_respawn': True,
@@ -154,15 +155,6 @@ class VehicleSpawnManager(Node):
     def _odom_cb(self, msg):
         self._odom = msg
         self._seen('odom')
-        transform = TransformStamped()
-        transform.header = msg.header
-        transform.header.frame_id = 'odom'
-        transform.child_frame_id = 'base_footprint'
-        transform.transform.translation.x = msg.pose.pose.position.x
-        transform.transform.translation.y = msg.pose.pose.position.y
-        transform.transform.translation.z = msg.pose.pose.position.z
-        transform.transform.rotation = msg.pose.pose.orientation
-        self.tf_broadcaster.sendTransform(transform)
 
     def _tf_cb(self, msg):
         if any(t.header.frame_id.lstrip('/') == 'odom' and
@@ -248,10 +240,57 @@ class VehicleSpawnManager(Node):
         return f"""<?xml version="1.0"?>
 <sdf version="1.10"><model name="{name}"><static>true</static>
 <link name="block_link"><collision name="block_collision"><geometry>
-<box><size>0.45 0.90 0.25</size></box></geometry></collision>
-<visual name="block_visual"><geometry><box><size>0.45 0.90 0.25</size></box>
+<box><size>0.78 1.33 0.70</size></box></geometry></collision>
+<visual name="block_visual"><geometry><box><size>0.78 1.33 0.70</size></box>
 </geometry><material><ambient>0.95 0.16 0.03 1</ambient>
 <diffuse>1.0 0.22 0.04 1</diffuse></material></visual></link></model></sdf>"""
+
+    @classmethod
+    def _mapping_reflector_sdf(cls):
+        """Tall GPU-LiDAR visuals used only while making the reference map."""
+        boxes = (
+            ('main_right', 0.0, -2.16, 14.0, 0.12),
+            ('main_left_west', -3.665, 2.16, 6.67, 0.12),
+            ('main_left_east', 5.165, 2.16, 3.67, 0.12),
+            ('connector_upper', 7.5, 2.16, 1.0, 0.12),
+            ('connector_lower', 7.5, -2.16, 1.0, 0.12),
+            ('t_bay_west', -0.33, 4.875, 0.12, 5.43),
+            ('t_bay_east', 3.33, 4.875, 0.12, 5.43),
+            ('t_bay_rear', 1.5, 7.65, 3.78, 0.12),
+            ('parallel_left', 8.0, 5.36, 0.12, 6.40),
+            ('parallel_right', 11.5, 5.125, 0.12, 13.87),
+            ('parallel_start', 9.75, -2.16, 3.62, 0.12),
+            ('parallel_upper_bottom', 4.0, 8.5, 8.12, 0.12),
+            ('parallel_upper_left', 0.0, 12.75, 0.12, 1.62),
+            ('parallel_extension_top', -2.515, 12.0, 4.97, 0.12),
+            ('parallel_extension_bottom', -2.515, 8.5, 4.97, 0.12),
+            ('parallel_west_end', -5.03, 10.25, 0.12, 3.44),
+            ('parallel_top_east', 10.75, 12.0, 1.62, 0.12),
+            ('parallel_slots_outer', 5.0, 13.5, 10.12, 0.12),
+            ('parallel_slots_east', 10.0, 12.75, 0.12, 1.62),
+        )
+        visuals = ''.join(
+            f'<visual name="{name}"><pose>{x} {y} 0.35 0 0 0</pose>'
+            f'<geometry><box><size>{sx} {sy} 0.70</size></box></geometry>'
+            '</visual>'
+            for name, x, y, sx, sy in boxes)
+        return (
+            '<?xml version="1.0"?>'
+            f'<sdf version="1.10"><model name="{cls.MAPPING_REFLECTOR_NAME}">'
+            '<static>true</static><link name="reflector_link">'
+            f'{visuals}</link></model></sdf>')
+
+    def _spawn_mapping_reflectors(self):
+        command = [
+            'ros2', 'run', 'ros_gz_sim', 'create', '-world', self.world_name,
+            '-string', self._mapping_reflector_sdf(),
+            '-name', self.MAPPING_REFLECTOR_NAME,
+            '-allow_renaming', 'false']
+        try:
+            result = subprocess.run(command, timeout=15, check=False)
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
 
     def _spawn_obstacle(self, name, slot):
         x, y, z, yaw = self.SLOT_POSES[slot]
@@ -270,6 +309,21 @@ class VehicleSpawnManager(Node):
         self._publish_status('REMOVING_OBSTACLES', False)
         if not all(self._remove_named_entity(name) for name in self.OBSTACLE_NAMES):
             return False
+        if not self._remove_named_entity(self.MAPPING_REFLECTOR_NAME):
+            return False
+        if bool(self.get_parameter('spawn_parking_obstacles').value):
+            self.get_logger().info(
+                'Mapping-only LiDAR reflectors removed for navigation')
+        if not bool(self.get_parameter('spawn_parking_obstacles').value):
+            self._publish_status('SPAWNING_MAPPING_REFLECTORS', False)
+            if not self._spawn_mapping_reflectors():
+                return False
+            self._obstacle_layout = 'NONE'
+            self.layout_pub.publish(String(data=self._obstacle_layout))
+            self.get_logger().info(
+                'Parking obstacles disabled; mapping-only LiDAR reflectors '
+                'spawned; obstacle layout: NONE')
+            return self._model_count(self.MAPPING_REFLECTOR_NAME) == 1
         rerandomize = bool(self.get_parameter('rerandomize_on_respawn').value)
         if self._obstacle_layout is None or (respawn and rerandomize):
             self._publish_status('SELECTING_OBSTACLES', False)
@@ -439,7 +493,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -1,27 +1,36 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="turtle_car">
+  <xacro:arg name="lidar_ground_height" default="0.52"/>
+
   <!-- Vehicle dimensions (metres unless noted otherwise). -->
-  <xacro:property name="vehicle_length" value="0.90"/>
-  <xacro:property name="vehicle_width" value="0.45"/>
-  <xacro:property name="body_length" value="0.75"/>
-  <xacro:property name="body_width" value="0.38"/>
-  <xacro:property name="body_height" value="0.15"/>
-  <xacro:property name="wheel_base" value="0.58"/>
-  <xacro:property name="wheel_track" value="0.38"/>
-  <xacro:property name="kingpin_width" value="0.32"/>
-  <xacro:property name="wheel_radius" value="0.095"/>
-  <xacro:property name="wheel_width" value="0.055"/>
-  <!-- Real vehicle maximum steering angle: 28 deg.  The Ackermann plugin
-       and both steering joint limits read this one property, and nav2's
-       minimum_turning_radius must match wheel_base/tan(steering_limit)
-       = 0.58/tan(0.4887) = 1.091 m (configured as 1.10 for margin). -->
-  <xacro:property name="steering_limit" value="0.4887"/>
+  <xacro:property name="vehicle_length" value="1.33"/>
+  <xacro:property name="vehicle_width" value="0.78"/>
+  <xacro:property name="body_length" value="1.33"/>
+  <xacro:property name="body_width" value="0.74"/>
+  <xacro:property name="body_height" value="0.70"/>
+  <xacro:property name="body_bottom_from_ground" value="0.20"/>
+  <xacro:property name="body_center_x" value="0.020"/>
+  <xacro:property name="wheel_base" value="0.77"/>
+  <xacro:property name="wheel_track" value="0.67"/>
+  <!-- No separate kingpin measurement was supplied.  Place each steering
+       pivot at its wheel centre so the measured 0.67 m track is exact. -->
+  <xacro:property name="kingpin_width" value="${wheel_track}"/>
+  <xacro:property name="front_axle_x" value="0.385"/>
+  <xacro:property name="rear_axle_x" value="-0.385"/>
+  <xacro:property name="wheel_radius" value="0.14"/>
+  <xacro:property name="wheel_width" value="0.11"/>
+  <!-- Shared MCU/Gazebo maximum steering angle: exactly 27 deg. -->
+  <xacro:property name="steering_limit" value="0.471238898"/>
   <xacro:property name="steering_link_radius" value="0.020"/>
   <xacro:property name="steering_link_height" value="0.040"/>
-  <!-- Ahead of the front tyre envelope (x=0.385), inside the x=0.450 bumper. -->
-  <xacro:property name="laser_x" value="0.40"/>
-  <xacro:property name="laser_z_from_ground" value="0.065"/>
-  <xacro:property name="laser_radius" value="0.025"/>
+  <!-- base_link is the axle midpoint, 0.020 m behind the physical geometric
+       centre.  These offsets therefore reproduce the measured physical
+       LiDAR centres at +0.7025/-0.7025 m about the geometric centre. -->
+  <xacro:property name="front_laser_x" value="0.7225"/>
+  <xacro:property name="rear_laser_x" value="-0.6825"/>
+  <xacro:property name="laser_z_from_ground"
+                  value="${float(xacro.arg('lidar_ground_height'))}"/>
+  <xacro:property name="laser_radius" value="0.0375"/>
   <xacro:property name="laser_height" value="0.040"/>
 
   <!-- Total model mass is approximately 21.05 kg. -->
@@ -152,8 +161,10 @@
   <joint name="chassis_joint" type="fixed">
     <parent link="base_link"/>
     <child link="chassis_link"/>
-    <!-- Body bottom is at the wheel axle height, safely above the ground. -->
-    <origin xyz="0 0 ${body_height / 2.0}" rpy="0 0 0"/>
+    <!-- Measured body envelope: x is the physical geometric centre; z spans
+         exactly 0.20..0.90 m above ground. -->
+    <origin xyz="${body_center_x} 0 ${body_bottom_from_ground + body_height / 2.0 - wheel_radius}"
+            rpy="0 0 0"/>
   </joint>
 
   <xacro:steering_link name="front_left_steering_link"/>
@@ -162,7 +173,7 @@
   <joint name="front_left_steering_joint" type="revolute">
     <parent link="base_link"/>
     <child link="front_left_steering_link"/>
-    <origin xyz="${wheel_base / 2.0} ${kingpin_width / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="${front_axle_x} ${kingpin_width / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 0 1"/>
     <limit lower="${-steering_limit}" upper="${steering_limit}"
            effort="20" velocity="0.6"/>
@@ -172,7 +183,7 @@
   <joint name="front_right_steering_joint" type="revolute">
     <parent link="base_link"/>
     <child link="front_right_steering_link"/>
-    <origin xyz="${wheel_base / 2.0} ${-kingpin_width / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="${front_axle_x} ${-kingpin_width / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 0 1"/>
     <limit lower="${-steering_limit}" upper="${steering_limit}"
            effort="20" velocity="0.6"/>
@@ -184,7 +195,7 @@
   <xacro:wheel_link name="rear_left_wheel_link"/>
   <xacro:wheel_link name="rear_right_wheel_link"/>
 
-  <!-- Offset the front wheel centres from the 0.32 m kingpins to a 0.38 m track. -->
+  <!-- Front steering pivots and wheel centres share the measured track. -->
   <joint name="front_left_wheel_joint" type="continuous">
     <parent link="front_left_steering_link"/>
     <child link="front_left_wheel_link"/>
@@ -206,7 +217,7 @@
   <joint name="rear_left_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="rear_left_wheel_link"/>
-    <origin xyz="${-wheel_base / 2.0} ${wheel_track / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="${rear_axle_x} ${wheel_track / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="50" velocity="30"/>
     <dynamics damping="0.02" friction="0.002"/>
@@ -215,7 +226,7 @@
   <joint name="rear_right_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="rear_right_wheel_link"/>
-    <origin xyz="${-wheel_base / 2.0} ${-wheel_track / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="${rear_axle_x} ${-wheel_track / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="50" velocity="30"/>
     <dynamics damping="0.02" friction="0.002"/>
@@ -238,10 +249,11 @@
   <joint name="laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="laser_link"/>
-    <origin xyz="${laser_x} 0 ${laser_z_from_ground - wheel_radius}" rpy="0 0 0"/>
+    <origin xyz="${front_laser_x} 0 ${laser_z_from_ground - wheel_radius}" rpy="0 0 0"/>
   </joint>
 
-  <!-- Exact centre-symmetric counterpart of the front lidar. -->
+  <!-- Rear sensor is physically symmetric about the vehicle geometric centre,
+       which is intentionally not the base_link origin. -->
   <link name="rear_laser_link">
     <inertial>
       <mass value="${laser_mass}"/>
@@ -259,7 +271,7 @@
   <joint name="rear_laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="rear_laser_link"/>
-    <origin xyz="${-laser_x} 0 ${laser_z_from_ground - wheel_radius}"
+    <origin xyz="${rear_laser_x} 0 ${laser_z_from_ground - wheel_radius}"
             rpy="0 0 ${pi}"/>
   </joint>
 

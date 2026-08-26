@@ -1,6 +1,6 @@
 slam_toolbox:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
 
     solver_plugin: solver_plugins::CeresSolver
     ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
@@ -11,10 +11,10 @@ slam_toolbox:
 
     odom_frame: odom
     map_frame: map
-    base_frame: base_footprint
+    base_frame: base_link
     # Dynamic returns are stripped by scan_filter before SLAM sees them, so a
     # person walking through the course cannot be baked into the map as a wall.
-    scan_topic: /scan_static
+    scan_topic: /scan
     mode: mapping
     use_map_saver: true
 

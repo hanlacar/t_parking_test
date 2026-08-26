@@ -1,11 +1,30 @@
-# colcon build artefacts
+# ROS 2 / colcon build artefacts
 build/
 install/
 log/
 
-# Python
+# Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Editor
+# Editors / IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary / backup files
+*.bak
+*.tmp
+
+# ROS bag files
+*.db3
+*.mcap
+*.bag
+rosbag2_*/
+
+# TF view_frames output
+frames_*.gv
+frames_*.pdf

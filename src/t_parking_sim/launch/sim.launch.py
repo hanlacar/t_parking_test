@@ -9,8 +9,10 @@ from launch.substitutions import (
     FindExecutable,
     LaunchConfiguration,
     PathJoinSubstitution,
+    PythonExpression,
 )
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -24,6 +26,10 @@ def generate_launch_description():
     spawn_z = LaunchConfiguration("z")
     spawn_yaw = LaunchConfiguration("yaw")
     practice_mode = LaunchConfiguration("practice_mode")
+    spawn_parking_obstacles = LaunchConfiguration(
+        "spawn_parking_obstacles")
+    mapping_lidar_override = LaunchConfiguration("mapping_lidar_override")
+    mapping_lidar_z = LaunchConfiguration("mapping_lidar_z")
 
     package_share = FindPackageShare("t_parking_sim")
     xacro_file = PathJoinSubstitution(
@@ -36,12 +42,17 @@ def generate_launch_description():
         [package_share, "rviz", "t_parking_mapping.rviz"]
     )
     default_world = PathJoinSubstitution(
-        [package_share, "worlds", "t_parking_exam.sdf"]
+        [package_share, "worlds", "t_parking_exam_real_vehicle.sdf"]
     )
 
-    robot_description = Command(
-        [FindExecutable(name="xacro"), " ", xacro_file]
-    )
+    effective_lidar_z = PythonExpression([
+        "", mapping_lidar_z, " if '", mapping_lidar_override,
+        "'.lower() == 'true' else 0.52",
+    ])
+    robot_description = Command([
+        FindExecutable(name="xacro"), " ", xacro_file,
+        " lidar_ground_height:=", effective_lidar_z,
+    ])
 
     gazebo_gui = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -70,7 +81,8 @@ def generate_launch_description():
         output="screen",
         parameters=[
             {
-                "robot_description": robot_description,
+                "robot_description": ParameterValue(
+                    robot_description, value_type=str),
                 "use_sim_time": use_sim_time,
                 "publish_frequency": 50.0,
             }
@@ -91,6 +103,8 @@ def generate_launch_description():
                 "world_name": "t_parking_exam",
                 "entity_name": "turtle_car",
                 "practice_mode": practice_mode,
+                "spawn_parking_obstacles": ParameterValue(
+                    spawn_parking_obstacles, value_type=bool),
                 "randomize_parking_obstacles": True,
                 "parking_obstacle_seed": -1,
                 # Only consulted when practice_mode is "custom"; every other
@@ -114,6 +128,16 @@ def generate_launch_description():
                 "use_sim_time": use_sim_time,
             }
         ],
+    )
+
+    # Sole ROS authority for /odom and odom -> base_footprint.  Its input is
+    # Gazebo's collision-aware model pose, not Ackermann wheel integration.
+    pose_odom = Node(
+        package="t_parking_sim",
+        executable="gazebo_pose_odom.py",
+        name="gazebo_pose_odom",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}],
     )
 
     optional_rviz = Node(
@@ -165,10 +189,31 @@ def generate_launch_description():
                     "to custom only."
                 ),
             ),
+            DeclareLaunchArgument(
+                "spawn_parking_obstacles",
+                default_value="true",
+                description=(
+                    "Spawn parking-slot obstacles. Set false only for a "
+                    "clean reference-map mapping run."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "mapping_lidar_override",
+                default_value="false",
+                description=(
+                    "Use mapping_lidar_z for this simulation. Normal and "
+                    "saved-map launches must leave this false."),
+            ),
+            DeclareLaunchArgument(
+                "mapping_lidar_z",
+                default_value="0.15",
+                description="Mapping-only LiDAR centre height above ground.",
+            ),
             gazebo_gui,
             gazebo_headless,
             state_publisher,
             bridge,
+            pose_odom,
             spawn_manager,
             optional_rviz,
         ]
