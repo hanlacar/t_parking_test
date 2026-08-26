@@ -66,6 +66,7 @@ install(PROGRAMS
   scripts/gazebo_pose_odom.py
   scripts/lidar_to_gazebo_bridge.py
   scripts/lidar_visibility_check.py
+  scripts/rviz_fake_vehicle.py
   scripts/scan_filter.py
   scripts/vehicle_spawn_manager.py
   DESTINATION lib/${PROJECT_NAME}

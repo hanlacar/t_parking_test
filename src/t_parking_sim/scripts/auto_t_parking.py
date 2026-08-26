@@ -125,9 +125,11 @@ class AutoTParking(Node):
         super().__init__('t_parking_auto')
         self.callback_group = ReentrantCallbackGroup()
         self._declare_parameters()
+        self.rviz_only = bool(self.get_parameter('rviz_only').value)
         self.target_slot = str(self.get_parameter('target_slot').value)
         self.auto_start = bool(self.get_parameter('auto_start').value)
-        self.execute_path = bool(self.get_parameter('execute').value)
+        self.execute_path = (
+            bool(self.get_parameter('execute').value) and not self.rviz_only)
         self.slots = [self._load_slot('slot_1'), self._load_slot('slot_2')]
 
         self.worker_lock = threading.Lock()
@@ -162,13 +164,16 @@ class AutoTParking(Node):
         # velocity smoother input; the smoother then feeds the sole
         # Twist-to-lidar adapter.  This node must never publish /cmd_vel
         # directly because /lidar_* is the final shared vehicle command.
-        self.nav_stop_publisher = self.create_publisher(
-            Twist, '/cmd_vel_nav', 10)
+        self.nav_stop_publisher = None
         # Private request consumed by cmd_vel_to_lidar_cmd.  Only genuine
         # safety faults set it; normal segment/cusp/final stops remain
         # /lidar_drive=0 with /lidar_stop=false.
-        self.emergency_stop_request_publisher = self.create_publisher(
-            Bool, '/t_parking/emergency_stop_request', 10)
+        self.emergency_stop_request_publisher = None
+        if not self.rviz_only:
+            self.nav_stop_publisher = self.create_publisher(
+                Twist, '/cmd_vel_nav', 10)
+            self.emergency_stop_request_publisher = self.create_publisher(
+                Bool, '/t_parking/emergency_stop_request', 10)
 
         self.map_msg: Optional[OccupancyGrid] = None
         self.global_costmap: Optional[Costmap] = None
@@ -216,34 +221,35 @@ class AutoTParking(Node):
             self._global_costmap_callback, transient_qos,
             callback_group=self.callback_group)
         self.create_subscription(
-            Costmap, '/local_costmap/costmap_raw',
-            self._local_costmap_callback, transient_qos,
-            callback_group=self.callback_group)
-        self.create_subscription(
-            LaserScan, '/scan', self._scan_callback, qos_profile_sensor_data,
-            callback_group=self.callback_group)
-        self.create_subscription(
-            LaserScan, '/scan_rear', self._rear_scan_callback,
-            qos_profile_sensor_data, callback_group=self.callback_group)
-        self.create_subscription(
             Odometry, '/odom', self._odom_callback, qos_profile_sensor_data,
             callback_group=self.callback_group)
-        self.create_subscription(
-            Twist, '/cmd_vel', self._cmd_vel_callback, 10,
-            callback_group=self.callback_group)
-        self.create_subscription(
-            Twist, '/cmd_vel_nav', self._cmd_vel_nav_callback, 10,
-            callback_group=self.callback_group)
-        self.create_subscription(
-            Twist, '/t_parking/cmd_vel_control',
-            self._cmd_vel_control_callback, 10,
-            callback_group=self.callback_group)
-        self.create_subscription(
-            Float32, '/lidar_drive', self._lidar_drive_callback, 10,
-            callback_group=self.callback_group)
-        self.create_subscription(
-            Int32, '/lidar_wheel', self._lidar_wheel_callback, 10,
-            callback_group=self.callback_group)
+        if not self.rviz_only:
+            self.create_subscription(
+                Costmap, '/local_costmap/costmap_raw',
+                self._local_costmap_callback, transient_qos,
+                callback_group=self.callback_group)
+            self.create_subscription(
+                LaserScan, '/scan', self._scan_callback,
+                qos_profile_sensor_data, callback_group=self.callback_group)
+            self.create_subscription(
+                LaserScan, '/scan_rear', self._rear_scan_callback,
+                qos_profile_sensor_data, callback_group=self.callback_group)
+            self.create_subscription(
+                Twist, '/cmd_vel', self._cmd_vel_callback, 10,
+                callback_group=self.callback_group)
+            self.create_subscription(
+                Twist, '/cmd_vel_nav', self._cmd_vel_nav_callback, 10,
+                callback_group=self.callback_group)
+            self.create_subscription(
+                Twist, '/t_parking/cmd_vel_control',
+                self._cmd_vel_control_callback, 10,
+                callback_group=self.callback_group)
+            self.create_subscription(
+                Float32, '/lidar_drive', self._lidar_drive_callback, 10,
+                callback_group=self.callback_group)
+            self.create_subscription(
+                Int32, '/lidar_wheel', self._lidar_wheel_callback, 10,
+                callback_group=self.callback_group)
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=30.0))
         self.tf_listener = tf2_ros.TransformListener(
@@ -251,9 +257,11 @@ class AutoTParking(Node):
         self.plan_client = ActionClient(
             self, ComputePathThroughPoses, '/compute_path_through_poses',
             callback_group=self.callback_group)
-        self.follow_client = ActionClient(
-            self, FollowPath, '/follow_path',
-            callback_group=self.callback_group)
+        self.follow_client = None
+        if not self.rviz_only:
+            self.follow_client = ActionClient(
+                self, FollowPath, '/follow_path',
+                callback_group=self.callback_group)
         self.slam_pause_client = self.create_client(
             Pause, '/slam_toolbox/pause_new_measurements',
             callback_group=self.callback_group)
@@ -267,7 +275,9 @@ class AutoTParking(Node):
             # calls /navigate_to_pose, so the BT navigator is not launched.
             # Polling a lifecycle node that does not exist would leave the
             # readiness gate below permanently unsatisfied.
-            for name in ('planner_server', 'controller_server')
+            for name in (
+                ('planner_server',) if self.rviz_only
+                else ('planner_server', 'controller_server'))
         }
         self.lifecycle_state_lock = threading.Lock()
         self.lifecycle_state: Dict[str, bool] = {
@@ -300,6 +310,7 @@ class AutoTParking(Node):
         self.last_feedback_log = 0.0
         self._log_info(
             '[AUTO PARKING PARAMETERS]\n'
+            f'rviz_only={str(self.rviz_only).lower()}\n'
             f'auto_start={str(self.auto_start).lower()}\n'
             f'execute={str(self.execute_path).lower()}\n'
             f'target_slot={self.target_slot}')
@@ -315,6 +326,7 @@ class AutoTParking(Node):
     def _declare_parameters(self) -> None:
         defaults = {
             'target_slot': 'auto', 'auto_start': True, 'execute': True,
+            'rviz_only': False,
             'return_to_entrance': True,
             'stop_when_all_wheels_inside': True,
             'exit_mode': 'forward_right',
@@ -324,6 +336,15 @@ class AutoTParking(Node):
             'max_reverse_distance_during_exit': 0.01,
             'road_center_y': 0.0, 'road_min_y': -2.16,
             'road_max_y': 2.16, 'approach_lead': 0.50,
+            # RViz-only testing deliberately supports only the canonical
+            # east-to-west approach on the saved real map.  These defaults
+            # are repeated in rviz_t_parking_test.yaml and the launch file so
+            # the planner diagnostics document the intended fixed start.
+            'opposite_start_x': 9.70,
+            'opposite_start_y': 0.0,
+            'opposite_start_yaw': math.pi,
+            'opposite_staging_lead': 0.50,
+            'opposite_setup_inset_candidates': [0.45, 0.30, 0.15, 0.0],
             # R-slot_half_width = 1.52-0.915 = 0.605 m is the geometry-based
             # nominal setup for the expanded real-vehicle bay.
             'setup_offset_candidates': [0.60, 0.75, 0.90, 1.05],
@@ -740,7 +761,9 @@ class AutoTParking(Node):
             # them here so plan-only validation can safely precede execution
             # without restarting Gazebo, SLAM, or Nav2 and losing the map.
             self.target_slot = str(self.get_parameter('target_slot').value)
-            self.execute_path = bool(self.get_parameter('execute').value)
+            self.execute_path = (
+                bool(self.get_parameter('execute').value)
+                and not self.rviz_only)
             self.cancel_requested.clear()
             self._set_emergency_stop_request(False)
             self.cmd_vel_nonzero_seen = False
@@ -764,6 +787,7 @@ class AutoTParking(Node):
             self.active_motion_final = None
             self._log_info(
                 '[AUTO PARKING PARAMETERS]\n'
+                f'rviz_only={str(self.rviz_only).lower()}\n'
                 f'auto_start={str(self.auto_start).lower()}\n'
                 f'execute={str(self.execute_path).lower()}\n'
                 f'target_slot={self.target_slot}')
@@ -820,18 +844,31 @@ class AutoTParking(Node):
                 self._fail('wheel TF and base-footprint geometry are unavailable')
                 return
 
-            self._publish_status('WAIT_OBSTACLE_OBSERVATION')
-            if not self._wait_for_stable_obstacle_observation():
-                if self._abort_requested():
-                    self._cancelled()
-                else:
-                    self._fail(
-                        'front/rear lidar and costmaps did not provide a '
-                        'stable obstacle observation window')
-                return
-
             self._publish_status('WAIT_MAP')
-            available_slots = self._wait_for_map_and_slots()
+            if self.rviz_only:
+                # The dry-run deliberately has no LaserScan source.  Slot
+                # geometry is still the same deterministic Slot data used by
+                # the real planner; only live occupancy classification is
+                # bypassed in this explicitly isolated mode.
+                with self.data_lock:
+                    map_ready = self.map_msg is not None
+                    costmap_ready = self.global_costmap is not None
+                available_slots = (
+                    list(self.slots) if map_ready and costmap_ready else [])
+                self._log_info(
+                    '[RVIZ ONLY] using configured deterministic slot geometry; '
+                    'LaserScan occupancy detection is disabled')
+            else:
+                self._publish_status('WAIT_OBSTACLE_OBSERVATION')
+                if not self._wait_for_stable_obstacle_observation():
+                    if self._abort_requested():
+                        self._cancelled()
+                    else:
+                        self._fail(
+                            'front/rear lidar and costmaps did not provide a '
+                            'stable obstacle observation window')
+                    return
+                available_slots = self._wait_for_map_and_slots()
             if not available_slots:
                 if self._abort_requested():
                     self._cancelled()
@@ -900,6 +937,13 @@ class AutoTParking(Node):
                 f'goal_checker_id={self.get_parameter("goal_checker_id").value}')
 
             self._publish_status('PLAN_VALID')
+
+            if self.rviz_only:
+                self._log_info(
+                    'rviz_only: parking plan published; fake vehicle owns '
+                    'visual playback and no FollowPath or command output exists')
+                self._publish_status('FINISHED')
+                return
 
             if not self.execute_path:
                 parking_stop_pose = self._expected_wheels_inside_stop_pose(
@@ -1130,6 +1174,19 @@ class AutoTParking(Node):
             name: self._poll_lifecycle_state(name, client)
             for name, client in self.lifecycle_clients.items()
         }
+        if self.rviz_only:
+            return {
+                'robot_spawned': robot_spawned,
+                'odom': robot_spawned,
+                'map': map_ready,
+                'map_to_base_tf': bool(self.tf_buffer.can_transform(
+                    'map', 'base_footprint', Time(),
+                    timeout=Duration(seconds=0.05))),
+                'planner_active': lifecycle['planner_server'],
+                'compute_path_server': self.plan_client.wait_for_server(
+                    timeout_sec=0.05),
+                'global_costmap': global_costmap_ready,
+            }
         return {
             'robot_spawned': robot_spawned,
             'front_scan': now - self.scan_received_at < scan_timeout,
@@ -1699,13 +1756,39 @@ class AutoTParking(Node):
         approach_lead = float(self.get_parameter('approach_lead').value)
         overshoot = float(self.get_parameter('final_pose_overshoot').value)
         target_x, target_y = self._parking_target_depth(slot, overshoot)
-        odom_poses = {
-            'approach': (slot.min_x - approach_lead, road_y, 0.0),
-            # Offset is measured beyond the far edge of the selected slot.
-            'setup': (slot.max_x + setup_offset, road_y, 0.0),
-            'entry': (slot.odom_x, slot.min_y + entry_depth, slot.yaw),
-            'final': (target_x, target_y, slot.yaw),
-        }
+        forward_x = math.cos(slot.yaw)
+        forward_y = math.sin(slot.yaw)
+        entry_x = slot.odom_x
+        entry_y = slot.odom_y
+        if abs(forward_x) >= abs(forward_y):
+            entrance_x = slot.max_x if forward_x > 0.0 else slot.min_x
+            entry_x = entrance_x - forward_x * entry_depth
+        else:
+            entrance_y = slot.max_y if forward_y > 0.0 else slot.min_y
+            entry_y = entrance_y - forward_y * entry_depth
+        if self.rviz_only:
+            # The saved-map dry run has one canonical approach: start at the
+            # east end of the road, face west, pass a forward-only staging
+            # pose, and reach the west-side setup before reversing into the
+            # T branch.  Do not route through the old west-to-east waypoints.
+            staging_lead = float(
+                self.get_parameter('opposite_staging_lead').value)
+            odom_poses = {
+                'staging': (
+                    slot.max_x + staging_lead, road_y, math.pi),
+                'setup': (
+                    slot.min_x + setup_offset, road_y, math.pi),
+                'entry': (entry_x, entry_y, slot.yaw),
+                'final': (target_x, target_y, slot.yaw),
+            }
+        else:
+            odom_poses = {
+                'approach': (slot.min_x - approach_lead, road_y, 0.0),
+                # Offset is measured beyond the far edge of the selected slot.
+                'setup': (slot.max_x + setup_offset, road_y, 0.0),
+                'entry': (entry_x, entry_y, slot.yaw),
+                'final': (target_x, target_y, slot.yaw),
+            }
         result = {}
         for name, values in odom_poses.items():
             pose = self._odom_pose_to_map(*values)
@@ -1716,8 +1799,11 @@ class AutoTParking(Node):
 
     def _plan_all_candidates(self, slots: Sequence[Slot]) -> List[PlanCandidate]:
         results = []
+        offset_parameter = (
+            'opposite_setup_inset_candidates'
+            if self.rviz_only else 'setup_offset_candidates')
         offsets = [float(value) for value in self.get_parameter(
-            'setup_offset_candidates').value]
+            offset_parameter).value]
         depths = [float(value) for value in self.get_parameter(
             'entry_depth_candidates').value]
         for slot in slots:
@@ -1729,8 +1815,11 @@ class AutoTParking(Node):
                         slot, setup_offset, entry_depth)
                     if named is None:
                         continue
+                    first_waypoint = (
+                        named['staging'] if self.rviz_only
+                        else named['approach'])
                     path = self._request_plan([
-                        named['approach'], named['setup'],
+                        first_waypoint, named['setup'],
                         named['entry'], named['final']])
                     if path is None:
                         self._log_error(
@@ -3589,6 +3678,7 @@ class AutoTParking(Node):
         marker_id = 0
         colors = {
             'approach': ColorRGBA(r=0.1, g=0.5, b=1.0, a=0.9),
+            'staging': ColorRGBA(r=0.1, g=0.5, b=1.0, a=0.9),
             'setup': ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.9),
             'entry': ColorRGBA(r=0.8, g=0.2, b=1.0, a=0.9),
             'final': ColorRGBA(r=0.1, g=1.0, b=0.2, a=0.9),
@@ -3662,6 +3752,8 @@ class AutoTParking(Node):
                     pass
 
     def _set_emergency_stop_request(self, active: bool) -> None:
+        if self.emergency_stop_request_publisher is None:
+            return
         msg = Bool()
         msg.data = active
         self._safe_publish(self.emergency_stop_request_publisher, msg)
@@ -3669,6 +3761,8 @@ class AutoTParking(Node):
     def _emergency_stop(
             self, final: bool = False, emergency: bool = False) -> None:
         if not self._runtime_ok():
+            return
+        if self.nav_stop_publisher is None:
             return
         if emergency:
             self._set_emergency_stop_request(True)

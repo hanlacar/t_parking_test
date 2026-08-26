@@ -1,0 +1,73 @@
+t_parking_auto:
+  ros__parameters:
+    use_sim_time: false
+    rviz_only: true
+    auto_start: false
+    execute: false
+    return_to_entrance: false
+    target_slot: "auto"
+
+    # Canonical opposite-side start derived from the saved map.  Around y=0
+    # the east free-space boundary is x=10.88 m.  At yaw=pi the padded vehicle
+    # extends 0.67 m east of base_footprint, leaving about 0.51 m clearance at
+    # x=9.70 and about 0.21 m even for the +0.30 m robustness case.
+    opposite_start_x: 9.70
+    opposite_start_y: 0.0
+    opposite_start_yaw: 3.14159265359
+
+    # Opposite-only sequence: START -> staging east of the T mouth -> setup
+    # on its west side -> entry -> reverse final.  With the geometry below,
+    # staging is (7.45, 0, pi) and the primary setup is (3.70, 0, pi).
+    opposite_staging_lead: 0.50
+    opposite_setup_inset_candidates: [0.45, 0.30, 0.15, 0.0]
+
+    # Deterministic bay measured from real_parking_map.yaml.  The saved map
+    # contains one undivided T branch, not two bays separated by a wall.  Both
+    # legacy names select that same physical dry-run target.  The branch runs
+    # toward negative map Y, so a parked vehicle faces +Y and reverses into it.
+    # No LaserScan is fabricated for this mode.
+    slot_1:
+      odom_x: 5.10
+      odom_y: -4.975
+      yaw: 1.57079632679
+      min_x: 3.25
+      max_x: 6.95
+      min_y: -8.70
+      max_y: -1.25
+    slot_2:
+      odom_x: 5.10
+      odom_y: -4.975
+      yaw: 1.57079632679
+      min_x: 3.25
+      max_x: 6.95
+      min_y: -8.70
+      max_y: -1.25
+
+    road_center_y: 0.0
+    road_min_y: -1.05
+    road_max_y: 0.90
+    entry_depth_candidates: [0.10, 0.20, 0.30]
+    freeze_slam_during_execution: false
+    system_wait_timeout: 30.0
+    map_wait_timeout: 30.0
+
+# The planner still uses the package's existing Reeds-Shepp settings and
+# 1.52 m minimum radius.  Only the unavailable live obstacle layer is off.
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      plugins: ["static_layer", "inflation_layer"]
+      obstacle_layer:
+        enabled: false
+      inflation_layer:
+        # Keep inflation at least as large as the reported 0.822390 m
+        # circumscribed radius.  The polygon footprint itself is unchanged.
+        inflation_radius: 0.85
+        cost_scaling_factor: 2.5
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    GridBased:
+      allow_unknown: true
