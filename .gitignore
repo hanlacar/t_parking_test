@@ -17,6 +17,7 @@ __pycache__/
 
 # Temporary / backup files
 *.bak
+*.bak_*
 *.tmp
 
 # ROS bag files
@@ -28,3 +29,22 @@ rosbag2_*/
 # TF view_frames output
 frames_*.gv
 frames_*.pdf
+
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ROS bags / generated data
+rosbag2_*/
+*.db3
+*.mcap
+
+# Editor
+.vscode/
+.idea/

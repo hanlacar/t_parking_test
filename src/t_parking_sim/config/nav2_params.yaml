@@ -1,10 +1,10 @@
 amcl:
   ros__parameters:
     use_sim_time: true
-    base_frame_id: base_footprint
+    base_frame_id: base_link
     global_frame_id: map
     odom_frame_id: odom
-    scan_topic: /scan
+    scan_topic: /scan_front
     tf_broadcast: true
     # Gazebo Ackermann publishes the simulation pose as noise-free odometry.
     # Do not inject the real-robot motion noise defaults into this exact source.
@@ -211,12 +211,12 @@ local_costmap:
       update_frequency: 5.0
       publish_frequency: 2.0
       global_frame: odom
-      robot_base_frame: base_footprint
+      robot_base_frame: base_link
       rolling_window: true
       width: 4
       height: 4
       resolution: 0.05
-      # base_footprint is the axle midpoint. Physical centre is +0.020 m,
+      # base_link is the axle reference. Physical centre is +0.020 m,
       # hence the measured 1.33 x 0.78 m envelope is asymmetric in x.
       footprint: "[[0.685, 0.39], [0.685, -0.39], [-0.645, -0.39], [-0.645, 0.39]]"
       footprint_padding: 0.025
@@ -226,12 +226,15 @@ local_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        # Deliberately the raw scans, not /scan_static: local obstacle
-        # avoidance must react to a person stepping out, and the rear lidar is
-        # what makes the reversing leg of the manoeuvre safe.
-        observation_sources: "front_scan rear_scan"
-        front_scan:
-          topic: /scan
+        # The real vehicle has independent front and rear lidars.  Each source
+        # marks and clears using its own message timestamp and TF frame.
+        # Footprint clearing removes only cells physically under the measured
+        # vehicle envelope; obstacle marking and rear emergency checks remain
+        # enabled everywhere outside it.
+        footprint_clearing_enabled: true
+        observation_sources: "scan_front scan_rear"
+        scan_front:
+          topic: /scan_front
           data_type: "LaserScan"
           clearing: true
           marking: true
@@ -240,7 +243,7 @@ local_costmap:
           obstacle_max_range: 9.0
           raytrace_min_range: 0.10
           raytrace_max_range: 12.0
-        rear_scan:
+        scan_rear:
           topic: /scan_rear
           data_type: "LaserScan"
           clearing: true
@@ -250,10 +253,10 @@ local_costmap:
           obstacle_max_range: 9.0
           raytrace_min_range: 0.10
           raytrace_max_range: 12.0
-
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # See the global costmap note: 0.55 m closed the slot mouth off.
+        # Local collision prediction still checks the full polygon footprint;
+        # this radius shapes controller slowdown around newly seen obstacles.
         inflation_radius: 0.25
         cost_scaling_factor: 5.0
 
@@ -266,7 +269,7 @@ global_costmap:
       update_frequency: 5.0
       publish_frequency: 2.0
       global_frame: map
-      robot_base_frame: base_footprint
+      robot_base_frame: base_link
       resolution: 0.05
       track_unknown_space: true
       footprint: "[[0.685, 0.39], [0.685, -0.39], [-0.645, -0.39], [-0.645, 0.39]]"
@@ -282,12 +285,16 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        # Saved maps do not contain the randomly spawned parking obstacles.
-        # Feed both raw 360-degree lidars to the global layer so slot
-        # occupancy is based on live geometry, not the obstacle-layout label.
-        observation_sources: "front_scan rear_scan"
-        front_scan:
-          topic: /scan
+        # Saved maps do not contain live obstacles.  Independent front and
+        # rear scans provide marking and ray-clearing around the complete car.
+        # Explicit footprint clearing prevents either lidar's obstacle layer
+        # from leaving a self-marked lethal cell under the
+        # stationary start pose; it does not clear anything outside the true
+        # padded footprint.
+        footprint_clearing_enabled: true
+        observation_sources: "scan_front scan_rear"
+        scan_front:
+          topic: /scan_front
           data_type: "LaserScan"
           clearing: true
           marking: true
@@ -296,7 +303,7 @@ global_costmap:
           obstacle_max_range: 9.0
           raytrace_min_range: 0.10
           raytrace_max_range: 12.0
-        rear_scan:
+        scan_rear:
           topic: /scan_rear
           data_type: "LaserScan"
           clearing: true
@@ -306,15 +313,15 @@ global_costmap:
           obstacle_max_range: 9.0
           raytrace_min_range: 0.10
           raytrace_max_range: 12.0
-
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # 0.55 m of inflation on both sides of a 1.5 m slot leaves a 0.4 m
-        # corridor, narrower than the 0.45 m vehicle width, so the planner had
-        # to bow around a gap it could not legally enter.
-        inflation_radius: 0.30
-        # Gentler cost gradient, so small costmap changes no longer shift the
-        # cheapest path sideways between replans.
+        # The padded footprint's circumscribed radius is 0.822390 m.  Nav2
+        # 1.3.12 does not require inflation_radius to exceed that radius for
+        # safety: a smaller radius only disables Smac's centre-cost shortcut
+        # and makes it perform the exact polygon check more often.  Keep the
+        # already-live 0.85 m value because the measured corridor and the
+        # successful plans below show it is not this failure's cause.
+        inflation_radius: 0.85
         cost_scaling_factor: 2.5
 
       always_send_full_costmap: true

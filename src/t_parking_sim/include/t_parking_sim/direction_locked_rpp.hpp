@@ -17,6 +17,7 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/int32_multi_array.hpp"
+#include "t_parking_sim/terminal_capture.hpp"
 
 namespace t_parking_sim
 {
@@ -78,6 +79,9 @@ private:
     const builtin_interfaces::msg::Time & command_stamp);
   geometry_msgs::msg::PoseStamped getDirectionLockedLookAheadPoint(
     double lookahead_distance, const nav_msgs::msg::Path & transformed_plan) const;
+  bool findDirectionLockedLookAheadPoint(
+    double lookahead_distance, const nav_msgs::msg::Path & transformed_plan,
+    geometry_msgs::msg::PoseStamped & carrot) const;
   PathProjection projectReversePath(
     const geometry_msgs::msg::PoseStamped & robot_plan_pose);
   geometry_msgs::msg::PoseStamped reverseArcTarget(
@@ -126,6 +130,7 @@ private:
   double reverse_profile_median_steering_deg_{0.0};
   double reverse_profile_p90_steering_deg_{0.0};
   double reverse_profile_p95_steering_deg_{0.0};
+  double terminal_capture_distance_{0.0};
 
   int locked_direction_{1};
   std::atomic<int> segment_number_{-1};
@@ -147,7 +152,9 @@ private:
   std::uint64_t reverse_saturation_samples_{0};
   std::uint64_t reverse_saturation_events_{0};
   bool reverse_saturation_active_{false};
+  bool terminal_goal_reached_logged_{false};
   rclcpp::Time last_track_log_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_terminal_log_{0, 0, RCL_ROS_TIME};
 };
 
 }  // namespace t_parking_sim

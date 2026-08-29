@@ -1,0 +1,16 @@
+# BENCH ONLY. Launch overrides the three false motion gates explicitly.
+bench_virtual_vehicle:
+  ros__parameters:
+    use_sim_time: false
+    bench_mode: false
+    wheels_off_ground: false
+    execute: false
+    input_topic: "/t_parking/cmd_vel_control"
+    odom_topic: "/bench/odom"
+    odom_frame: "bench_odom"
+    base_frame: "bench_base_link"
+    wheel_base: 0.77
+    steering_limit_deg: 27.0
+    stopped_speed_epsilon: 0.01
+    input_timeout_sec: 0.50
+    publish_frequency: 50.0

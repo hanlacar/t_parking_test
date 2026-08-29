@@ -6,7 +6,6 @@ from typing import List, Sequence
 
 from geometry_msgs.msg import (
     Pose,
-    PoseStamped,
     PoseWithCovarianceStamped,
     TransformStamped,
 )
@@ -52,7 +51,9 @@ class RvizFakeVehicle(Node):
         self.declare_parameter('reverse_speed_mps', 0.20)
         self.declare_parameter('update_rate_hz', 20.0)
         self.declare_parameter('cusp_pause_sec', 0.5)
-        self.declare_parameter('auto_exit', True)
+        self.declare_parameter('return_pose_yaw', 0.0)
+        self.declare_parameter('return_position_tolerance', 0.05)
+        self.declare_parameter('return_yaw_tolerance', 0.05)
         self.declare_parameter('wheel_base', 0.77)
         self.declare_parameter('wheel_radius', 0.14)
 
@@ -67,7 +68,12 @@ class RvizFakeVehicle(Node):
             1.0, float(self.get_parameter('update_rate_hz').value))
         self.cusp_pause = max(
             0.0, float(self.get_parameter('cusp_pause_sec').value))
-        self.auto_exit = bool(self.get_parameter('auto_exit').value)
+        self.return_yaw = float(self.get_parameter('return_pose_yaw').value)
+        self.return_position_tolerance = max(
+            0.0, float(
+                self.get_parameter('return_position_tolerance').value))
+        self.return_yaw_tolerance = max(
+            0.0, float(self.get_parameter('return_yaw_tolerance').value))
         self.wheel_base = float(self.get_parameter('wheel_base').value)
         self.wheel_radius = float(self.get_parameter('wheel_radius').value)
 
@@ -82,12 +88,13 @@ class RvizFakeVehicle(Node):
             JointState, '/joint_states', 10)
         self.status_publisher = self.create_publisher(
             String, '/t_parking/fake_vehicle_status', transient_qos)
-        self.exit_path_publisher = self.create_publisher(
-            Path, '/t_parking/rviz_exit_path', transient_qos)
         self.tf_broadcaster = TransformBroadcaster(self)
 
         self.create_subscription(
             Path, '/t_parking/planned_path', self._path_callback,
+            transient_qos)
+        self.create_subscription(
+            Path, '/t_parking/forward_exit_path', self._exit_path_callback,
             transient_qos)
         self.create_subscription(
             PoseWithCovarianceStamped, '/initialpose',
@@ -100,7 +107,11 @@ class RvizFakeVehicle(Node):
         self.pause_remaining = 0.0
         self.playback_kind = 'idle'
         self.exit_poses: List[Pose] = []
+        self.exit_directions: List[int] = []
         self.exit_pending = False
+        self.finish_pending = False
+        self.return_x = self.x
+        self.return_y = self.y
         self.linear_velocity = 0.0
         self.angular_velocity = 0.0
         self.wheel_rotation = 0.0
@@ -174,14 +185,12 @@ class RvizFakeVehicle(Node):
             self.get_logger().error('could not classify parking Path directions')
             return
 
-        # Preserve the terminal reverse run for a simple, physically valid
-        # forward pull-out after the parking animation has stopped.
+        # Save only the original position.  The return yaw is an independent
+        # requirement and must never be copied from the starting orientation.
+        self.return_x = self.x
+        self.return_y = self.y
         self.exit_poses = []
-        if self.auto_exit and directions and directions[-1] < 0:
-            first_reverse_edge = len(directions) - 1
-            while first_reverse_edge > 0 and directions[first_reverse_edge - 1] < 0:
-                first_reverse_edge -= 1
-            self.exit_poses = list(reversed(poses[first_reverse_edge:]))
+        self.exit_directions = []
 
         self._start_playback(poses, directions, 'parking')
         forward_edges = sum(value > 0 for value in directions)
@@ -190,7 +199,50 @@ class RvizFakeVehicle(Node):
         self.get_logger().info(
             f'parking Path accepted: poses={len(poses)} '
             f'forward_edges={forward_edges} reverse_edges={reverse_edges} '
-            f'cusps={cusps}')
+            f'cusps={cusps}; return goal=({self.return_x:.3f}, '
+            f'{self.return_y:.3f}, {self.return_yaw:.3f})')
+
+    def _exit_path_callback(self, message: Path) -> None:
+        if len(message.poses) < 2:
+            self.get_logger().error(
+                'ignoring ForwardExit Path with fewer than two poses')
+            self._publish_status('EXIT_PLAN_FAILED')
+            return
+        poses = [item.pose for item in message.poses]
+        directions = self._edge_directions(poses)
+        if not directions or any(value < 0 for value in directions):
+            self.get_logger().error(
+                'ForwardExit Path is not a continuous forward-only path')
+            self._publish_status('EXIT_PLAN_FAILED')
+            return
+
+        endpoint = poses[-1]
+        position_error = math.hypot(
+            endpoint.position.x - self.return_x,
+            endpoint.position.y - self.return_y)
+        yaw_error = abs(normalize_angle(
+            yaw_from_pose(endpoint) - self.return_yaw))
+        if (position_error > self.return_position_tolerance
+                or yaw_error > self.return_yaw_tolerance):
+            self.get_logger().error(
+                'ForwardExit endpoint does not satisfy RETURN_POSE: '
+                f'position_error={position_error:.4f} '
+                f'yaw_error={yaw_error:.4f}')
+            self._publish_status('EXIT_PLAN_FAILED')
+            return
+
+        self.exit_poses = poses
+        self.exit_directions = directions
+        total_length = sum(
+            math.hypot(second.position.x - first.position.x,
+                       second.position.y - first.position.y)
+            for first, second in zip(poses, poses[1:]))
+        cusps = sum(a != b for a, b in zip(directions, directions[1:]))
+        self.get_logger().info(
+            f'planner ForwardExit Path accepted: poses={len(poses)} '
+            f'length={total_length:.3f}m cusps={cusps} '
+            f'endpoint_position_error={position_error:.4f} '
+            f'endpoint_yaw_error={yaw_error:.4f}')
 
     def _start_playback(
             self, poses: Sequence[Pose], directions: Sequence[int],
@@ -202,6 +254,7 @@ class RvizFakeVehicle(Node):
         self.pause_remaining = 0.0
         self.playback_kind = kind
         self.exit_pending = False
+        self.finish_pending = False
         self._publish_status(f'PLAYING_{kind.upper()}')
 
     def _initial_pose_callback(self, message: PoseWithCovarianceStamped) -> None:
@@ -216,7 +269,9 @@ class RvizFakeVehicle(Node):
         self.poses = []
         self.directions = []
         self.exit_poses = []
+        self.exit_directions = []
         self.exit_pending = False
+        self.finish_pending = False
         self.playback_kind = 'idle'
         self.linear_velocity = 0.0
         self.angular_velocity = 0.0
@@ -235,6 +290,10 @@ class RvizFakeVehicle(Node):
             self.pause_remaining = max(0.0, self.pause_remaining - dt)
             if self.pause_remaining == 0.0 and self.exit_pending:
                 self._begin_exit()
+            elif self.pause_remaining == 0.0 and self.finish_pending:
+                self.finish_pending = False
+                self.playback_kind = 'idle'
+                self._publish_status('FINISHED')
             self._publish_state()
             return
 
@@ -279,32 +338,58 @@ class RvizFakeVehicle(Node):
 
         self.linear_velocity = 0.0
         self.angular_velocity = 0.0
-        if self.playback_kind == 'parking' and len(self.exit_poses) >= 2:
+        if self.playback_kind == 'parking':
             self.exit_pending = True
             self.pause_remaining = self.cusp_pause
             self._publish_status('PARKED_PAUSE')
-        else:
-            self.playback_kind = 'idle'
-            self._publish_status('FINISHED')
+            return
+        if self.playback_kind == 'exit':
+            position_error = math.hypot(
+                self.x - self.return_x, self.y - self.return_y)
+            yaw_error = abs(normalize_angle(self.yaw - self.return_yaw))
+            if (position_error > self.return_position_tolerance
+                    or yaw_error > self.return_yaw_tolerance):
+                self.get_logger().error(
+                    'actual return failed: '
+                    f'final=({self.x:.4f}, {self.y:.4f}, {self.yaw:.4f}) '
+                    f'position_error={position_error:.4f} '
+                    f'yaw_error={yaw_error:.4f}')
+                self.playback_kind = 'idle'
+                self._publish_status('RETURN_VALIDATION_FAILED')
+                return
+            self.get_logger().info(
+                'RETURNED_TO_START: '
+                f'final=({self.x:.4f}, {self.y:.4f}, {self.yaw:.4f}) '
+                f'position_error={position_error:.4f} '
+                f'yaw_error={yaw_error:.4f}; vehicle faces east')
+            self.finish_pending = True
+            self.pause_remaining = self.cusp_pause
+            self._publish_status('RETURNED_TO_START')
 
     def _begin_exit(self) -> None:
-        path = Path()
-        path.header.frame_id = 'map'
-        path.header.stamp = self.get_clock().now().to_msg()
-        for pose in self.exit_poses:
-            item = PoseStamped()
-            item.header = path.header
-            item.pose = pose
-            path.poses.append(item)
-        self.exit_path_publisher.publish(path)
-        directions = self._edge_directions(self.exit_poses)
-        if not directions or any(value < 0 for value in directions):
-            self.get_logger().error('terminal reverse run could not become a forward exit')
+        if (len(self.exit_poses) < 2
+                or len(self.exit_directions) != len(self.exit_poses) - 1):
+            self.get_logger().error(
+                'parking completed but no valid planner ForwardExit Path exists')
             self.playback_kind = 'idle'
             self.exit_pending = False
-            self._publish_status('EXIT_FAILED')
+            self._publish_status('EXIT_PLAN_FAILED')
             return
-        self._start_playback(self.exit_poses, directions, 'exit')
+        start = self.exit_poses[0]
+        join_position_error = math.hypot(
+            start.position.x - self.x, start.position.y - self.y)
+        join_yaw_error = abs(normalize_angle(yaw_from_pose(start) - self.yaw))
+        if join_position_error > 0.05 or join_yaw_error > 0.05:
+            self.get_logger().error(
+                'ForwardExit Path does not join the actual parked pose: '
+                f'position_error={join_position_error:.4f} '
+                f'yaw_error={join_yaw_error:.4f}')
+            self.playback_kind = 'idle'
+            self.exit_pending = False
+            self._publish_status('EXIT_PLAN_FAILED')
+            return
+        self._start_playback(
+            self.exit_poses, self.exit_directions, 'exit')
 
     def _publish_state(self) -> None:
         stamp = self.get_clock().now().to_msg()

@@ -5,6 +5,9 @@ t_parking_auto:
     auto_start: false
     execute: false
     return_to_entrance: false
+    rviz_return_yaw: 0.0
+    entrance_return_position_tolerance: 0.05
+    entrance_return_yaw_tolerance: 0.05
     target_slot: "auto"
 
     # Canonical opposite-side start derived from the saved map.  Around y=0

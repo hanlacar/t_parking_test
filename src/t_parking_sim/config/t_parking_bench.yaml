@@ -1,0 +1,25 @@
+# BENCH ONLY - VEHICLE MUST BE OFF THE GROUND FOR execute=true.
+t_parking_auto:
+  ros__parameters:
+    use_sim_time: false
+    bench_mode: true
+    wheels_off_ground: false
+    auto_start: false
+    execute: false
+    robot_base_frame: "bench_base_link"
+    odom_topic: "/bench/odom"
+    target_slot: "slot_1"
+    return_to_entrance: true
+    bench_plan_exit: true
+    freeze_slam_during_execution: false
+    localization_stability_duration: 1.0
+    entrance_pose_sample_count: 3
+
+    # Repeat the measured geometry to make review of this safety overlay easy.
+    vehicle_length: 1.33
+    vehicle_width: 0.78
+    vehicle_center_x_offset: 0.020
+    parking_end_clearance_m: 3.06
+    wheel_base: 0.77
+    minimum_turning_radius: 1.52
+    costmap_footprint_padding: 0.025

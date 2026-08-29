@@ -6,11 +6,12 @@ import math
 import time
 from typing import Optional
 
+from bench_support import bench_motion_allowed
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, Int32
+from std_msgs.msg import Bool, Float32, Int32, String
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,37 @@ class ConvertedCommand:
     drive_stage: float
     wheel_deg: int
     steering_deg_ros: float
+
+
+ZERO_COMMAND = ConvertedCommand(0.0, 0, 0.0)
+DEFAULT_PARKING_MODES = frozenset({'T_PARK', 'PARALLEL_PARK'})
+
+
+def any_stop_active(*stop_requests: bool) -> bool:
+    """Combine independent stop owners without letting one clear another."""
+    return any(bool(request) for request in stop_requests)
+
+
+def mode_allows_lidar_commands(
+        vehicle_mode: str,
+        parking_modes=DEFAULT_PARKING_MODES) -> bool:
+    """Return whether the MCU has granted drive and wheel to LiDAR."""
+    return str(vehicle_mode).strip().upper() in parking_modes
+
+
+def select_output_command(
+        command: ConvertedCommand,
+        last_input_time: Optional[float],
+        now: float,
+        input_timeout_sec: float,
+        emergency_stop: bool) -> ConvertedCommand:
+    """Select a safe heartbeat command without changing production policy."""
+    input_fresh = (
+        last_input_time is not None
+        and now - last_input_time <= input_timeout_sec)
+    if emergency_stop or not input_fresh:
+        return ZERO_COMMAND
+    return command
 
 
 def convert_command(
@@ -81,6 +113,26 @@ class CmdVelToLidarCmd(Node):
         self.declare_parameter('reverse_drive_stage', -1.0)
         self.declare_parameter('output_frequency', 10.0)
         self.declare_parameter('input_timeout_sec', 0.50)
+        # Production keeps the request topic as its compatibility default.
+        # BENCH overrides this with the MCU manager's applied-mode topic.
+        self.declare_parameter('mode_topic', '/vehicle_mode')
+        # The front motion detector owns this immediate 0.5 m ROI safety
+        # result.  Keep it separate from the parking controller's stop so a
+        # false message from either producer cannot clear the other one.
+        self.declare_parameter(
+            'lidar_safety_stop_topic', '/lidar/stop_required')
+        self.declare_parameter(
+            'parking_modes', ['T_PARK', 'PARALLEL_PARK'])
+        # Send a brief paired zero on parking exit, then become silent so the
+        # MCU's 0.5 s freshness timeout cannot be held by an idle heartbeat.
+        self.declare_parameter('mode_exit_zero_duration_sec', 0.20)
+        # Disabled by default so the production command converter retains its
+        # exact existing behavior.  bench_t_parking.launch.py explicitly
+        # enables this independent, fail-closed second motion gate.
+        self.declare_parameter('bench_interlock_enabled', False)
+        self.declare_parameter('bench_mode', False)
+        self.declare_parameter('wheels_off_ground', False)
+        self.declare_parameter('execute', False)
 
         self.wheel_base = float(self.get_parameter('wheel_base').value)
         self.steering_limit_deg = float(
@@ -98,6 +150,24 @@ class CmdVelToLidarCmd(Node):
             self.get_parameter('output_frequency').value)
         self.input_timeout_sec = float(
             self.get_parameter('input_timeout_sec').value)
+        self.mode_topic = str(self.get_parameter('mode_topic').value)
+        self.lidar_safety_stop_topic = str(
+            self.get_parameter('lidar_safety_stop_topic').value)
+        self.parking_modes = {
+            str(value).strip().upper()
+            for value in self.get_parameter('parking_modes').value
+            if str(value).strip()
+        }
+        self.mode_exit_zero_duration_sec = float(
+            self.get_parameter('mode_exit_zero_duration_sec').value)
+        self.bench_interlock_enabled = bool(
+            self.get_parameter('bench_interlock_enabled').value)
+        self.bench_mode = bool(self.get_parameter('bench_mode').value)
+        self.wheels_off_ground = bool(
+            self.get_parameter('wheels_off_ground').value)
+        self.execute = bool(self.get_parameter('execute').value)
+        self.bench_motion_allowed = bench_motion_allowed(
+            self.bench_mode, self.wheels_off_ground, self.execute)
 
         if self.wheel_base <= 0.0:
             raise ValueError('wheel_base must be supplied from the vehicle xacro')
@@ -118,10 +188,22 @@ class CmdVelToLidarCmd(Node):
             raise ValueError('output_frequency must be at least 4 Hz')
         if self.input_timeout_sec <= 0.0:
             raise ValueError('input_timeout_sec must be > 0')
+        if not self.mode_topic:
+            raise ValueError('mode_topic must not be empty')
+        if not self.lidar_safety_stop_topic:
+            raise ValueError('lidar_safety_stop_topic must not be empty')
+        if not self.parking_modes:
+            raise ValueError('parking_modes must not be empty')
+        if self.mode_exit_zero_duration_sec < 0.0:
+            raise ValueError('mode_exit_zero_duration_sec must be >= 0')
 
-        self.current_command = ConvertedCommand(0.0, 0, 0.0)
+        self.current_command = ZERO_COMMAND
         self.last_input_time: Optional[float] = None
         self.emergency_stop = False
+        self.lidar_safety_stop = False
+        self.current_mode = ''
+        self.mode_exit_zero_until: Optional[float] = None
+        self.stop_release_pending = False
 
         self.drive_publisher = self.create_publisher(
             Float32, '/lidar_drive', 10)
@@ -134,6 +216,11 @@ class CmdVelToLidarCmd(Node):
         self.stop_subscription = self.create_subscription(
             Bool, '/t_parking/emergency_stop_request',
             self._emergency_stop_callback, 10)
+        self.lidar_safety_stop_subscription = self.create_subscription(
+            Bool, self.lidar_safety_stop_topic,
+            self._lidar_safety_stop_callback, 10)
+        self.mode_subscription = self.create_subscription(
+            String, self.mode_topic, self._mode_callback, 10)
         self.output_timer = self.create_timer(
             1.0 / self.output_frequency,
             self._publish_tick,
@@ -154,11 +241,27 @@ class CmdVelToLidarCmd(Node):
         self.get_logger().info(
             '[LIDAR_COMMAND] fixed output rate=%.1fHz, input timeout=%.2fs'
             % (self.output_frequency, self.input_timeout_sec))
+        self.get_logger().info(
+            '[LIDAR_COMMAND] mode source=%s' % self.mode_topic)
+        self.get_logger().info(
+            '[LIDAR_COMMAND] silent outside vehicle modes: %s'
+            % sorted(self.parking_modes))
+        self.get_logger().info(
+            '[LIDAR_SAFETY] %s -> /lidar_stop (all vehicle modes)'
+            % self.lidar_safety_stop_topic)
+        if self.bench_interlock_enabled and not self.bench_motion_allowed:
+            self.get_logger().warning(
+                'BENCH MOTION INHIBITED: bench_mode and wheels_off_ground '
+                'must both be true; converter output is locked to zero')
+        elif self.bench_interlock_enabled:
+            self.get_logger().info(
+                '[BENCH STARTUP] no fresh Twist means zero heartbeat; '
+                'motion still requires a later FollowPath command')
 
     def _cmd_vel_callback(self, msg: Twist) -> None:
         linear_x = float(msg.linear.x)
         angular_z = float(msg.angular.z)
-        self.current_command = convert_command(
+        converted = convert_command(
             linear_x=linear_x,
             angular_z=angular_z,
             wheel_base=self.wheel_base,
@@ -168,6 +271,16 @@ class CmdVelToLidarCmd(Node):
             forward_drive_stage=self.forward_drive_stage,
             reverse_drive_stage=self.reverse_drive_stage,
         )
+        if self.bench_interlock_enabled and not self.bench_motion_allowed:
+            self.current_command = ZERO_COMMAND
+            if abs(linear_x) >= self.stopped_speed_epsilon:
+                self.get_logger().error(
+                    'BENCH MOTION INHIBITED: bench_mode and '
+                    'wheels_off_ground must both be true',
+                    throttle_duration_sec=2.0,
+                )
+        else:
+            self.current_command = converted
 
         if not math.isfinite(linear_x) or not math.isfinite(angular_z):
             self.get_logger().warning(
@@ -178,31 +291,109 @@ class CmdVelToLidarCmd(Node):
         self.last_input_time = time.monotonic()
 
     def _emergency_stop_callback(self, msg: Bool) -> None:
+        previous = self._stop_active()
         self.emergency_stop = bool(msg.data)
+        self._record_stop_transition(previous)
+
+    def _lidar_safety_stop_callback(self, msg: Bool) -> None:
+        previous = self._stop_active()
+        self.lidar_safety_stop = bool(msg.data)
+        self._record_stop_transition(previous)
+
+    def _stop_active(self) -> bool:
+        return any_stop_active(self.emergency_stop, self.lidar_safety_stop)
+
+    def _record_stop_transition(self, previous: bool) -> None:
+        if previous and not self._stop_active():
+            # /lidar_stop is global in mcu_manager. Publish one explicit false
+            # to release this node's request even while drive/wheel are silent.
+            self.stop_release_pending = True
+
+    def _mode_callback(self, msg: String) -> None:
+        previous_mode = self.current_mode
+        previous_active = mode_allows_lidar_commands(
+            previous_mode, self.parking_modes)
+        new_mode = str(msg.data).strip().upper()
+        new_active = mode_allows_lidar_commands(new_mode, self.parking_modes)
+        self.current_mode = new_mode
+
+        if new_mode != previous_mode:
+            self.get_logger().info(
+                '[LIDAR_COMMAND] current mode received: %s'
+                % (new_mode or 'UNKNOWN'))
+
+        if previous_active and not new_active:
+            self.current_command = ZERO_COMMAND
+            self.last_input_time = None
+            self.mode_exit_zero_until = (
+                time.monotonic() + self.mode_exit_zero_duration_sec)
+            self.get_logger().info(
+                '[LIDAR_COMMAND] vehicle mode %s: brief zero then silent'
+                % (new_mode or 'UNKNOWN'))
+        elif not previous_active and new_active:
+            self.mode_exit_zero_until = None
+            if self.bench_interlock_enabled:
+                # BENCH startup must establish an explicit zero heartbeat
+                # before any later Nav2 command can be accepted.
+                self.current_command = ZERO_COMMAND
+                self.last_input_time = None
+                self.get_logger().info(
+                    '[BENCH STARTUP] zero heartbeat enabled for %s'
+                    % new_mode)
+            else:
+                self.get_logger().info(
+                    '[LIDAR_COMMAND] vehicle mode %s: command output enabled'
+                    % new_mode)
+
+    def _publish_stop(self, active: bool) -> None:
+        self.stop_publisher.publish(Bool(data=bool(active)))
 
     def _publish_tick(self) -> None:
-        command = self.current_command
+        now = time.monotonic()
+        stop_active = self._stop_active()
+        parking_active = mode_allows_lidar_commands(
+            self.current_mode, self.parking_modes)
+        exit_zero_active = (
+            self.mode_exit_zero_until is not None
+            and now <= self.mode_exit_zero_until)
+
+        if not parking_active and not exit_zero_active:
+            self.mode_exit_zero_until = None
+            # Preserve the MCU's global /lidar_stop safety semantics without
+            # keeping drive/wheel fresh in NORMAL.
+            if stop_active:
+                self._publish_stop(True)
+            elif self.stop_release_pending:
+                self._publish_stop(False)
+                self.stop_release_pending = False
+            return
+
         input_fresh = (
             self.last_input_time is not None
-            and time.monotonic() - self.last_input_time
-            <= self.input_timeout_sec)
-        if self.emergency_stop:
-            command = ConvertedCommand(0.0, 0, 0.0)
-        elif not input_fresh:
-            command = ConvertedCommand(0.0, 0, 0.0)
+            and now - self.last_input_time <= self.input_timeout_sec)
+        if parking_active:
+            command = select_output_command(
+                self.current_command,
+                self.last_input_time,
+                now,
+                self.input_timeout_sec,
+                stop_active,
+            )
+        else:
+            command = ZERO_COMMAND
 
         drive_msg = Float32()
         drive_msg.data = command.drive_stage
         wheel_msg = Int32()
         wheel_msg.data = command.wheel_deg
-        stop_msg = Bool()
-        stop_msg.data = self.emergency_stop
         # Publish steering first.  Both the Gazebo bridge and mcu_manager run
         # periodic output loops, so they observe the newly paired values on
         # their next tick rather than a new drive value with old steering.
         self.wheel_publisher.publish(wheel_msg)
         self.drive_publisher.publish(drive_msg)
-        self.stop_publisher.publish(stop_msg)
+        self._publish_stop(stop_active)
+        if not stop_active:
+            self.stop_release_pending = False
 
         self.get_logger().debug(
             '[CMD_SPLITTER] steering=%+.2fdeg drive_out=%+.1f '
@@ -211,7 +402,7 @@ class CmdVelToLidarCmd(Node):
                 command.steering_deg_ros,
                 command.drive_stage,
                 command.wheel_deg,
-                self.emergency_stop,
+                stop_active,
                 input_fresh,
             ))
 

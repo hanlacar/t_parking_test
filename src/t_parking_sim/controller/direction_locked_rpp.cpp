@@ -96,6 +96,9 @@ void DirectionLockedRPP::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name_ + ".reverse_soft_limit_override_deg",
     rclcpp::ParameterValue(0.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name_ + ".terminal_capture_distance",
+    rclcpp::ParameterValue(0.0));
   node->get_parameter(plugin_name_ + ".locked_direction", locked_direction_);
   node->get_parameter(plugin_name_ + ".segment_state_topic", segment_state_topic_);
   node->get_parameter(plugin_name_ + ".reverse_wheel_base", reverse_wheel_base_);
@@ -114,6 +117,9 @@ void DirectionLockedRPP::configure(
   node->get_parameter(
     plugin_name_ + ".reverse_soft_limit_override_deg",
     reverse_soft_limit_override_deg_);
+  node->get_parameter(
+    plugin_name_ + ".terminal_capture_distance",
+    terminal_capture_distance_);
   if (locked_direction_ != 1 && locked_direction_ != -1) {
     throw nav2_core::ControllerException(
             plugin_name_ + ".locked_direction must be +1 or -1");
@@ -123,7 +129,7 @@ void DirectionLockedRPP::configure(
     reverse_hard_steering_limit_deg_ > 27.0 || reverse_lateral_gain_ < 0.0 ||
     reverse_heading_gain_ < 0.0 ||
     reverse_lateral_correction_limit_deg_ < 0.0 ||
-    reverse_soft_limit_margin_deg_ < 0.0)
+    reverse_soft_limit_margin_deg_ < 0.0 || terminal_capture_distance_ < 0.0)
   {
     throw nav2_core::ControllerException(
             plugin_name_ + " has invalid reverse steering geometry parameters");
@@ -174,6 +180,11 @@ void DirectionLockedRPP::setPlan(const nav_msgs::msg::Path & path)
   segment_plan_ = path;
   resetTrackingState();
   median_spacing_ = medianPathSpacing();
+  cumulative_arc_length_.assign(segment_plan_.poses.size(), 0.0);
+  for (std::size_t index = 1; index < segment_plan_.poses.size(); ++index) {
+    cumulative_arc_length_[index] = cumulative_arc_length_[index - 1] +
+      euclideanDistance(segment_plan_.poses[index - 1], segment_plan_.poses[index]);
+  }
   progress_search_distance_ = std::max(
     params_->max_lookahead_dist, 3.0 * median_spacing_);
 
@@ -188,11 +199,12 @@ void DirectionLockedRPP::setPlan(const nav_msgs::msg::Path & path)
   RCLCPP_INFO(
     logger_,
     "[RPP-LOCK] setPlan controller=%s segment=%d direction=%s poses=%zu "
-    "full_range=%d..%d median_spacing=%.4f search_distance=%.4f",
+    "full_range=%d..%d median_spacing=%.4f search_distance=%.4f "
+    "terminal_capture_distance=%.4f",
     plugin_name_.c_str(), segment_number_.load(),
     locked_direction_ > 0 ? "FORWARD" : "REVERSE", segment_plan_.poses.size(),
     full_start_index_.load(), full_end_index_.load(), median_spacing_,
-    progress_search_distance_);
+    progress_search_distance_, terminal_capture_distance_);
   diagnoseSelfProximity();
   if (locked_direction_ < 0) {
     buildReverseSteeringProfile();
@@ -218,7 +230,9 @@ void DirectionLockedRPP::resetTrackingState()
   reverse_saturation_samples_ = 0;
   reverse_saturation_events_ = 0;
   reverse_saturation_active_ = false;
+  terminal_goal_reached_logged_ = false;
   last_track_log_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  last_terminal_log_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
 }
 
 void DirectionLockedRPP::logTrackingSummary(const char * context)
@@ -335,12 +349,6 @@ double DirectionLockedRPP::threePointCurvature(std::size_t index) const
 
 void DirectionLockedRPP::buildReverseSteeringProfile()
 {
-  cumulative_arc_length_.assign(segment_plan_.poses.size(), 0.0);
-  for (std::size_t index = 1; index < segment_plan_.poses.size(); ++index) {
-    cumulative_arc_length_[index] = cumulative_arc_length_[index - 1] +
-      euclideanDistance(segment_plan_.poses[index - 1], segment_plan_.poses[index]);
-  }
-
   std::vector<double> raw_curvature(segment_plan_.poses.size(), 0.0);
   for (std::size_t index = 0; index < segment_plan_.poses.size(); ++index) {
     // Path indices increase in the direction of travel.  During reverse,
@@ -674,7 +682,8 @@ DirectionLockedRPP::ProgressUpdate DirectionLockedRPP::updateProgress(
     if (candidate < last_progress_index_) {
       ++accepted_rollback_count_;
     } else {
-      last_progress_index_ = std::min(candidate, segment_plan_.poses.size() - 2);
+      last_progress_index_ = monotonicPathIndex(
+        last_progress_index_, candidate, segment_plan_.poses.size() - 2);
     }
   }
 
@@ -723,6 +732,20 @@ nav_msgs::msg::Path DirectionLockedRPP::transformActivePlan(
 geometry_msgs::msg::PoseStamped DirectionLockedRPP::getDirectionLockedLookAheadPoint(
   double lookahead_distance, const nav_msgs::msg::Path & transformed_plan) const
 {
+  geometry_msgs::msg::PoseStamped carrot;
+  if (findDirectionLockedLookAheadPoint(
+      lookahead_distance, transformed_plan, carrot))
+  {
+    return carrot;
+  }
+  throw nav2_core::NoValidControl(
+          "No active-segment carrot exists in the locked motion half-plane");
+}
+
+bool DirectionLockedRPP::findDirectionLockedLookAheadPoint(
+  double lookahead_distance, const nav_msgs::msg::Path & transformed_plan,
+  geometry_msgs::msg::PoseStamped & carrot) const
+{
   const geometry_msgs::msg::PoseStamped * best_directional_pose = nullptr;
   double best_directional_x = 0.0;
   const geometry_msgs::msg::PoseStamped * previous_pose = nullptr;
@@ -735,7 +758,7 @@ geometry_msgs::msg::PoseStamped DirectionLockedRPP::getDirectionLockedLookAheadP
       best_directional_pose = &candidate;
     }
     if (directional_x >= lookahead_distance) {
-      auto carrot = candidate;
+      carrot = candidate;
       if (previous_pose != nullptr && previous_directional_x < lookahead_distance &&
         directional_x > previous_directional_x)
       {
@@ -747,7 +770,7 @@ geometry_msgs::msg::PoseStamped DirectionLockedRPP::getDirectionLockedLookAheadP
         carrot.pose.position.y = previous_pose->pose.position.y + ratio *
           (candidate.pose.position.y - previous_pose->pose.position.y);
       }
-      return carrot;
+      return true;
     }
     previous_pose = &candidate;
     previous_directional_x = directional_x;
@@ -757,10 +780,10 @@ geometry_msgs::msg::PoseStamped DirectionLockedRPP::getDirectionLockedLookAheadP
   // configured lookahead. Use the pose furthest into the locked motion
   // half-plane, never a lateral pose from the opposite half-plane.
   if (best_directional_pose != nullptr) {
-    return *best_directional_pose;
+    carrot = *best_directional_pose;
+    return true;
   }
-  throw nav2_core::NoValidControl(
-          "No active-segment carrot exists in the locked motion half-plane");
+  return false;
 }
 
 void DirectionLockedRPP::diagnoseSelfProximity()
@@ -830,8 +853,15 @@ geometry_msgs::msg::TwistStamped DirectionLockedRPP::computeVelocityCommands(
 
   geometry_msgs::msg::Pose pose_tolerance;
   geometry_msgs::msg::Twist velocity_tolerance;
+  double xy_goal_tolerance = -1.0;
+  double yaw_goal_tolerance = -1.0;
   if (goal_checker->getTolerances(pose_tolerance, velocity_tolerance)) {
     goal_dist_tol_ = pose_tolerance.position.x;
+    xy_goal_tolerance = std::abs(pose_tolerance.position.x);
+    // GoalChecker encodes angular tolerance as a yaw-only quaternion.
+    // Decode its angle; orientation.z alone is sin(yaw_tolerance / 2).
+    yaw_goal_tolerance = yawToleranceFromQuaternion(
+      pose_tolerance.orientation.z, pose_tolerance.orientation.w);
   } else {
     RCLCPP_WARN(logger_, "Unable to retrieve goal checker tolerances");
   }
@@ -872,6 +902,7 @@ geometry_msgs::msg::TwistStamped DirectionLockedRPP::computeVelocityCommands(
   const double raw_directional_x = locked_direction_ * raw_carrot_pose.pose.position.x;
   const double unambiguous_x = 0.5 * median_spacing_;
   auto carrot_pose = raw_carrot_pose;
+  bool normal_carrot_available = false;
   double target_plan_x = std::numeric_limits<double>::quiet_NaN();
   double target_plan_y = std::numeric_limits<double>::quiet_NaN();
   if (locked_direction_ < 0) {
@@ -884,8 +915,112 @@ geometry_msgs::msg::TwistStamped DirectionLockedRPP::computeVelocityCommands(
     {
       throw nav2_core::ControllerTFError("Unable to transform reverse arc target");
     }
+    normal_carrot_available = isInLockedMotionHalfPlane(
+      locked_direction_, carrot_pose.pose.position.x);
   } else if (raw_directional_x < unambiguous_x) {
-    carrot_pose = getDirectionLockedLookAheadPoint(lookahead_distance, transformed_plan);
+    normal_carrot_available = findDirectionLockedLookAheadPoint(
+      lookahead_distance, transformed_plan, carrot_pose);
+  } else {
+    normal_carrot_available = true;
+  }
+
+  geometry_msgs::msg::PoseStamped endpoint_plan = segment_plan_.poses.back();
+  endpoint_plan.header.frame_id = segment_plan_.header.frame_id;
+  endpoint_plan.header.stamp = pose.header.stamp;
+  geometry_msgs::msg::PoseStamped endpoint_base;
+  if (!path_handler_->transformPose(
+      costmap_ros_->getBaseFrameID(), endpoint_plan, endpoint_base))
+  {
+    throw nav2_core::ControllerTFError("Unable to transform active segment endpoint");
+  }
+  endpoint_base.pose.position.z = 0.0;
+
+  const std::size_t last_index = segment_plan_.poses.size() - 1;
+  const std::size_t remaining_poses = last_index - std::min(
+    progress.local_index, last_index);
+  const double progress_arc_length = locked_direction_ < 0 ?
+    reverse_projection.arc_length : cumulative_arc_length_[progress.local_index];
+  const double remaining_arc_length = std::max(
+    0.0, cumulative_arc_length_.back() - progress_arc_length);
+  const double endpoint_distance = std::hypot(
+    endpoint_base.pose.position.x, endpoint_base.pose.position.y);
+  const double position_error = euclideanDistance(robot_plan_pose, endpoint_plan);
+  const double goal_yaw = tf2::getYaw(endpoint_plan.pose.orientation);
+  const double actual_yaw = tf2::getYaw(robot_plan_pose.pose.orientation);
+  const double yaw_error = normalizeAngle(actual_yaw - goal_yaw);
+  const TerminalCaptureMode terminal_mode = selectTerminalCaptureMode(
+    remaining_arc_length, terminal_capture_distance_, locked_direction_,
+    endpoint_base.pose.position.x, position_error, yaw_error,
+    xy_goal_tolerance, yaw_goal_tolerance);
+  const bool terminal_carrot_used =
+    terminal_mode == TerminalCaptureMode::kCaptureEndpoint;
+  if (terminal_carrot_used) {
+    carrot_pose = endpoint_base;
+  }
+
+  auto terminal_node = node_.lock();
+  if (terminal_node && terminal_capture_distance_ > 0.0 && remaining_poses <= 5) {
+    const rclcpp::Time now = terminal_node->now();
+    if (last_terminal_log_.nanoseconds() == 0 ||
+      (now - last_terminal_log_).seconds() >= 0.5)
+    {
+      last_terminal_log_ = now;
+      RCLCPP_INFO(
+        logger_,
+        "[T-PARK][TERMINAL TRACK] segment=%d direction=%s local_index=%zu "
+        "last_index=%zu remaining_poses=%zu remaining_arc_length=%.4f "
+        "goal=(%.4f,%.4f,%.4f) actual=(%.4f,%.4f,%.4f) "
+        "endpoint_base_x=%+.4f endpoint_base_y=%+.4f endpoint_distance=%.4f "
+        "position_error=%.4f yaw_error=%+.4f xy_tolerance=%.4f yaw_tolerance=%.4f "
+        "normal_carrot_available=%s terminal_carrot_used=%s terminal_mode=%s",
+        segment_number_.load(), locked_direction_ > 0 ? "FORWARD" : "REVERSE",
+        progress.local_index, last_index, remaining_poses, remaining_arc_length,
+        endpoint_plan.pose.position.x, endpoint_plan.pose.position.y, goal_yaw,
+        robot_plan_pose.pose.position.x, robot_plan_pose.pose.position.y, actual_yaw,
+        endpoint_base.pose.position.x, endpoint_base.pose.position.y, endpoint_distance,
+        position_error, yaw_error, xy_goal_tolerance, yaw_goal_tolerance,
+        normal_carrot_available ? "true" : "false",
+        terminal_carrot_used ? "true" : "false",
+        terminalCaptureModeName(terminal_mode));
+    }
+  }
+
+  if (terminal_mode == TerminalCaptureMode::kGoalToleranceZero) {
+    if (terminal_node && !terminal_goal_reached_logged_) {
+      terminal_goal_reached_logged_ = true;
+      RCLCPP_INFO(
+        logger_,
+        "[T-PARK][TERMINAL GOAL REACHED] segment=%d direction=%s "
+        "position_error=%.4f yaw_error=%+.4f xy_tolerance=%.4f "
+        "yaw_tolerance=%.4f",
+        segment_number_.load(), locked_direction_ > 0 ? "FORWARD" : "REVERSE",
+        position_error, yaw_error, xy_goal_tolerance, yaw_goal_tolerance);
+    }
+    is_rotating_to_heading_ = false;
+    carrot_pub_->publish(createCarrotMsg(endpoint_base));
+    std_msgs::msg::Bool rotating_message;
+    rotating_message.data = false;
+    is_rotating_to_heading_pub_->publish(rotating_message);
+    geometry_msgs::msg::TwistStamped zero_command;
+    zero_command.header = pose.header;
+    return zero_command;
+  }
+  if (terminal_mode == TerminalCaptureMode::kOvershootAbort) {
+    if (terminal_node) {
+      RCLCPP_ERROR_THROTTLE(
+        logger_, *terminal_node->get_clock(), 1000,
+        "[T-PARK][TERMINAL] CUSP_ENDPOINT_OVERSHOOT segment=%d direction=%s "
+        "remaining_arc_length=%.4f endpoint_base=(%+.4f,%+.4f) "
+        "position_error=%.4f yaw_error=%+.4f",
+        segment_number_.load(), locked_direction_ > 0 ? "FORWARD" : "REVERSE",
+        remaining_arc_length, endpoint_base.pose.position.x,
+        endpoint_base.pose.position.y, position_error, yaw_error);
+    }
+    throw nav2_core::NoValidControl("CUSP_ENDPOINT_OVERSHOOT");
+  }
+  if (!normal_carrot_available) {
+    throw nav2_core::NoValidControl(
+            "No active-segment carrot exists in the locked motion half-plane");
   }
   auto rotation_carrot = carrot_pose;
   carrot_pub_->publish(createCarrotMsg(carrot_pose));
@@ -944,7 +1079,7 @@ geometry_msgs::msg::TwistStamped DirectionLockedRPP::computeVelocityCommands(
       }
     }
     reverse_saturation_active_ = saturated;
-  } else if (params_->use_fixed_curvature_lookahead) {
+  } else if (params_->use_fixed_curvature_lookahead && !terminal_carrot_used) {
     const auto raw_curvature_carrot = getLookAheadPoint(
       params_->curvature_lookahead_dist, transformed_plan,
       params_->interpolate_curvature_after_goal);

@@ -44,6 +44,7 @@ def generate_launch_description():
     initial_y = LaunchConfiguration('initial_pose_y')
     initial_yaw = LaunchConfiguration('initial_pose_yaw')
     start_rviz = LaunchConfiguration('start_rviz')
+    auto_start = LaunchConfiguration('auto_start')
 
     base_params = PathJoinSubstitution(
         [package_share, 'config', 'nav2_params.yaml'])
@@ -112,6 +113,11 @@ def generate_launch_description():
                 LaunchConfiguration('update_rate_hz'), value_type=float),
             'cusp_pause_sec': ParameterValue(
                 LaunchConfiguration('cusp_pause_sec'), value_type=float),
+            # RETURN_POSE heading is deliberately independent from
+            # initial_pose_yaw (pi).
+            'return_pose_yaw': 0.0,
+            'return_position_tolerance': 0.05,
+            'return_yaw_tolerance': 0.05,
         }])
 
     planner = Node(
@@ -124,7 +130,7 @@ def generate_launch_description():
             {
                 'use_sim_time': False,
                 'rviz_only': True,
-                'auto_start': False,
+                'auto_start': ParameterValue(auto_start, value_type=bool),
                 'execute': False,
                 'target_slot': target_slot,
             },
@@ -153,6 +159,9 @@ def generate_launch_description():
         DeclareLaunchArgument('update_rate_hz', default_value='20.0'),
         DeclareLaunchArgument('cusp_pause_sec', default_value='0.5'),
         DeclareLaunchArgument('start_rviz', default_value='true'),
+        DeclareLaunchArgument(
+            'auto_start', default_value='false',
+            description='Automatically start this execute=false RViz dry-run.'),
         OpaqueFunction(function=_validate_map),
         map_to_odom,
         state_publisher,
