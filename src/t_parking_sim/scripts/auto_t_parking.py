@@ -4390,7 +4390,9 @@ class AutoTParking(Node):
                 self.last_bench_preflight_failure_reason)
             self._emergency_stop()
             return False
-        if direction < 0:
+        require_physical_rear_lidar = not (
+            self.bench_mode and self.wheels_off_ground)
+        if direction < 0 and require_physical_rear_lidar:
             healthy, rear_distance, reason = self._rear_scan_state()
             if not healthy:
                 self._log_pre_segment_failure(
@@ -4402,6 +4404,11 @@ class AutoTParking(Node):
                 f'rear safety armed: nearest={rear_distance:.3f}m '
                 'threshold='
                 f'{float(self.get_parameter("rear_emergency_stop_distance").value):.3f}m')
+        elif direction < 0:
+            self._log_info(
+                '[BENCH SAFETY]\n'
+                'physical rear LiDAR availability check skipped:\n'
+                'bench_mode=true wheels_off_ground=true')
         if self._abort_requested():
             self._log_pre_segment_failure(
                 run_number - 1, direction, forward_exit,
@@ -4487,7 +4494,7 @@ class AutoTParking(Node):
                     goal_handle.cancel_goal_async()
                 self._emergency_stop(emergency=True)
                 return False
-            if direction < 0:
+            if direction < 0 and require_physical_rear_lidar:
                 healthy, rear_distance, reason = self._rear_scan_state()
                 threshold = float(self.get_parameter(
                     'rear_emergency_stop_distance').value)

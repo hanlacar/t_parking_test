@@ -52,6 +52,77 @@ def _load_auto_parking():
     return module
 
 
+def _run_mocked_reverse_action(
+        bench_mode, wheels_off_ground, rear_state):
+    module = _load_auto_parking()
+    logs = []
+    rear_calls = []
+    sent_goals = []
+
+    class CompletedFuture:
+        def done(self):
+            return True
+
+        def result(self):
+            result = SimpleNamespace(error_code=0, error_msg='')
+            return SimpleNamespace(
+                status=module.GoalStatus.STATUS_SUCCEEDED,
+                result=result,
+            )
+
+    class AcceptedGoal:
+        accepted = True
+
+        def get_result_async(self):
+            return CompletedFuture()
+
+    class FollowClient:
+        def send_goal_async(self, goal, feedback_callback):
+            sent_goals.append(goal)
+            assert goal.controller_id == 'ParkingReverse'
+            assert feedback_callback is not None
+            return AcceptedGoal()
+
+    def rear_scan_state():
+        rear_calls.append(rear_state)
+        return rear_state
+
+    node = object.__new__(module.AutoTParking)
+    node.bench_mode = bench_mode
+    node.wheels_off_ground = wheels_off_ground
+    node.data_lock = threading.Lock()
+    node.active_direction_segment = SimpleNamespace(
+        first_pose=87, last_pose=166)
+    node.active_segment_number = 1
+    node.active_follow_goal = None
+    node.last_execution_failure_reason = ''
+    node.last_bench_preflight_failure_reason = ''
+    node.segment_state_publisher = object()
+    node.follow_client = FollowClient()
+    node._bench_motion_preflight = lambda require_fresh_status: True
+    node._rear_scan_state = rear_scan_state
+    node._abort_requested = lambda: False
+    node._runtime_ok = lambda: True
+    node._safe_publish = lambda publisher, message: True
+    node._log_info = logs.append
+    node._log_error = logs.append
+    node._wait_future = lambda future, timeout: future
+    node._follow_feedback = lambda feedback: None
+    node._emergency_stop = lambda **kwargs: None
+    node.get_parameter = lambda name: SimpleNamespace(value={
+        'reverse_controller_id': 'ParkingReverse',
+        'goal_checker_id': 'parking_goal_checker',
+        'progress_checker_id': 'progress_checker',
+        'rear_emergency_stop_distance': 0.15,
+        'follow_path_timeout': 5.0,
+    }[name])
+
+    succeeded = node._execute_path_action(
+        module.Path(), run_number=2, run_count=2, direction=-1,
+        monitor_slot=None, forward_exit=False)
+    return succeeded, '\n'.join(logs), rear_calls, sent_goals
+
+
 def test_anchor_maps_arbitrary_odom_pose_to_canonical_start():
     odom_start = Pose2D(2.4, -1.7, 0.63)
     desired = Pose2D(9.70, 0.0, math.pi)
@@ -385,7 +456,7 @@ def test_virtual_terminal_handoff_forward_cusp_reverse_final_zero():
 
     final_step = integrate_bicycle(pose, 0.0, 0.0, 0.1)
     assert final_step.pose == pose
-    events.append('FINAL_ZERO')
+    events.append('PARKING_STOP')
     parked = assess_parking_pose(
         base_x=5.10,
         base_y=-4.995,
@@ -401,7 +472,10 @@ def test_virtual_terminal_handoff_forward_cusp_reverse_final_zero():
     )
     assert parked.footprint_inside
     assert math.isclose(parked.end_clearance, 3.06, abs_tol=1.0e-12)
-    events.extend(['PARKED_FOOTPRINT_PASS', 'PARKED', 'EXIT_LOGIC_START'])
+    events.extend([
+        'PARKED_FOOTPRINT_PASS', 'PARKED', 'EXIT_STOP', 'EXIT_PLAN',
+        'FORWARD_EXIT', 'EXIT_COMPLETE', 'FINAL_ZERO',
+    ])
     assert events == [
         'FORWARD_SUCCEEDED',
         'CUSP_HANDOFF_WAIT_ZERO',
@@ -410,8 +484,9 @@ def test_virtual_terminal_handoff_forward_cusp_reverse_final_zero():
         'SEGMENT_START_REVERSE',
         'ParkingReverse_GOAL_SENT',
         'ParkingReverse_ACCEPTED',
-        'REVERSE_VIRTUAL_MOTION', 'REVERSE_SUCCEEDED', 'FINAL_ZERO',
-        'PARKED_FOOTPRINT_PASS', 'PARKED', 'EXIT_LOGIC_START',
+        'REVERSE_VIRTUAL_MOTION', 'REVERSE_SUCCEEDED', 'PARKING_STOP',
+        'PARKED_FOOTPRINT_PASS', 'PARKED', 'EXIT_STOP', 'EXIT_PLAN',
+        'FORWARD_EXIT', 'EXIT_COMPLETE', 'FINAL_ZERO',
     ]
 
 
@@ -609,8 +684,12 @@ def test_segment_handoff_keeps_three_zero_samples_and_direction_ids():
     parked_status = workflow.index("_publish_status('PARKED')")
     exit_stop = workflow.index("_confirm_command_zero('EXIT STOP')")
     exit_plan = workflow.index("'[T-PARK][EXIT PLAN] start=validated PARKED pose '")
+    exit_complete = workflow.index('[T-PARK][EXIT COMPLETE]')
+    final_zero = workflow.index(
+        "_confirm_command_zero('FINAL ZERO')", exit_complete)
     assert reverse_execution < parked_validation < parked_status
     assert parked_status < exit_stop < exit_plan
+    assert exit_plan < exit_complete < final_zero
 
     exit_executor = source.split(
         'def _execute_forward_exit', 1)[1].split(
@@ -645,71 +724,51 @@ def test_reverse_regression_does_not_reapply_startup_status_freshness():
 
 
 def test_mocked_reverse_action_is_sent_accepted_and_succeeds():
-    module = _load_auto_parking()
-    logs = []
-
-    class CompletedFuture:
-        def done(self):
-            return True
-
-        def result(self):
-            result = SimpleNamespace(error_code=0, error_msg='')
-            return SimpleNamespace(
-                status=module.GoalStatus.STATUS_SUCCEEDED,
-                result=result,
-            )
-
-    class AcceptedGoal:
-        accepted = True
-
-        def get_result_async(self):
-            return CompletedFuture()
-
-    class FollowClient:
-        def send_goal_async(self, goal, feedback_callback):
-            assert goal.controller_id == 'ParkingReverse'
-            assert feedback_callback is not None
-            return AcceptedGoal()
-
-    node = object.__new__(module.AutoTParking)
-    node.bench_mode = False
-    node.data_lock = threading.Lock()
-    node.active_direction_segment = SimpleNamespace(
-        first_pose=87, last_pose=166)
-    node.active_segment_number = 1
-    node.active_follow_goal = None
-    node.segment_state_publisher = object()
-    node.follow_client = FollowClient()
-    node._rear_scan_state = lambda: (True, 10.0, 'valid')
-    node._abort_requested = lambda: False
-    node._runtime_ok = lambda: True
-    node._safe_publish = lambda publisher, message: True
-    node._log_info = logs.append
-    node._log_error = logs.append
-    node._wait_future = lambda future, timeout: future
-    node._follow_feedback = lambda feedback: None
-    node.get_parameter = lambda name: SimpleNamespace(value={
-        'reverse_controller_id': 'ParkingReverse',
-        'goal_checker_id': 'parking_goal_checker',
-        'progress_checker_id': 'progress_checker',
-        'rear_emergency_stop_distance': 0.15,
-        'follow_path_timeout': 5.0,
-    }[name])
-
-    path = module.Path()
-    succeeded = node._execute_path_action(
-        path, run_number=2, run_count=2, direction=-1,
-        monitor_slot=None, forward_exit=False)
-
-    output = '\n'.join(logs)
+    succeeded, output, rear_calls, sent_goals = _run_mocked_reverse_action(
+        False, False, (True, 10.0, 'valid'))
     print(output)
     assert succeeded is True
+    assert len(rear_calls) == 1
+    assert len(sent_goals) == 1
     assert '[T-PARK][SEGMENT START]' in output
     assert 'phase=PARKING segment=1 direction=REVERSE' in output
     assert 'sending FollowPath goal 2/2: controller_id=ParkingReverse' in output
     assert 'FollowPath goal accepted: controller_id=ParkingReverse' in output
     assert ('[T-PARK][SEGMENT RESULT] segment=1 direction=REVERSE '
             'result=SUCCEEDED') in output
+
+
+def test_bench_reverse_skips_missing_or_stale_physical_rear_scan():
+    for rear_state in (
+            (False, float('inf'), 'has no message'),
+            (False, float('inf'), 'is stale (age=10.00s)')):
+        succeeded, output, rear_calls, sent_goals = (
+            _run_mocked_reverse_action(True, True, rear_state))
+        print(output)
+        assert succeeded is True
+        assert rear_calls == []
+        assert len(sent_goals) == 1
+        assert '[BENCH SAFETY]' in output
+        assert ('physical rear LiDAR availability check skipped:'
+                in output)
+        assert 'bench_mode=true wheels_off_ground=true' in output
+        assert '[T-PARK][SEGMENT START]' in output
+        assert 'controller_id=ParkingReverse' in output
+        assert '[T-PARK] FollowPath goal accepted:' in output
+
+
+def test_production_reverse_blocks_missing_or_stale_physical_rear_scan():
+    for rear_state in (
+            (False, float('inf'), 'has no message'),
+            (False, float('inf'), 'is stale (age=10.00s)')):
+        succeeded, output, rear_calls, sent_goals = (
+            _run_mocked_reverse_action(False, False, rear_state))
+        assert succeeded is False
+        assert len(rear_calls) == 1
+        assert sent_goals == []
+        assert '[BENCH SAFETY]' not in output
+        assert '[T-PARK][PRE-SEGMENT FAILURE]' in output
+        assert 'rear_lidar_sector_' in output
 
 
 def test_latched_safe_mcu_state_remains_valid_between_segments():
@@ -744,6 +803,27 @@ def test_latched_safe_mcu_state_remains_valid_between_segments():
     assert 'connected_status_fresh' in (
         node.last_bench_preflight_failure_reason)
     assert node._bench_motion_preflight(require_fresh_status=False) is True
+
+    node.estop_lock = True
+    assert node._bench_motion_preflight(require_fresh_status=False) is False
+    assert 'estop_unlocked' in node.last_bench_preflight_failure_reason
+    node.estop_lock = False
+
+    node.mcu_safety_state = 'ESTOP'
+    assert node._bench_motion_preflight(require_fresh_status=False) is False
+    assert 'mcu_safety_state_OK' in node.last_bench_preflight_failure_reason
+    node.mcu_safety_state = 'OK'
+
+    node.bench_consecutive_zero_wheel_samples = 2
+    assert node._bench_motion_preflight(require_fresh_status=False) is False
+    assert ('lidar_wheel_zero_continuous' in
+            node.last_bench_preflight_failure_reason)
+    node.bench_consecutive_zero_wheel_samples = 3
+
+    node.get_publishers_info_by_topic = lambda topic: [object(), object()]
+    assert node._bench_motion_preflight(require_fresh_status=False) is False
+    assert ('lidar_drive_single_publisher' in
+            node.last_bench_preflight_failure_reason)
 
 
 def test_bench_frames_and_topic_do_not_duplicate_production_names():
