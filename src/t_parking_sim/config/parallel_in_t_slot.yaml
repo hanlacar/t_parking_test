@@ -1,0 +1,109 @@
+parallel_in_t_slot:
+  ros__parameters:
+    use_sim_time: true
+    target_slot: "auto"
+    auto_start: false
+    execute: false
+    exit_mode: "parked"
+    freeze_slam_during_execution: false
+
+    # Existing expanded T bay from t_parking_exam_real_vehicle.sdf, converted
+    # to the full_course odom/map origin at world (-5, 0, 0).  Bounds use the
+    # physical curb inner faces and leave 0.08 m around the visual divider.
+    # The map and world are intentionally not changed for this experiment.
+    slot_1:
+      odom_x: 5.595
+      odom_y: 4.875
+      yaw: 0.0
+      min_x: 4.73
+      max_x: 6.46
+      min_y: 2.16
+      max_y: 7.59
+    slot_2:
+      odom_x: 7.405
+      odom_y: 4.875
+      yaw: 3.14159265359
+      min_x: 6.54
+      max_x: 8.27
+      min_y: 2.16
+      max_y: 7.59
+
+    # Final-pose candidates are offsets from the selected half-slot centre.
+    # Yaw stays exactly parallel to the road; slot_2 uses the equally valid
+    # opposite parallel heading so its swept path enters through the mouth.
+    goal_longitudinal_offsets: [0.0, -0.05, 0.05, -0.10, 0.10]
+    goal_depth_offsets: [0.0, -0.05, 0.05, -0.10, 0.10]
+    safety_margin: 0.03
+
+    vehicle_length: 1.33
+    vehicle_width: 0.78
+    body_center_x: 0.020
+    wheel_base: 0.77
+    wheel_track: 0.67
+    steering_limit_deg: 27.0
+    # 0.77 / tan(27 deg) = 1.511 m. Both planning radii remain above it.
+    minimum_turning_radius: 1.52
+    entry_turning_radius: 1.70
+    curvature_tolerance_factor: 1.00
+    footprint_clearance: 0.03
+    occupied_threshold: 50
+
+    # The road is the unchanged main lane in front of the T-bay mouth.
+    road_min_y: -2.10
+    road_max_y: 2.10
+    road_center_y: 0.0
+    lane_offset_candidates: [0.80, 0.70]
+    # R=1.70 m needs 3.398 m for the 3.515 m lateral move to slot centre.
+    approach_offset_candidates: [3.50, 3.65, 3.80]
+    entry_pose_spacing: 0.05
+    entry_loop_length_factor: 2.2
+    minimum_reverse_length: 0.30
+    maximum_cusps: 2
+
+    # Start is the original full_course pose. Slot 2 is reached by continuing
+    # east and asking the existing Reeds-Shepp planner for a stopped, segmented
+    # turnaround before its westbound staging pose.
+    staging_hop_distance: 3.0
+    east_turnaround_x: 10.50
+    staging_turnaround_cusps: 3
+    transit_planner_id: "GridBased"
+    transit_controller_id: "ParkingFollowPath"
+    transit_goal_checker_id: "goal_checker"
+
+    entry_lead_in_forward_max: 0.30
+    replan_extra_cusps: 2
+    cusp_arrival_tolerance: 0.35
+    cusp_yaw_tolerance: 0.30
+    cusp_stall_timeout: 4.0
+    wheel_inside_margin: 0.01
+    parked_yaw_tolerance: 0.20
+    wheel_inside_confirm_count: 5
+    wheel_check_period: 0.10
+    wheel_radius: 0.14
+    wheel_width: 0.11
+    wheel_frames:
+      - "front_left_wheel_link"
+      - "front_right_wheel_link"
+      - "rear_left_wheel_link"
+      - "rear_right_wheel_link"
+
+    system_wait_timeout: 120.0
+    map_wait_timeout: 120.0
+    layout_wait_timeout: 20.0
+    scan_timeout: 2.0
+    rear_emergency_stop_distance: 0.15
+    rear_emergency_sector_deg: 30.0
+    map_observation_settle_time: 3.0
+    action_timeout: 45.0
+    follow_path_timeout: 180.0
+    parking_cancel_timeout: 5.0
+    parking_stop_grace_timeout: 2.0
+    stop_wait_timeout: 120.0
+    stop_confirm_count: 3
+
+    planner_id: "GridBased"
+    controller_id: "ParkingFollowPath"
+    forward_controller_id: "ParkingForward"
+    reverse_controller_id: "ParkingReverse"
+    goal_checker_id: "parking_goal_checker"
+    progress_checker_id: "progress_checker"

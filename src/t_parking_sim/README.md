@@ -76,6 +76,29 @@ source ~/t_parking_ws/install/setup.bash
 ros2 service call /parallel_parking/start std_srvs/srv/Trigger "{}"
 ```
 
+## 기존 T 슬롯 안에서 평행주차 테스트
+
+기존 world와 `combined_parking_map_real_vehicle.yaml`을 수정하지 않고,
+원래 `full_course` 시작점에서 T 베이 안에 도로와 평행한 자세로 진입합니다.
+기본값은 안전하게 경로만 생성하며 차량은 움직이지 않습니다.
+
+```bash
+ros2 launch t_parking_sim auto_parallel_in_t_slot.launch.py \
+  execute:=false auto_start:=true
+```
+
+RViz에서 T 슬롯 경계, 현재 pose, staging/transition/goal, 1.33 x 0.78 m
+최종 footprint, 전체/전진/후진 path, reject 후보 및 collision 결과를 확인한
+뒤 실제 실행을 허용합니다.
+
+```bash
+ros2 launch t_parking_sim auto_parallel_in_t_slot.launch.py \
+  execute:=true auto_start:=false
+ros2 service call /parallel_in_t_slot/start std_srvs/srv/Trigger "{}"
+```
+
+`/t_parking/start`와 기존 `auto_t_parking.launch.py`는 변경되지 않습니다.
+
 ## Environment
 
 * Ubuntu 24.04

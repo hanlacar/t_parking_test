@@ -79,6 +79,17 @@ source ~/t_parking_ws/install/setup.bash
 ros2 service call /parallel_parking/start std_srvs/srv/Trigger "{}"
 ```
 
+기존 T 슬롯 자체에 평행 방향으로 주차하는 별도 실험은 다음처럼 먼저
+motion 없이 검증할 수 있습니다.
+
+```bash
+ros2 launch t_parking_sim auto_parallel_in_t_slot.launch.py \
+  execute:=false auto_start:=true
+```
+
+검증 후 `execute:=true`로 실행하고 `/parallel_in_t_slot/start` 서비스를
+호출합니다. 기존 `/t_parking/start` 인터페이스는 그대로 유지됩니다.
+
 ## Environment
 
 * Ubuntu 24.04
