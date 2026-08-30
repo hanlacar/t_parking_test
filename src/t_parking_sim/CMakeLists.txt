@@ -92,6 +92,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     test_parallel_in_t_slot_geometry
     test/test_parallel_in_t_slot_geometry.py)
+  ament_add_pytest_test(
+    test_scan_topic_contract
+    test/test_scan_topic_contract.py)
 endif()
 
 ament_package()

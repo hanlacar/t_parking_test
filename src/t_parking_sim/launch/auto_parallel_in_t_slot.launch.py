@@ -49,6 +49,11 @@ def generate_launch_description():
     initial_pose_y = LaunchConfiguration('initial_pose_y')
     initial_pose_yaw = LaunchConfiguration('initial_pose_yaw')
     enable_gazebo_bridge = LaunchConfiguration('enable_gazebo_bridge')
+    front_scan_topic = LaunchConfiguration('front_scan_topic')
+    rear_scan_topic = LaunchConfiguration('rear_scan_topic')
+    spawn_parking_obstacles = LaunchConfiguration(
+        'spawn_parking_obstacles')
+    parking_obstacle_seed = LaunchConfiguration('parking_obstacle_seed')
 
     default_map = PathJoinSubstitution([
         package_share, 'maps', 'combined_parking_map_real_vehicle.yaml'])
@@ -64,11 +69,14 @@ def generate_launch_description():
             'start_rviz': 'false',
             'practice_mode': 'full_course',
             'map': map_yaml,
-            'spawn_parking_obstacles': 'true',
+            'spawn_parking_obstacles': spawn_parking_obstacles,
             'initial_pose_x': initial_pose_x,
             'initial_pose_y': initial_pose_y,
             'initial_pose_yaw': initial_pose_yaw,
             'cmd_vel_output_topic': '/parallel_in_t_slot/cmd_vel_control',
+            'front_scan_topic': front_scan_topic,
+            'rear_scan_topic': rear_scan_topic,
+            'parking_obstacle_seed': parking_obstacle_seed,
         }.items())
 
     parking = Node(
@@ -101,6 +109,8 @@ def generate_launch_description():
             ('/t_parking/active_segment',
              '/parallel_in_t_slot/active_segment'),
             ('/cmd_vel', '/parallel_in_t_slot/cmd_vel_control'),
+            ('/scan', front_scan_topic),
+            ('/scan_rear', rear_scan_topic),
         ])
 
     cmd_bridge = Node(
@@ -160,6 +170,18 @@ def generate_launch_description():
         DeclareLaunchArgument('start_rviz', default_value='true'),
         DeclareLaunchArgument(
             'enable_gazebo_bridge', default_value='true'),
+        DeclareLaunchArgument(
+            'front_scan_topic', default_value='/scan',
+            description='Gazebo front LaserScan topic.'),
+        DeclareLaunchArgument(
+            'rear_scan_topic', default_value='/scan_rear',
+            description='Gazebo rear LaserScan topic.'),
+        DeclareLaunchArgument(
+            'spawn_parking_obstacles', default_value='true',
+            description='Keep the normal random-obstacle behavior by default.'),
+        DeclareLaunchArgument(
+            'parking_obstacle_seed', default_value='-1',
+            description='Nonnegative values reproduce obstacle layouts.'),
         DeclareLaunchArgument('map', default_value=default_map),
         # The existing saved map was made from this original full-course pose.
         DeclareLaunchArgument('initial_pose_x', default_value='0.0'),

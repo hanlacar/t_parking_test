@@ -338,6 +338,9 @@ class ParallelInTSlot(AutoParallelParking):
                             f'length={metrics.total_length:.3f}m')
                 if not accepted_this_goal and goal_for_rejection is not None:
                     self.rejected_goals.append((goal_for_rejection, last_reason))
+                    self._log_warn(
+                        f'[GOAL REJECT] offset=({longitudinal:+.2f},'
+                        f'{depth:+.2f}) reason={last_reason}')
 
         if not candidates:
             self._log_error(

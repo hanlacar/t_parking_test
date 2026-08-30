@@ -1,11 +1,16 @@
 """Launch Gazebo, online SLAM, Nav2 navigation, and one Nav2 RViz."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+    TimerAction,
+)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -22,6 +27,8 @@ def generate_launch_description():
     spawn_parking_obstacles = LaunchConfiguration(
         'spawn_parking_obstacles')
     cmd_vel_output_topic = LaunchConfiguration('cmd_vel_output_topic')
+    front_scan_topic = LaunchConfiguration('front_scan_topic')
+    rear_scan_topic = LaunchConfiguration('rear_scan_topic')
 
     package_share = FindPackageShare('t_parking_sim')
     default_world = PathJoinSubstitution(
@@ -57,19 +64,22 @@ def generate_launch_description():
     # nav2_bringup/navigation_launch.py would start eleven lifecycle nodes;
     # this package uses planner_server, controller_server and
     # velocity_smoother only.  See nav2_minimal.launch.py for the rationale.
-    navigation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution(
-                [package_share, 'launch', 'nav2_minimal.launch.py']
-            )
-        ),
-        launch_arguments={
-            'use_sim_time': use_sim_time,
-            'params_file': nav2_params,
-            'log_level': 'info',
-            'cmd_vel_output_topic': cmd_vel_output_topic,
-        }.items(),
-    )
+    navigation = GroupAction([
+        SetRemap(src='/scan_front', dst=front_scan_topic),
+        SetRemap(src='/scan_rear', dst=rear_scan_topic),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution(
+                    [package_share, 'launch', 'nav2_minimal.launch.py']
+                )
+            ),
+            launch_arguments={
+                'use_sim_time': use_sim_time,
+                'params_file': nav2_params,
+                'log_level': 'info',
+                'cmd_vel_output_topic': cmd_vel_output_topic,
+            }.items()),
+    ])
 
     nav2_rviz = Node(
         package='rviz2',
@@ -102,6 +112,10 @@ def generate_launch_description():
                 description='Keep obstacles in online navigation sessions.'),
             DeclareLaunchArgument(
                 'cmd_vel_output_topic', default_value='/cmd_vel'),
+            DeclareLaunchArgument(
+                'front_scan_topic', default_value='/scan'),
+            DeclareLaunchArgument(
+                'rear_scan_topic', default_value='/scan_rear'),
             mapping,
             # Let Gazebo, the robot, and online SLAM begin publishing first.
             TimerAction(period=3.0, actions=[navigation]),

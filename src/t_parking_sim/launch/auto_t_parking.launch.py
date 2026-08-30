@@ -79,6 +79,8 @@ def generate_launch_description():
     initial_pose_y = LaunchConfiguration('initial_pose_y')
     initial_pose_yaw = LaunchConfiguration('initial_pose_yaw')
     enable_gazebo_bridge = LaunchConfiguration('enable_gazebo_bridge')
+    front_scan_topic = LaunchConfiguration('front_scan_topic')
+    rear_scan_topic = LaunchConfiguration('rear_scan_topic')
 
     default_map = PathJoinSubstitution([
         package_share, 'maps',
@@ -96,6 +98,8 @@ def generate_launch_description():
             'start_rviz': start_rviz,
             'practice_mode': practice_mode,
             'cmd_vel_output_topic': '/t_parking/cmd_vel_control',
+            'front_scan_topic': front_scan_topic,
+            'rear_scan_topic': rear_scan_topic,
         }.items(),
         condition=IfCondition(PythonExpression([
             "'", map_mode, "' == 'online'"])),
@@ -118,6 +122,8 @@ def generate_launch_description():
             'initial_pose_y': initial_pose_y,
             'initial_pose_yaw': initial_pose_yaw,
             'cmd_vel_output_topic': '/t_parking/cmd_vel_control',
+            'front_scan_topic': front_scan_topic,
+            'rear_scan_topic': rear_scan_topic,
         }.items(),
         condition=IfCondition(PythonExpression([
             "'", map_mode, "' == 'saved'"])),
@@ -155,6 +161,10 @@ def generate_launch_description():
                         "'", map_mode, "' == 'online'"]),
                     value_type=bool),
             },
+        ],
+        remappings=[
+            ('/scan_front', front_scan_topic),
+            ('/scan_rear', rear_scan_topic),
         ],
     )
 
@@ -218,6 +228,12 @@ def generate_launch_description():
             description=(
                 'Convert shared /lidar_drive and /lidar_wheel to Gazebo '
                 '/cmd_vel. Disable for a real-vehicle-only session.')),
+        DeclareLaunchArgument(
+            'front_scan_topic', default_value='/scan',
+            description='Gazebo front LaserScan topic.'),
+        DeclareLaunchArgument(
+            'rear_scan_topic', default_value='/scan_rear',
+            description='Gazebo rear LaserScan topic.'),
         DeclareLaunchArgument(
             'map_mode',
             default_value='saved',

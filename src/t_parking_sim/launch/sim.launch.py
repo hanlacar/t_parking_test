@@ -28,6 +28,7 @@ def generate_launch_description():
     practice_mode = LaunchConfiguration("practice_mode")
     spawn_parking_obstacles = LaunchConfiguration(
         "spawn_parking_obstacles")
+    parking_obstacle_seed = LaunchConfiguration('parking_obstacle_seed')
     mapping_lidar_override = LaunchConfiguration("mapping_lidar_override")
     mapping_lidar_z = LaunchConfiguration("mapping_lidar_z")
 
@@ -106,7 +107,8 @@ def generate_launch_description():
                 "spawn_parking_obstacles": ParameterValue(
                     spawn_parking_obstacles, value_type=bool),
                 "randomize_parking_obstacles": True,
-                "parking_obstacle_seed": -1,
+                'parking_obstacle_seed': ParameterValue(
+                    parking_obstacle_seed, value_type=int),
                 # Only consulted when practice_mode is "custom"; every other
                 # mode takes its start pose from the node's POSES table.
                 "x": spawn_x,
@@ -196,6 +198,13 @@ def generate_launch_description():
                     "Spawn parking-slot obstacles. Set false only for a "
                     "clean reference-map mapping run."
                 ),
+            ),
+            DeclareLaunchArgument(
+                'parking_obstacle_seed',
+                default_value='-1',
+                description=(
+                    'Negative selects system randomness; a nonnegative seed '
+                    'makes obstacle layouts reproducible.'),
             ),
             DeclareLaunchArgument(
                 "mapping_lidar_override",

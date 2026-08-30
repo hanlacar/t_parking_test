@@ -5,6 +5,7 @@ import os
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    GroupAction,
     IncludeLaunchDescription,
     OpaqueFunction,
     SetLaunchConfiguration,
@@ -16,7 +17,7 @@ from launch.substitutions import (
     LaunchConfiguration,
     PathJoinSubstitution,
 )
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
@@ -58,11 +59,14 @@ def generate_launch_description():
     practice_mode = LaunchConfiguration('practice_mode')
     spawn_parking_obstacles = LaunchConfiguration(
         'spawn_parking_obstacles')
+    parking_obstacle_seed = LaunchConfiguration('parking_obstacle_seed')
     map_yaml = LaunchConfiguration('map')
     initial_pose_x = LaunchConfiguration('initial_pose_x')
     initial_pose_y = LaunchConfiguration('initial_pose_y')
     initial_pose_yaw = LaunchConfiguration('initial_pose_yaw')
     cmd_vel_output_topic = LaunchConfiguration('cmd_vel_output_topic')
+    front_scan_topic = LaunchConfiguration('front_scan_topic')
+    rear_scan_topic = LaunchConfiguration('rear_scan_topic')
 
     package_share = FindPackageShare('t_parking_sim')
     default_world = PathJoinSubstitution(
@@ -86,18 +90,22 @@ def generate_launch_description():
             'world': world,
             'practice_mode': practice_mode,
             'spawn_parking_obstacles': spawn_parking_obstacles,
+            'parking_obstacle_seed': parking_obstacle_seed,
         }.items(),
     )
 
-    # /scan_static remains useful to the global costmap even though AMCL uses
-    # the full raw /scan directly.
+    # /scan_static remains available for diagnostics while localization and
+    # costmaps consume the configured front scan topic through launch remaps.
     scan_filter = Node(
         package='t_parking_sim',
         executable='scan_filter.py',
         name='scan_filter',
         output='screen',
-        parameters=[{'use_sim_time': ParameterValue(
-            use_sim_time, value_type=bool), 'odom_frame': 'odom'}],
+        parameters=[{
+            'use_sim_time': ParameterValue(use_sim_time, value_type=bool),
+            'odom_frame': 'odom',
+            'input_scan_topic': front_scan_topic,
+        }],
     )
 
     map_server = Node(
@@ -129,7 +137,11 @@ def generate_launch_description():
                     initial_pose_yaw, value_type=float),
             },
         ],
-        remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
+        remappings=[
+            ('/tf', 'tf'),
+            ('/tf_static', 'tf_static'),
+            ('/scan_front', front_scan_topic),
+        ],
     )
 
     localization_lifecycle = Node(
@@ -144,17 +156,24 @@ def generate_launch_description():
         }],
     )
 
-    navigation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution(
-                [package_share, 'launch', 'nav2_minimal.launch.py'])),
-        launch_arguments={
-            'use_sim_time': use_sim_time,
-            'params_file': nav2_params,
-            'log_level': 'info',
-            'cmd_vel_output_topic': cmd_vel_output_topic,
-        }.items(),
-    )
+    # nav2_params.yaml deliberately keeps /scan_front as the canonical real
+    # vehicle topic.  Gazebo publishes its front sensor on /scan, so alias the
+    # canonical names only inside this simulation include.  The hardware
+    # launches retain their independent front_scan_topic/remap contract.
+    navigation = GroupAction([
+        SetRemap(src='/scan_front', dst=front_scan_topic),
+        SetRemap(src='/scan_rear', dst=rear_scan_topic),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                PathJoinSubstitution(
+                    [package_share, 'launch', 'nav2_minimal.launch.py'])),
+            launch_arguments={
+                'use_sim_time': use_sim_time,
+                'params_file': nav2_params,
+                'log_level': 'info',
+                'cmd_vel_output_topic': cmd_vel_output_topic,
+            }.items()),
+    ])
 
     nav2_rviz = Node(
         package='rviz2',
@@ -177,6 +196,8 @@ def generate_launch_description():
             'practice_mode', default_value='full_course'),
         DeclareLaunchArgument(
             'spawn_parking_obstacles', default_value='true'),
+        DeclareLaunchArgument(
+            'parking_obstacle_seed', default_value='-1'),
         # The reference map was created with full_course world (-5, 0, 0) as
         # odom/map (0, 0, 0), so these are derived map coordinates.
         DeclareLaunchArgument('initial_pose_x', default_value='0.0'),
@@ -184,6 +205,12 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_pose_yaw', default_value='0.0'),
         DeclareLaunchArgument(
             'cmd_vel_output_topic', default_value='/cmd_vel'),
+        DeclareLaunchArgument(
+            'front_scan_topic', default_value='/scan',
+            description='Gazebo front LaserScan topic.'),
+        DeclareLaunchArgument(
+            'rear_scan_topic', default_value='/scan_rear',
+            description='Gazebo rear LaserScan topic.'),
         OpaqueFunction(function=_validate_saved_map),
         simulation,
         scan_filter,

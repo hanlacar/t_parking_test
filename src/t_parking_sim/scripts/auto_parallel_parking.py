@@ -1781,8 +1781,14 @@ class AutoParallelParking(Node):
                 if (map_value is None or map_value < 0
                         or cost_value is None or cost_value == 255):
                     return False, f'footprint index {index} reaches unknown'
-                if map_value >= occupied_threshold or cost_value == 254:
-                    return False, f'footprint index {index} overlaps obstacle'
+                if map_value >= occupied_threshold:
+                    return False, (
+                        f'footprint index {index} overlaps static-map '
+                        f'obstacle at ({x:.3f}, {y:.3f})')
+                if cost_value == 254:
+                    return False, (
+                        f'footprint index {index} overlaps global-costmap '
+                        f'obstacle at ({x:.3f}, {y:.3f})')
         return True, 'valid'
 
     def _approach_inside_lane(self, pose: PoseStamped) -> bool:
