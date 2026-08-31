@@ -131,6 +131,24 @@ def generate_launch_description():
             'input_timeout_sec': 0.50,
         }])
 
+    # The real vehicle gets its applied mode from the mission/MCU manager.
+    # Gazebo has no mode manager, so this launch owns the equivalent lifecycle:
+    # grant LiDAR commands only while this parking state machine is active and
+    # restore NORMAL on finish, failure, or cancellation.
+    mode_publisher = Node(
+        package='t_parking_sim',
+        executable='parking_mode_publisher.py',
+        name='parallel_in_t_slot_mode_publisher',
+        output='screen',
+        parameters=[{
+            'use_sim_time': ParameterValue(use_sim_time, value_type=bool),
+            'status_topic': '/parallel_in_t_slot/status',
+            'mode_topic': '/vehicle_mode',
+            'active_mode': 'PARALLEL_PARK',
+            'restore_mode': 'NORMAL',
+            'publish_hz': 2.0,
+        }])
+
     gazebo_bridge = Node(
         package='t_parking_sim',
         executable='lidar_to_gazebo_bridge.py',
@@ -189,6 +207,7 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_pose_yaw', default_value='0.0'),
         saved_navigation,
         parking,
+        mode_publisher,
         cmd_bridge,
         gazebo_bridge,
         rviz,

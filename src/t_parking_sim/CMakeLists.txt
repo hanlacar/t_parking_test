@@ -71,6 +71,7 @@ install(PROGRAMS
   scripts/lidar_to_gazebo_bridge.py
   scripts/lidar_visibility_check.py
   scripts/parallel_in_t_slot.py
+  scripts/parking_mode_publisher.py
   scripts/rviz_fake_vehicle.py
   scripts/scan_filter.py
   scripts/start_staging_diagnostics.py
@@ -89,6 +90,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_terminal_capture test/test_terminal_capture.cpp)
   target_include_directories(test_terminal_capture PRIVATE include)
   ament_add_pytest_test(test_bench_mode test/test_bench_mode.py)
+  ament_add_pytest_test(
+    test_parking_mode_publisher test/test_parking_mode_publisher.py)
   ament_add_pytest_test(
     test_parallel_in_t_slot_geometry
     test/test_parallel_in_t_slot_geometry.py)
