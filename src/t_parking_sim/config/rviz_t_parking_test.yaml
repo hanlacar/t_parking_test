@@ -5,9 +5,7 @@ t_parking_auto:
     auto_start: false
     execute: false
     return_to_entrance: false
-    rviz_return_yaw: 0.0
-    entrance_return_position_tolerance: 0.05
-    entrance_return_yaw_tolerance: 0.05
+    plan_exit: false
     target_slot: "auto"
 
     # Canonical opposite-side start derived from the saved map.  Around y=0
@@ -54,8 +52,8 @@ t_parking_auto:
     system_wait_timeout: 30.0
     map_wait_timeout: 30.0
 
-# The planner still uses the package's existing Reeds-Shepp settings and
-# 1.52 m minimum radius.  Only the unavailable live obstacle layer is off.
+# The real vehicle command limit is 22 deg with a 0.73 m wheelbase.
+# 0.73 / tan(22 deg) = 1.8068 m; planning uses the rounded-up 1.82 m.
 global_costmap:
   global_costmap:
     ros__parameters:
@@ -74,3 +72,7 @@ planner_server:
     use_sim_time: false
     GridBased:
       allow_unknown: true
+      minimum_turning_radius: 1.82
+    ForwardExit:
+      allow_unknown: true
+      minimum_turning_radius: 2.30

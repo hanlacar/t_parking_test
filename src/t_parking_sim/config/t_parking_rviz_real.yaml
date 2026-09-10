@@ -1,0 +1,198 @@
+t_parking_auto:
+  ros__parameters:
+    # Shared map-frame geometry for real_cart_slam_T_park_handA/B.  The two
+    # maps have identical resolution, origin, and painted/occupied boundaries;
+    # only the occupied side at the T mouth differs.
+    #
+    # Coordinate contract:
+    #   - course entrance: supplied by the launch initial pose and captured
+    #     from map -> base_link at start time
+    #   - road and slot values below: map-frame metres, measured from the
+    #     known-free envelope in the supplied 0.05 m/pixel maps
+    #   - slot yaw: points from the virtual closed end toward the mouth; the
+    #     vehicle faces +Y and reverses into the slot
+    opposite_start_x: 0.24247
+    opposite_start_y: 0.05097
+    opposite_start_yaw: 3.14159265
+
+    # A-map fixed road-centre exit target. Never derive this from the launch
+    # initial pose: initial_pose may vary laterally at each race start.
+    exit_goal:
+      x: 0.24247
+      y: 0.05097
+      yaw: 0.0
+      position_tolerance: 0.05
+      yaw_tolerance: 0.05
+
+    # A-map measured winner. FAST mode still runs the complete Nav2,
+    # collision, footprint, cusp, steering, radius, and clearance validators.
+    # Any rejection automatically falls back to the exhaustive search.
+    fast_planning: true
+    preferred_candidates:
+      slot_1:
+        setup_offset: 0.30
+        entry_depth: 0.30
+      slot_2:
+        setup_offset: 0.15
+        entry_depth: 0.30
+
+    # B/slot_2 first tries the same direct, continuous ForwardExit request.
+    # Only when that path fails a full validator does it try one calculated
+    # slot-clear pose, smallest extra clearance first.  These are margins
+    # beyond the rear-wheel clearance derived from the selected slot mouth;
+    # no absolute B-map waypoint is embedded in Python.
+    exit:
+      slot_2:
+        clearance_margin_candidates: [0.20, 0.40, 0.60]
+
+    # If the direct preferred path fails only steering/curvature validation,
+    # search the smallest forward-only lateral correction first. The 2.30 m
+    # radius shapes a conservative intermediate waypoint; GridBased produces
+    # one continuous recenter+parking path which is checked against the
+    # physical 1.82 m / 22 deg limits and the complete map/footprint sweep.
+    recenter:
+      enabled: true
+      # 0.10 m was measured unsafe at the straight/Nav2 boundary; 0.20 m is
+      # the smallest configured correction that passed the combined path.
+      lateral_step: 0.20
+      max_lateral_shift: 1.50
+      turn_radius: 2.30
+      straight_lead: 0.50
+      longitudinal_margin: 0.30
+      position_tolerance: 0.05
+      yaw_tolerance: 0.05
+      join_position_tolerance: 0.002
+      join_yaw_tolerance: 0.01
+      max_heading_change_deg: 120.0
+      # Permit a recenter attempt only when UNKNOWN/boundary rejection is at
+      # the first moving samples beside the captured initial footprint.  The
+      # combined path still uses the unchanged strict UNKNOWN validator.
+      recoverable_start_max_index: 2
+      slot_2:
+        # B tries the least intervention first: an observed-lane straight
+        # lead with zero lateral correction, then fine 0.10 m corrections
+        # near the minimum before coarser moves toward the road centre. Each
+        # tuple is a normal fully validated Nav2 path.
+        correction_candidates: [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 1.00, 1.20, 1.40, 1.50]
+        straight_lead_candidates: [0.0, 0.25, 0.50]
+        heading_modes: [preserve, road]
+        turn_radius: 3.00
+        longitudinal_margin: 0.30
+        # Warm plan-only measurements: initial-fringe UNKNOWN is cleared by
+        # the shortest 0.25 m straight lead; the B RIGHT/+10deg steering case
+        # first becomes valid at 0.50 m correction with the same lead.
+        preferred_unknown:
+          correction: 0.0
+          straight_lead: 0.25
+          heading_mode: preserve
+        preferred_geometry:
+          correction: 0.50
+          straight_lead: 0.25
+          heading_mode: preserve
+
+    # Complete all motionless startup work before /t_parking/start. The
+    # readiness probe also caches the already-observed five-second stable
+    # entrance pose, so START never restarts that full safety window.
+    pre_race_readiness: true
+    # Measured first/second harmless requests were equivalent (~0.10 s), so
+    # do not spend two extra Nav2 requests when this plugin has no cold-call
+    # penalty. The parameter remains available for another Nav2 build.
+    planner_warmup_before_start: false
+    readiness_poll_period: 0.10
+    pre_race_pose_max_age: 0.50
+
+    # Real execution may compute the exit while FollowPath parks. The cached
+    # path starts at the selected candidate's final pose and is accepted only
+    # after the measured parked pose and the full exit safety checks agree.
+    preplan_exit_during_parking: true
+    exit_cache_start_position_tolerance: 0.08
+    exit_cache_start_yaw_tolerance: 0.12
+
+    # Costmap initialization can exceed 30 s on the first launch after a map
+    # swap.  These only affect readiness waiting, not any safety decision.
+    system_wait_timeout: 60.0
+    map_wait_timeout: 120.0
+
+    road_center_y: 0.05097
+    road_min_y: -2.20
+    road_max_y: 3.20
+
+    # West/left half of the T branch.  Bounds stay inside the mapped outer
+    # wall and the mapped centre divider instead of treating either as free.
+    slot_1:
+      odom_x: -9.690
+      odom_y: -5.200
+      yaw: 1.57079632679
+      min_x: -11.050
+      max_x: -8.330
+      min_y: -8.100
+      max_y: -2.300
+
+    # East/right half of the same branch.  The gap around the mapped centre
+    # divider is deliberately excluded from both slot envelopes.
+    slot_2:
+      odom_x: -6.600
+      odom_y: -5.200
+      yaw: 1.57079632679
+      min_x: -7.850
+      max_x: -5.350
+      min_y: -8.100
+      max_y: -2.300
+
+    # Legacy single-view coordinates remain loadable for manual-mode
+    # compatibility. Automatic mode below derives every map pose from the
+    # configured slot mouths and road centreline instead.
+    observation_odom_x: 0.24247
+    observation_odom_y: 0.05097
+    observation_odom_yaw: 3.14159265
+
+    slot_observation:
+      enabled: true
+      # Both configured real scan inputs must independently contribute ten
+      # post-stop frames. A missing/occluded sensor therefore cannot turn an
+      # unobserved bay into FREE.
+      required_sensors: [front, rear]
+      min_frames: 10
+      buffer_frames: 40
+      # Ten frames need about 0.9 s at 10 Hz; keep the freshness window above
+      # that accumulation span while still rejecting pre-viewpoint data.
+      max_scan_age: 2.0
+      timeout: 4.0
+      # Coverage is computed over a 0.10 m grid in the vehicle-width parking
+      # corridor derived from each slot's bounds/centre/yaw. Static wall and
+      # curb strips are excluded by margins; saved-map cells never count as
+      # live obstacle evidence.
+      coverage_resolution: 0.10
+      min_coverage: 0.55
+      min_valid_rays: 40
+      obstacle_point_threshold: 4
+      obstacle_frame_threshold: 2
+      wall_margin: 0.15
+      curb_margin: 0.20
+      lateral_clearance: 0.10
+      # These are geometric selectors, not absolute coordinates. Their map
+      # poses are derived from the two slot mouths and road_center_y. The
+      # nearer mouth is first to minimize travel, and observation stops as
+      # soon as a safe decision is possible.
+      viewpoints:
+        - nearest_slot_mouth
+        - midpoint
+        - farthest_slot_mouth
+      max_viewpoints: 3
+      approach_position_tolerance: 0.15
+      preferred_free_slot: slot_1
+
+    # FIELD vehicle steering contract.  This real-map overlay intentionally
+    # supersedes the simulator geometry without changing simulator configs.
+    wheel_base: 0.73
+    wheel_radius: 0.135
+    front_wheel_track: 0.775
+    rear_wheel_track: 0.785
+    mechanical_steering_max_deg: 22.0
+    maximum_command_steering_deg: 22.0
+    minimum_turning_radius: 1.82
+    # Smac's 0.05 m / 5 deg lattice can rasterize a nominal-radius Dubins arc
+    # tighter than requested. Generate the exit at 2.30 m, while the strict
+    # post-plan validator below continues to enforce the physical 1.82 m
+    # minimum and 22 deg command limit on the resulting sampled path.
+    exit_planning_turn_radius: 2.30

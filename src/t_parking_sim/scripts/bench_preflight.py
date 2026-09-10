@@ -35,6 +35,11 @@ class BenchPreflight(Node):
         self.declare_parameter('observation_sec', 1.5)
         self.declare_parameter('startup_timeout_sec', 15.0)
         self.declare_parameter('zero_samples_required', 3)
+        self.declare_parameter('require_mcu_status', True)
+        self.declare_parameter('mcu_connected_topic', '/arduino/connected')
+        self.declare_parameter('mcu_ready_topic', '/mcu/ready')
+        self.declare_parameter('mcu_mode_topic', '/mcu/current_mode')
+        self.declare_parameter('mcu_safety_topic', '/mcu/safety_state')
 
         self.bench_anchor_seen = False
         self.bench_vehicle_tf_seen = False
@@ -45,21 +50,34 @@ class BenchPreflight(Node):
         self.safety_state = ''
         self.lidar_drive = None
         self.lidar_wheel = None
+        self.lidar_stop = None
         self.drive_zero_samples = 0
         self.wheel_zero_samples = 0
+        self.stop_false_samples = 0
         self.nonzero_command_seen = False
+        self.stop_active_seen = False
 
-        self.create_subscription(
-            Bool, '/mcu/connected', self._connected_callback, 10)
-        self.create_subscription(Bool, '/mcu/ready', self._ready_callback, 10)
-        self.create_subscription(
-            String, '/mcu/current_mode', self._mode_callback, 10)
-        self.create_subscription(
-            String, '/mcu/safety_state', self._safety_callback, 10)
+        self.require_mcu_status = bool(
+            self.get_parameter('require_mcu_status').value)
+        if self.require_mcu_status:
+            self.create_subscription(
+                Bool, str(self.get_parameter('mcu_connected_topic').value),
+                self._connected_callback, 10)
+            self.create_subscription(
+                Bool, str(self.get_parameter('mcu_ready_topic').value),
+                self._ready_callback, 10)
+            self.create_subscription(
+                String, str(self.get_parameter('mcu_mode_topic').value),
+                self._mode_callback, 10)
+            self.create_subscription(
+                String, str(self.get_parameter('mcu_safety_topic').value),
+                self._safety_callback, 10)
         self.create_subscription(
             Float32, '/lidar_drive', self._drive_callback, 10)
         self.create_subscription(
             Int32, '/lidar_wheel', self._wheel_callback, 10)
+        self.create_subscription(
+            Bool, '/lidar_stop', self._stop_callback, 10)
         self.create_subscription(TFMessage, '/tf', self._tf_callback, 100)
         static_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -111,6 +129,15 @@ class BenchPreflight(Node):
         else:
             self.wheel_zero_samples = 0
             self.nonzero_command_seen = True
+
+    def _stop_callback(self, msg: Bool) -> None:
+        value = bool(msg.data)
+        self.lidar_stop = value
+        if value:
+            self.stop_false_samples = 0
+            self.stop_active_seen = True
+        else:
+            self.stop_false_samples += 1
 
     def _tf_callback(self, msg: TFMessage) -> None:
         for transform in msg.transforms:
@@ -191,9 +218,13 @@ class BenchPreflight(Node):
                 '/lidar_drive')),
             wheel_publishers=len(self.get_publishers_info_by_topic(
                 '/lidar_wheel')),
+            stop_publishers=len(self.get_publishers_info_by_topic(
+                '/lidar_stop')),
             drive_zero_samples=self.drive_zero_samples,
             wheel_zero_samples=self.wheel_zero_samples,
+            stop_false_samples=self.stop_false_samples,
             nonzero_command_seen=self.nonzero_command_seen,
+            stop_active_seen=self.stop_active_seen,
             mcu_connected=self.mcu_connected,
             mcu_ready=self.mcu_ready,
             vehicle_mode=self.vehicle_mode,
@@ -210,6 +241,8 @@ class BenchPreflight(Node):
             errors.append('pre-existing /lidar_drive publisher detected')
         if self.get_publishers_info_by_topic('/lidar_wheel'):
             errors.append('pre-existing /lidar_wheel publisher detected')
+        if self.get_publishers_info_by_topic('/lidar_stop'):
+            errors.append('pre-existing /lidar_stop publisher detected')
         if not errors:
             self.get_logger().info('[BENCH PRE-PREFLIGHT]\nPASS')
         return errors
@@ -229,6 +262,7 @@ class BenchPreflight(Node):
             state = startup_gate_state(
                 snapshot,
                 zero_samples_required=required,
+                require_mcu_status=self.require_mcu_status,
             )
             if state != last_state:
                 last_state = state
@@ -238,15 +272,22 @@ class BenchPreflight(Node):
             if state == 'READY':
                 self.get_logger().info(
                     '[BENCH STARTUP]\nZERO_COMMAND_CONFIRMED')
-                self.get_logger().info('[BENCH STARTUP]\nMCU_STATUS_OK')
+                if self.require_mcu_status:
+                    self.get_logger().info(
+                        '[BENCH STARTUP]\nMCU_STATUS_OK')
+                else:
+                    self.get_logger().info(
+                        '[BENCH STARTUP]\nFIELD_DIRECT_SERIAL_CONTRACT')
                 self.get_logger().info('[BENCH PREFLIGHT]\nPASS')
                 return []
         return [
             f'startup timeout in {last_state or "UNKNOWN"}: '
             f'drive_publishers={snapshot.drive_publishers}, '
             f'wheel_publishers={snapshot.wheel_publishers}, '
+            f'stop_publishers={snapshot.stop_publishers}, '
             f'drive_zero_samples={snapshot.drive_zero_samples}, '
             f'wheel_zero_samples={snapshot.wheel_zero_samples}, '
+            f'stop_false_samples={snapshot.stop_false_samples}, '
             f'mcu_connected={snapshot.mcu_connected}, '
             f'mcu_ready_diagnostic={snapshot.mcu_ready}, '
             f'vehicle_mode={snapshot.vehicle_mode or "UNKNOWN"}, '

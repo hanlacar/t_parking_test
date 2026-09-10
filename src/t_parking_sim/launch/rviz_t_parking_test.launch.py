@@ -9,9 +9,15 @@ from launch.substitutions import Command, FindExecutable, LaunchConfiguration, P
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+import yaml
 
 
 def _validate_map(context):
+    execute = LaunchConfiguration('execute').perform(context).strip().lower()
+    if execute not in ('false', '0'):
+        raise RuntimeError(
+            'rviz_t_parking_test.launch.py is plan-only; execute must be false')
+
     requested = LaunchConfiguration('map').perform(context)
     map_yaml = os.path.abspath(os.path.expandvars(os.path.expanduser(requested)))
     if not os.path.isfile(map_yaml):
@@ -33,7 +39,32 @@ def _validate_map(context):
         raise RuntimeError(
             f'Saved map image referenced by {map_yaml} does not exist: '
             f'{os.path.abspath(image_path)}')
-    return [SetLaunchConfiguration('map', map_yaml)]
+    requested_config = LaunchConfiguration('parking_config').perform(context)
+    parking_config = os.path.abspath(os.path.expandvars(
+        os.path.expanduser(requested_config)))
+    if not os.path.isfile(parking_config):
+        raise RuntimeError(
+            f'T-parking config does not exist: {parking_config}')
+    with open(parking_config, encoding='utf-8') as stream:
+        parameters = yaml.safe_load(stream)['t_parking_auto']['ros__parameters']
+    try:
+        exit_goal = parameters['exit_goal']
+        values = {
+            name: float(exit_goal[name]) for name in (
+                'x', 'y', 'yaw', 'position_tolerance', 'yaw_tolerance')
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f'T-parking config has no complete numeric exit_goal: '
+            f'{parking_config}') from exc
+    return [
+        SetLaunchConfiguration('map', map_yaml),
+        SetLaunchConfiguration('parking_config', parking_config),
+        *(
+            SetLaunchConfiguration(f'configured_exit_goal_{name}', str(value))
+            for name, value in values.items()
+        ),
+    ]
 
 
 def generate_launch_description():
@@ -45,11 +76,15 @@ def generate_launch_description():
     initial_yaw = LaunchConfiguration('initial_pose_yaw')
     start_rviz = LaunchConfiguration('start_rviz')
     auto_start = LaunchConfiguration('auto_start')
+    execute = LaunchConfiguration('execute')
+    plan_exit = LaunchConfiguration('plan_exit')
+    fast_planning = LaunchConfiguration('fast_planning')
 
     base_params = PathJoinSubstitution(
         [package_share, 'config', 'nav2_params.yaml'])
     dry_run_params = PathJoinSubstitution(
         [package_share, 'config', 'rviz_t_parking_test.yaml'])
+    parking_config = LaunchConfiguration('parking_config')
     xacro_file = PathJoinSubstitution(
         [package_share, 'urdf', 'turtle_car.urdf.xacro'])
     rviz_file = PathJoinSubstitution(
@@ -113,11 +148,24 @@ def generate_launch_description():
                 LaunchConfiguration('update_rate_hz'), value_type=float),
             'cusp_pause_sec': ParameterValue(
                 LaunchConfiguration('cusp_pause_sec'), value_type=float),
-            # RETURN_POSE heading is deliberately independent from
-            # initial_pose_yaw (pi).
-            'return_pose_yaw': 0.0,
-            'return_position_tolerance': 0.05,
-            'return_yaw_tolerance': 0.05,
+            # The visual executor validates the same fixed config goal as
+            # the planner; it must never derive this target from initial pose.
+            'exit_goal.x': ParameterValue(
+                LaunchConfiguration('configured_exit_goal_x'),
+                value_type=float),
+            'exit_goal.y': ParameterValue(
+                LaunchConfiguration('configured_exit_goal_y'),
+                value_type=float),
+            'exit_goal.yaw': ParameterValue(
+                LaunchConfiguration('configured_exit_goal_yaw'),
+                value_type=float),
+            'exit_goal.position_tolerance': ParameterValue(
+                LaunchConfiguration(
+                    'configured_exit_goal_position_tolerance'),
+                value_type=float),
+            'exit_goal.yaw_tolerance': ParameterValue(
+                LaunchConfiguration('configured_exit_goal_yaw_tolerance'),
+                value_type=float),
         }])
 
     planner = Node(
@@ -127,11 +175,15 @@ def generate_launch_description():
             PathJoinSubstitution(
                 [package_share, 'config', 't_parking_auto.yaml']),
             dry_run_params,
+            parking_config,
             {
                 'use_sim_time': False,
                 'rviz_only': True,
                 'auto_start': ParameterValue(auto_start, value_type=bool),
-                'execute': False,
+                'execute': ParameterValue(execute, value_type=bool),
+                'plan_exit': ParameterValue(plan_exit, value_type=bool),
+                'fast_planning': ParameterValue(
+                    fast_planning, value_type=bool),
                 'target_slot': target_slot,
             },
         ])
@@ -144,14 +196,19 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            'map', default_value='/home/wan/t_parking_maps/real_parking_map.yaml'),
+            'map', default_value=os.path.expanduser(
+                '~/t_parking_maps/real_cart_slam_T_park_handA.yaml')),
+        DeclareLaunchArgument(
+            'parking_config',
+            default_value=PathJoinSubstitution([
+                package_share, 'config', 't_parking_rviz_real.yaml']),
+            description=(
+                'Map-frame T-parking geometry overlay shared by handA/B.')),
         DeclareLaunchArgument(
             'target_slot', default_value='auto',
             description='Existing planner convention: auto | slot_1 | slot_2'),
-        # Canonical opposite-side start from rviz_t_parking_test.yaml.  Launch
-        # arguments remain overrideable for the requested robustness checks.
-        DeclareLaunchArgument('initial_pose_x', default_value='9.70'),
-        DeclareLaunchArgument('initial_pose_y', default_value='0.0'),
+        DeclareLaunchArgument('initial_pose_x', default_value='0.24247'),
+        DeclareLaunchArgument('initial_pose_y', default_value='0.05097'),
         DeclareLaunchArgument(
             'initial_pose_yaw', default_value='3.14159265359'),
         DeclareLaunchArgument('forward_speed_mps', default_value='0.30'),
@@ -159,6 +216,19 @@ def generate_launch_description():
         DeclareLaunchArgument('update_rate_hz', default_value='20.0'),
         DeclareLaunchArgument('cusp_pause_sec', default_value='0.5'),
         DeclareLaunchArgument('start_rviz', default_value='true'),
+        DeclareLaunchArgument(
+            'execute', default_value='false',
+            description='Plan-only safety guard; true is rejected.'),
+        DeclareLaunchArgument(
+            'plan_exit', default_value='false',
+            description=(
+                'Also plan and publish the parked-to-entrance exit path; '
+                'never enables FollowPath or actuator commands.')),
+        DeclareLaunchArgument(
+            'fast_planning', default_value='true',
+            description=(
+                'Try the real-map preferred candidate first and stop only '
+                'after it passes every existing safety validator.')),
         DeclareLaunchArgument(
             'auto_start', default_value='false',
             description='Automatically start this execute=false RViz dry-run.'),

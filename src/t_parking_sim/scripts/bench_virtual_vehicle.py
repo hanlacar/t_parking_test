@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Publish isolated BENCH odometry by integrating the real Nav2 Twist."""
+"""Publish isolated BENCH odometry gated by the emitted actuator command."""
 
 import math
 import time
 from typing import Optional
 
 from bench_support import (
+    actuator_output_allows_progress,
     BENCH_BASE_FRAME,
     bench_motion_allowed,
     BENCH_ODOM_FRAME,
     BENCH_ODOM_TOPIC,
     integrate_bicycle,
+    lidar_drive_matches_twist,
     Pose2D,
 )
 from geometry_msgs.msg import TransformStamped, Twist
@@ -18,7 +20,7 @@ from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32, Int32
 from tf2_ros import TransformBroadcaster
 
 
@@ -31,11 +33,14 @@ class BenchVirtualVehicle(Node):
         self.declare_parameter('wheels_off_ground', False)
         self.declare_parameter('execute', False)
         self.declare_parameter('input_topic', '/t_parking/cmd_vel_control')
+        self.declare_parameter('drive_topic', '/lidar_drive')
+        self.declare_parameter('wheel_topic', '/lidar_wheel')
+        self.declare_parameter('stop_topic', '/lidar_stop')
         self.declare_parameter('odom_topic', BENCH_ODOM_TOPIC)
         self.declare_parameter('odom_frame', BENCH_ODOM_FRAME)
         self.declare_parameter('base_frame', BENCH_BASE_FRAME)
-        self.declare_parameter('wheel_base', 0.77)
-        self.declare_parameter('steering_limit_deg', 27.0)
+        self.declare_parameter('wheel_base', 0.73)
+        self.declare_parameter('steering_limit_deg', 22.0)
         self.declare_parameter('stopped_speed_epsilon', 0.01)
         self.declare_parameter('input_timeout_sec', 0.50)
         self.declare_parameter('publish_frequency', 50.0)
@@ -47,6 +52,9 @@ class BenchVirtualVehicle(Node):
         self.motion_allowed = bench_motion_allowed(
             self.bench_mode, self.wheels_off_ground, self.execute)
         self.input_topic = str(parameter('input_topic').value)
+        self.drive_topic = str(parameter('drive_topic').value)
+        self.wheel_topic = str(parameter('wheel_topic').value)
+        self.stop_topic = str(parameter('stop_topic').value)
         self.odom_topic = str(parameter('odom_topic').value)
         self.odom_frame = str(parameter('odom_frame').value)
         self.base_frame = str(parameter('base_frame').value)
@@ -67,6 +75,12 @@ class BenchVirtualVehicle(Node):
         self.pose = Pose2D(0.0, 0.0, 0.0)
         self.command = Twist()
         self.last_command_time: Optional[float] = None
+        self.lidar_drive = 0.0
+        self.lidar_wheel = 0
+        self.lidar_stop = False
+        self.last_lidar_drive_time: Optional[float] = None
+        self.last_lidar_wheel_time: Optional[float] = None
+        self.last_lidar_stop_time: Optional[float] = None
         self.last_tick_time = time.monotonic()
         self.last_log_time = 0.0
         self.path_progress = 0.0
@@ -78,6 +92,12 @@ class BenchVirtualVehicle(Node):
             Odometry, self.odom_topic, 20)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.create_subscription(Twist, self.input_topic, self._cmd_callback, 20)
+        self.create_subscription(
+            Float32, self.drive_topic, self._drive_callback, 20)
+        self.create_subscription(
+            Int32, self.wheel_topic, self._wheel_callback, 20)
+        self.create_subscription(
+            Bool, self.stop_topic, self._stop_callback, 20)
         self.create_subscription(Bool, '/estop_lock', self._estop_callback, 10)
         self.create_subscription(
             Bool, '/t_parking/emergency_stop_request',
@@ -92,6 +112,9 @@ class BenchVirtualVehicle(Node):
         self.get_logger().warning(
             '[BENCH VIRTUAL VEHICLE] physical chassis remains stationary; '
             'only isolated bench_odom -> bench_base_link moves')
+        self.get_logger().warning(
+            '[BENCH VIRTUAL VEHICLE] fake progress requires fresh matching '
+            '/lidar_drive + /lidar_wheel + /lidar_stop output')
         if not self.motion_allowed:
             self.get_logger().warning('BENCH VIRTUAL MOTION INHIBITED')
 
@@ -114,6 +137,18 @@ class BenchVirtualVehicle(Node):
         self.command = msg
         self.last_command_time = time.monotonic()
 
+    def _drive_callback(self, msg: Float32) -> None:
+        self.lidar_drive = float(msg.data)
+        self.last_lidar_drive_time = time.monotonic()
+
+    def _wheel_callback(self, msg: Int32) -> None:
+        self.lidar_wheel = int(msg.data)
+        self.last_lidar_wheel_time = time.monotonic()
+
+    def _stop_callback(self, msg: Bool) -> None:
+        self.lidar_stop = bool(msg.data)
+        self.last_lidar_stop_time = time.monotonic()
+
     def _estop_callback(self, msg: Bool) -> None:
         self.estop = bool(msg.data)
 
@@ -130,7 +165,23 @@ class BenchVirtualVehicle(Node):
         command_fresh = (
             self.last_command_time is not None
             and now - self.last_command_time <= self.input_timeout_sec)
-        command = self.command if command_fresh and not self.estop else Twist()
+        actuator_fresh = all(
+            received is not None
+            and now - received <= self.input_timeout_sec
+            for received in (
+                self.last_lidar_drive_time,
+                self.last_lidar_wheel_time,
+                self.last_lidar_stop_time,
+            ))
+        direction_matches = lidar_drive_matches_twist(
+            float(self.command.linear.x), self.lidar_drive,
+            self.stopped_speed_epsilon)
+        actuator_allows_progress = actuator_output_allows_progress(
+            actuator_fresh, self.lidar_stop, direction_matches)
+        command = (
+            self.command
+            if command_fresh and not self.estop and actuator_allows_progress
+            else Twist())
         step = integrate_bicycle(
             self.pose,
             float(command.linear.x),
@@ -157,6 +208,11 @@ class BenchVirtualVehicle(Node):
                 '[BENCH VIRTUAL VEHICLE]\n'
                 f'cmd_v={float(command.linear.x):+.4f}\n'
                 f'cmd_w={float(command.angular.z):+.4f}\n'
+                f'lidar_drive={self.lidar_drive:+.1f}\n'
+                f'lidar_wheel={self.lidar_wheel:+d}\n'
+                f'lidar_stop={str(self.lidar_stop).lower()}\n'
+                f'actuator_output_fresh={str(actuator_fresh).lower()}\n'
+                f'actuator_direction_matches={str(direction_matches).lower()}\n'
                 f'raw_delta_deg={step.raw_delta_deg:+.3f}\n'
                 f'clamped_delta_deg={step.clamped_delta_deg:+.3f}\n'
                 f'virtual_x={self.pose.x:+.4f}\n'

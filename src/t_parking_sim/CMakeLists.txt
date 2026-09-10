@@ -75,8 +75,14 @@ install(PROGRAMS
   scripts/rviz_fake_vehicle.py
   scripts/scan_filter.py
   scripts/start_staging_diagnostics.py
+  scripts/t870_field_serial_bridge.py
   scripts/t_parking_geometry.py
   scripts/vehicle_spawn_manager.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(FILES
+  scripts/parallel_entry_reference.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -93,11 +99,20 @@ if(BUILD_TESTING)
   ament_add_pytest_test(
     test_parking_mode_publisher test/test_parking_mode_publisher.py)
   ament_add_pytest_test(
+    test_parallel_entry_reference
+    test/test_parallel_entry_reference.py)
+  ament_add_pytest_test(
     test_parallel_in_t_slot_geometry
     test/test_parallel_in_t_slot_geometry.py)
   ament_add_pytest_test(
     test_scan_topic_contract
     test/test_scan_topic_contract.py)
+  ament_add_pytest_test(
+    test_t870_field_serial_bridge
+    test/test_t870_field_serial_bridge.py)
+  ament_add_pytest_test(
+    test_vehicle_geometry
+    test/test_vehicle_geometry.py)
 endif()
 
 ament_package()

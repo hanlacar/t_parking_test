@@ -37,9 +37,12 @@ class BicycleStep:
 class StartupSnapshot:
     drive_publishers: int
     wheel_publishers: int
+    stop_publishers: int
     drive_zero_samples: int
     wheel_zero_samples: int
+    stop_false_samples: int
     nonzero_command_seen: bool
+    stop_active_seen: bool
     mcu_connected: bool
     mcu_ready: bool
     vehicle_mode: str
@@ -48,18 +51,26 @@ class StartupSnapshot:
 
 def startup_gate_state(
         snapshot: StartupSnapshot,
-        zero_samples_required: int = 3) -> str:
+        zero_samples_required: int = 3,
+        require_mcu_status: bool = True) -> str:
     """Return the fail-closed BENCH startup state for one observation."""
-    if snapshot.drive_publishers > 1 or snapshot.wheel_publishers > 1:
+    if (snapshot.drive_publishers > 1
+            or snapshot.wheel_publishers > 1
+            or snapshot.stop_publishers > 1):
         return 'FAIL_DUPLICATE_LIDAR_COMMAND_SOURCE'
     if snapshot.nonzero_command_seen:
         return 'FAIL_NONZERO_COMMAND_BEFORE_START'
-    if snapshot.drive_publishers < 1 or snapshot.wheel_publishers < 1:
+    if snapshot.stop_active_seen:
+        return 'FAIL_STOP_ACTIVE_BEFORE_START'
+    if (snapshot.drive_publishers < 1
+            or snapshot.wheel_publishers < 1
+            or snapshot.stop_publishers < 1):
         return 'WAITING_FOR_LIDAR_COMMAND_SOURCE'
     if (snapshot.drive_zero_samples < zero_samples_required
-            or snapshot.wheel_zero_samples < zero_samples_required):
+            or snapshot.wheel_zero_samples < zero_samples_required
+            or snapshot.stop_false_samples < zero_samples_required):
         return 'WAITING_FOR_ZERO_COMMAND'
-    if not (
+    if require_mcu_status and not (
             snapshot.mcu_connected
             and snapshot.vehicle_mode == 'T_PARK'
             and snapshot.safety_state == 'OK'):
@@ -104,13 +115,32 @@ def bench_motion_allowed(
     return bool(bench_mode and wheels_off_ground and execute)
 
 
+def lidar_drive_matches_twist(
+        linear_x: float, drive_stage: float,
+        stopped_speed_epsilon: float = 0.01) -> bool:
+    """Require the emitted actuator drive direction before fake progress."""
+    if not math.isfinite(linear_x) or not math.isfinite(drive_stage):
+        return False
+    if abs(linear_x) < stopped_speed_epsilon:
+        return abs(drive_stage) < 1.0e-6
+    return (linear_x > 0.0 and drive_stage > 0.0) or (
+        linear_x < 0.0 and drive_stage < 0.0)
+
+
+def actuator_output_allows_progress(
+        actuator_fresh: bool, stop_active: bool,
+        direction_matches: bool) -> bool:
+    """Require every emitted-actuator gate before BENCH pose integration."""
+    return bool(actuator_fresh and not stop_active and direction_matches)
+
+
 def integrate_bicycle(
         pose: Pose2D,
         linear_x: float,
         angular_z: float,
         dt: float,
-        wheel_base: float = 0.77,
-        steering_limit_deg: float = 27.0,
+        wheel_base: float = 0.73,
+        steering_limit_deg: float = 22.0,
         stopped_speed_epsilon: float = 0.01,
         motion_allowed: bool = True) -> BicycleStep:
     """Integrate one converter-compatible Ackermann bicycle-model step."""

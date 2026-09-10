@@ -17,17 +17,29 @@ controller_server:
     # The controller's production default remains disabled (0.0 m).
     ParkingForward:
       terminal_capture_distance: 0.35
+      regulated_linear_scaling_min_radius: 1.82
     ParkingReverse:
       terminal_capture_distance: 0.35
+      reverse_wheel_base: 0.73
+      reverse_hard_steering_limit_deg: 22.0
+      reverse_fault_on_steering_limit: true
+      regulated_linear_scaling_min_radius: 1.82
 
 planner_server:
   ros__parameters:
     use_sim_time: false
+    GridBased:
+      minimum_turning_radius: 1.82
+    ForwardExit:
+      minimum_turning_radius: 2.30
 
 velocity_smoother:
   ros__parameters:
     use_sim_time: false
     odom_topic: /bench/odom
+    # Preserve v/w curvature during ramp-up so the converter never sees a
+    # false over-limit steering spike at a segment transition.
+    scale_velocities: true
 
 local_costmap:
   local_costmap:

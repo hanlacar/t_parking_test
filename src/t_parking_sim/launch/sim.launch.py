@@ -46,13 +46,18 @@ def generate_launch_description():
         [package_share, "worlds", "t_parking_exam_real_vehicle.sdf"]
     )
 
-    effective_lidar_z = PythonExpression([
-        "", mapping_lidar_z, " if '", mapping_lidar_override,
-        "'.lower() == 'true' else 0.52",
+    effective_front_lidar_z = PythonExpression([
+        'float("', mapping_lidar_z, '") - 0.135 if "',
+        mapping_lidar_override, '".lower() == "true" else -0.030',
+    ])
+    effective_rear_lidar_z = PythonExpression([
+        'float("', mapping_lidar_z, '") - 0.135 if "',
+        mapping_lidar_override, '".lower() == "true" else 0.020',
     ])
     robot_description = Command([
-        FindExecutable(name="xacro"), " ", xacro_file,
-        " lidar_ground_height:=", effective_lidar_z,
+        FindExecutable(name='xacro'), ' ', xacro_file,
+        ' front_laser_z_from_base:=', effective_front_lidar_z,
+        ' rear_laser_z_from_base:=', effective_rear_lidar_z,
     ])
 
     gazebo_gui = IncludeLaunchDescription(

@@ -28,8 +28,8 @@ class CombinedMappingDriver(Node):
         super().__init__('combined_mapping_driver')
         self.declare_parameter('linear_speed', 0.35)
         self.declare_parameter('lookahead_distance', 0.60)
-        self.declare_parameter('wheel_base', 0.77)
-        self.declare_parameter('steering_limit_deg', 27.0)
+        self.declare_parameter('wheel_base', 0.73)
+        self.declare_parameter('steering_limit_deg', 22.0)
         self.declare_parameter('start_delay', 5.0)
         self.declare_parameter('goal_tolerance', 0.20)
 

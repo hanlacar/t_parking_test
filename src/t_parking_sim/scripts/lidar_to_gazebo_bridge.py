@@ -57,7 +57,7 @@ class LidarToGazeboBridge(Node):
         super().__init__('lidar_to_gazebo_bridge')
         self.declare_parameter('drive_scale_mps', 0.30)
         self.declare_parameter('wheel_base', -1.0)
-        self.declare_parameter('wheel_limit_deg', 27)
+        self.declare_parameter('wheel_limit_deg', 22)
         self.declare_parameter('command_timeout_sec', 0.50)
         self.declare_parameter('publish_frequency', 20.0)
 

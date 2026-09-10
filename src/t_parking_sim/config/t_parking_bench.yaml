@@ -8,8 +8,10 @@ t_parking_auto:
     execute: false
     robot_base_frame: "bench_base_link"
     odom_topic: "/bench/odom"
-    target_slot: "slot_1"
-    return_to_entrance: true
+    target_slot: "auto"
+    # The wheels-off-ground check covers the parking manoeuvre only. Keep the
+    # vehicle stopped after PARKED instead of adding an unrelated exit run.
+    return_to_entrance: false
     bench_plan_exit: true
     freeze_slam_during_execution: false
     localization_stability_duration: 1.0
@@ -20,6 +22,15 @@ t_parking_auto:
     vehicle_width: 0.78
     vehicle_center_x_offset: 0.020
     parking_end_clearance_m: 3.06
-    wheel_base: 0.77
-    minimum_turning_radius: 1.52
+    # Final FIELD contract: mechanical travel and software commands both stop
+    # at 22 deg. R=1.82 m requires about 21.86 deg and retains margin.
+    wheel_base: 0.73
+    wheel_radius: 0.135
+    front_wheel_track: 0.775
+    rear_wheel_track: 0.785
+    mechanical_steering_max_deg: 22.0
+    maximum_command_steering_deg: 22.0
+    minimum_turning_radius: 1.82
+    exit_planning_turn_radius: 2.30
+    maximum_cusps: 2
     costmap_footprint_padding: 0.025

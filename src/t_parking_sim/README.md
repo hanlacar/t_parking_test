@@ -197,11 +197,12 @@ ros2 run nav2_map_server map_saver_cli \
 Vehicle length     : 1.33 m
 Overall width      : 0.78 m
 Body width         : 0.74 m
-Wheelbase          : 0.77 m
-Wheel track        : 0.67 m
-Wheel diameter     : 0.28 m
+Wheelbase          : 0.730 m
+Front wheel track  : 0.775 m
+Rear wheel track   : 0.785 m
+Wheel diameter     : 0.270 m
 Wheel width        : 0.11 m
-Steering limit     : ±27 deg
+Steering limit     : ±22 deg
 ```
 
 다른 차량에 적용할 경우 다음 값을 반드시 확인해야 합니다.
@@ -238,7 +239,9 @@ laser_link
 rear_laser_link
 ```
 
-LiDAR 높이는 xacro argument 및 launch argument를 통해 변경할 수 있습니다.
+`base_link` 기준 TF는 전방 `(0.730, 0, -0.030)`, 후방
+`(-0.680, 0, 0.020, yaw=pi)`입니다. `base_link`는 지면에서 0.135 m
+높이이므로 센서 지면 높이는 각각 약 0.105 m, 0.155 m입니다.
 
 ## Vehicle Command Topics
 
@@ -255,7 +258,7 @@ LiDAR 높이는 xacro argument 및 launch argument를 통해 변경할 수 있�
 ```text
 negative wheel = left
 positive wheel = right
-maximum        = ±27 deg
+maximum        = ±22 deg
 ```
 
 Gazebo bridge 사용 시 `/lidar_*` 명령을 `/cmd_vel`로 변환합니다.

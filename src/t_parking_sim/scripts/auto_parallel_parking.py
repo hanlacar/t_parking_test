@@ -66,6 +66,13 @@ import tf2_ros
 from visualization_msgs.msg import Marker, MarkerArray
 
 
+PARALLEL_SLOT_EXTERNAL_MAP = {
+    'slot_1': 'V_A',
+    'slot_2': 'V_B',
+}
+PARALLEL_SLOT_EXTERNAL_NONE = 'NONE'
+
+
 @dataclass
 class Slot:
     """A parallel slot in the odom frame.
@@ -162,6 +169,8 @@ class AutoParallelParking(Node):
         )
         self.status_publisher = self.create_publisher(
             String, '/parallel_parking/status', transient_qos)
+        self.selected_slot_publisher = self.create_publisher(
+            String, '/parallel_parking/selected_slot', transient_qos)
         self.path_publisher = self.create_publisher(
             Path, '/parallel_parking/planned_path', transient_qos)
         self.exit_path_publisher = self.create_publisher(
@@ -271,8 +280,10 @@ class AutoParallelParking(Node):
         self.active_motion_metrics: Optional[PathMetrics] = None
         self.active_motion_final: Optional[PoseStamped] = None
         self.state = 'WAITING'
+        self.selected_slot_name = ''
         self.last_feedback_log = 0.0
         self._publish_status('WAITING')
+        self._publish_selected_slot()
         self.readiness_timer = self.create_timer(
             1.0, self._readiness_timer_callback,
             callback_group=self.callback_group)
@@ -293,7 +304,7 @@ class AutoParallelParking(Node):
             'staging_hop_distance': 3.0,
             'corner_entry_odom_x': 10.00,
             'corner_exit_odom_y': 3.00,
-            'corner_arc_radius': 1.70,
+            'corner_arc_radius': 1.82,
             'transit_planner_id': 'ForwardExit',
             'transit_controller_id': 'FollowPath',
             'transit_goal_checker_id': 'goal_checker',
@@ -301,7 +312,7 @@ class AutoParallelParking(Node):
             'staging_final_gap': 0.0,
             'approach_offset_candidates': [3.00, 3.30],
             'slot_end_clearance': 0.35,
-            'entry_turning_radius': 1.70,
+            'entry_turning_radius': 1.82,
             'entry_pose_spacing': 0.05,
             'entry_loop_length_factor': 2.2,
             'exit_lead_candidates': [1.20, 1.80, 2.50],
@@ -312,7 +323,7 @@ class AutoParallelParking(Node):
             'footprint_clearance': 0.06,
             'minimum_reverse_length': 0.30,
             'maximum_cusps': 2,
-            'minimum_turning_radius': 1.52,
+            'minimum_turning_radius': 1.82,
             'curvature_tolerance_factor': 1.00,
             'occupied_threshold': 50,
             'exit_mode': 'parked',
@@ -325,10 +336,11 @@ class AutoParallelParking(Node):
             'wheel_frames': [
                 'front_left_wheel_link', 'front_right_wheel_link',
                 'rear_left_wheel_link', 'rear_right_wheel_link'],
-            'wheel_radius': 0.14,
+            'wheel_radius': 0.135,
             'wheel_width': 0.11,
-            'wheel_base': 0.77,
-            'wheel_track': 0.67,
+            'wheel_base': 0.73,
+            'front_wheel_track': 0.775,
+            'rear_wheel_track': 0.785,
             'wheel_inside_margin': 0.01,
             'parked_yaw_tolerance': 0.20,
             'wheel_inside_confirm_count': 5,
@@ -559,6 +571,8 @@ class AutoParallelParking(Node):
                 return False
             self.target_slot = str(self.get_parameter('target_slot').value)
             self.execute_path = bool(self.get_parameter('execute').value)
+            self.selected_slot_name = ''
+            self._publish_selected_slot()
             self.cancel_requested.clear()
             self.parking_wheels_inside = False
             self.wheel_inside_confirm_count = 0
@@ -604,6 +618,12 @@ class AutoParallelParking(Node):
         msg = String()
         msg.data = status if not detail else f'{status}: {detail}'
         self._safe_publish(self.status_publisher, msg)
+
+    def _publish_selected_slot(self, selected: str = '') -> None:
+        message = String()
+        message.data = PARALLEL_SLOT_EXTERNAL_MAP.get(
+            selected, PARALLEL_SLOT_EXTERNAL_NONE)
+        self._safe_publish(self.selected_slot_publisher, message)
 
     # ------------------------------------------------------------------
     # State machine
@@ -679,6 +699,8 @@ class AutoParallelParking(Node):
                         'to settle for a forward slide-in')
                 return
 
+            self.selected_slot_name = candidate.slot.name
+            self._publish_selected_slot(candidate.slot.name)
             self._publish_status('VALIDATE_ENTRY')
             self._publish_entry_plan(candidate)
             metrics = candidate.metrics
@@ -1370,7 +1392,7 @@ class AutoParallelParking(Node):
 
         # Leg A: up the start corridor, heading +odom_x (odom yaw 0).  It
         # deliberately stops short of the lane line: the corner is a 90 deg
-        # turn and this vehicle needs 1.52 m of turning radius, so trying to
+        # turn and this vehicle needs 1.82 m of turning radius, so trying to
         # pivot at the lane line itself wedges it against the slot mouth.
         x = current[0] + hop
         while x < corner_entry_x - 0.5 * hop:
@@ -2084,7 +2106,7 @@ class AutoParallelParking(Node):
         # Measure curvature over a physical window rather than adjacent grid
         # samples: three nearly coincident Hybrid-A* poses amplify map-grid
         # quantization, and a Reeds-Shepp cusp has undefined curvature.  A
-        # 0.15 m window stays well inside the 1.52 m minimum turning radius.
+        # 0.15 m window stays well inside the 1.82 m minimum turning radius.
         max_curvature = 0.0
         poses = path.poses
         curvature_window = 0.15
@@ -2253,23 +2275,23 @@ class AutoParallelParking(Node):
         if current is None:
             return None
         wheel_base = float(self.get_parameter('wheel_base').value)
-        wheel_track = float(self.get_parameter('wheel_track').value)
-        if wheel_base <= 0.0 or wheel_track <= 0.0:
+        front_track = float(self.get_parameter('front_wheel_track').value)
+        rear_track = float(self.get_parameter('rear_wheel_track').value)
+        if wheel_base <= 0.0 or front_track <= 0.0 or rear_track <= 0.0:
             return None
         if self.wheel_position_source != 'geometry':
             self._log_warn(
-                'wheel-link TF unavailable; using URDF wheel-base/track '
+                'wheel-link TF unavailable; using measured axle/track '
                 'geometry relative to map->base_footprint')
             self.wheel_position_source = 'geometry'
         half_base = 0.5 * wheel_base
-        half_track = 0.5 * wheel_track
         cosine = math.cos(current[2])
         sine = math.sin(current[2])
         offsets = {
-            'front_left': (half_base, half_track),
-            'front_right': (half_base, -half_track),
-            'rear_left': (-half_base, half_track),
-            'rear_right': (-half_base, -half_track),
+            'front_left': (half_base, 0.5 * front_track),
+            'front_right': (half_base, -0.5 * front_track),
+            'rear_left': (-half_base, 0.5 * rear_track),
+            'rear_right': (-half_base, -0.5 * rear_track),
         }
         return {
             label: (

@@ -83,7 +83,7 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 1.52
+      regulated_linear_scaling_min_radius: 1.82
       regulated_linear_scaling_min_speed: 0.08
       cost_scaling_dist: 0.22
       cost_scaling_gain: 1.0
@@ -110,7 +110,7 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 1.52
+      regulated_linear_scaling_min_radius: 1.82
       regulated_linear_scaling_min_speed: 0.12
       cost_scaling_dist: 0.22
       cost_scaling_gain: 1.0
@@ -146,7 +146,7 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 1.52
+      regulated_linear_scaling_min_radius: 1.82
       regulated_linear_scaling_min_speed: 0.12
       cost_scaling_dist: 0.22
       cost_scaling_gain: 1.0
@@ -165,15 +165,15 @@ controller_server:
       segment_state_topic: "/t_parking/active_segment"
       # Reverse-only geometry controller. Existing RPP speed, constraints,
       # collision checking, and lookahead parameters below remain unchanged.
-      reverse_wheel_base: 0.77
-      reverse_hard_steering_limit_deg: 27.0
+      reverse_wheel_base: 0.73
+      reverse_hard_steering_limit_deg: 22.0
+      reverse_fault_on_steering_limit: true
       reverse_profile_window: 0.25
       reverse_lateral_gain: 0.35
       reverse_heading_gain: 0.80
       reverse_lateral_correction_limit_deg: 3.0
-      # The validated 0.450 1/m arc needs 19.13 deg feed-forward.  Live
-      # lateral correction requested 22.13 deg but the old 1.5 deg margin
-      # clipped it at 20.63 deg; retain ample margin below the 27 deg hard cap.
+      # Keep three degrees for bounded feedback-loop correction while the hard
+      # physical and command clamp remains the measured 22 degree limit.
       reverse_soft_limit_margin_deg: 3.0
       # Zero selects the path-derived max-profile + margin limit.
       reverse_soft_limit_override_deg: 0.0
@@ -191,7 +191,7 @@ controller_server:
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 1.52
+      regulated_linear_scaling_min_radius: 1.82
       regulated_linear_scaling_min_speed: 0.12
       cost_scaling_dist: 0.22
       cost_scaling_gain: 1.0
@@ -363,8 +363,9 @@ planner_server:
       analytic_expansion_max_length: 6.0
       analytic_expansion_max_cost: 200.0
       analytic_expansion_max_cost_override: false
-      # 0.77 / tan(27 deg) = 1.511 m; round upward, never below physics.
-      minimum_turning_radius: 1.52
+      # 0.730 / tan(22 deg) = 1.8068 m. The extra 0.0132 m prevents a
+      # rounded planner setting from asking for more than physical lock.
+      minimum_turning_radius: 1.82
       reverse_penalty: 2.0
       # Was 0.0: zero cost for an extra direction switch gave the search no
       # reason to prefer a single continuous reverse curve over one with an
@@ -407,12 +408,11 @@ planner_server:
       analytic_expansion_max_length: 3.0
       analytic_expansion_max_cost: 200.0
       analytic_expansion_max_cost_override: false
-      # Keep a conservative lattice-generation margin above the measured
-      # 1.511 m physical radius.  With 1.52 here, the 0.05 m Smac lattice
-      # rasterized its Dubins arc at 0.681 1/m (effective 1.47 m), while the
-      # strict post-plan validator correctly limits it to 1/1.52=0.658 1/m.
-      # This changes only ForwardExit path generation; RPP remains untouched.
-      minimum_turning_radius: 1.70
+      # The 0.05 m / 5 deg Smac lattice can rasterize a nominal-radius Dubins
+      # arc tighter than requested. Retain the plan-only validated 2.30 m
+      # generation radius; the strict post-plan validator still enforces the
+      # 1.82 m physical minimum and 22 degree command limit.
+      minimum_turning_radius: 2.30
       reverse_penalty: 2.0
       # Was 0.0: zero cost for an extra direction switch gave the search no
       # reason to prefer a single continuous reverse curve over one with an
@@ -436,7 +436,9 @@ velocity_smoother:
     enable_stamped_cmd_vel: false
     smoothing_frequency: 20.0
     stamp_smoothed_velocity_with_smoothing_time: false
-    scale_velocities: false
+    # Preserve v/w curvature while ramping so transient smoothing cannot ask
+    # the Ackermann converter for steering beyond the validated path geometry.
+    scale_velocities: true
     feedback: "OPEN_LOOP"
     max_velocity: [0.40, 0.0, 0.55]
     min_velocity: [-0.30, 0.0, -0.55]

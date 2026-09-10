@@ -72,7 +72,7 @@ parallel_parking_auto:
     staging_via_odom_y: 0.0
     staging_hop_distance: 3.0
     # The corner from the start corridor into the lane is a 90 deg turn and
-    # the vehicle needs 1.52 m of turning radius, so the corridor leg stops
+    # the vehicle needs 1.82 m of turning radius, so the corridor leg stops
     # at corner_entry_odom_x (world y = 9.50, already past the corridor wall
     # which ends at world y = 8.56) and the next waypoint is placed on the far
     # side of the corner, lined up with the lane.  Turning at the lane line
@@ -85,7 +85,7 @@ parallel_parking_auto:
     # on at the slot mouth, so the 45 deg point of this arc is pinned as an
     # extra goal in the same plan request.  Clamped up to
     # minimum_turning_radius if set lower.
-    corner_arc_radius: 1.70
+    corner_arc_radius: 1.82
     # Staging is forward-only. A DUBIN planner cannot insert the short
     # reverse seam that previously stopped the car half way around the corner.
     transit_planner_id: "ForwardExit"
@@ -107,7 +107,7 @@ parallel_parking_auto:
     # back into it; that is what makes the entry a real parallel-parking
     # manoeuvre instead of a wide forward arc into an oversized bay.  The
     # lateral shift from the lane to the slot centre is about 1.5 m, which
-    # needs additional longitudinal run at the 1.52 m turning radius, so
+    # needs additional longitudinal run at the 1.82 m turning radius, so
     # these all leave comfortable margin.
     approach_offset_candidates: [3.00, 3.30]
     # Longitudinal end clearance used if a slot centre would put the body too
@@ -117,10 +117,9 @@ parallel_parking_auto:
     # approach-to-parked distance; a real back-in stays close to that line,
     # while "reverse 0.5 m then loop 7 m forward into the open bay" does not.
     entry_loop_length_factor: 2.2
-    # Kinematic reverse S-curve. At R=1.70 m the 1.54 m lateral shift needs
-    # 2.846 m longitudinal run and 24.37 deg peak steering, leaving feedback
-    # headroom below the immutable 27 deg limit.
-    entry_turning_radius: 1.70
+    # Kinematic reverse S-curve uses the same physical-radius floor as the
+    # planner and the measured 22 degree steering limit.
+    entry_turning_radius: 1.82
     entry_pose_spacing: 0.05
     # Forward exit target, measured past the far end of the slot.
     exit_lead_candidates: [1.20, 1.80, 2.50]
@@ -148,9 +147,9 @@ parallel_parking_auto:
     # The analytic entry has zero drive-direction cusps. Keep this bound as a
     # defensive validator if a future generator adds correction runs.
     maximum_cusps: 2
-    # 27 deg steering: 0.77/tan(27 deg) = 1.511 m, rounded up for margin.
+    # 22 deg steering: 0.730/tan(22 deg) = 1.8068 m, rounded up for margin.
     # Must stay equal to nav2_params.yaml's planner value.
-    minimum_turning_radius: 1.52
+    minimum_turning_radius: 1.82
     curvature_tolerance_factor: 1.00
     occupied_threshold: 50
 
@@ -174,12 +173,13 @@ parallel_parking_auto:
       - "front_right_wheel_link"
       - "rear_left_wheel_link"
       - "rear_right_wheel_link"
-    wheel_radius: 0.14
+    wheel_radius: 0.135
     wheel_width: 0.11
-    wheel_base: 0.77
-    wheel_track: 0.67
+    wheel_base: 0.73
+    front_wheel_track: 0.775
+    rear_wheel_track: 0.785
     # A wheel centre must clear the slot edge by wheel_radius + margin. With
-    # half-track 0.335 m this tests 0.485 m from the vehicle centreline,
+    # rear half-track 0.3925 m this tests 0.5375 m from the centreline,
     # stricter than the 0.390 m overall-width half extent.
     wheel_inside_margin: 0.01
     # Containment alone is not enough here. A 1.33 x 0.78 m car can have all

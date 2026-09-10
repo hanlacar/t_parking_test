@@ -74,10 +74,13 @@ void DirectionLockedRPP::configure(
     node, plugin_name_ + ".segment_state_topic",
     rclcpp::ParameterValue(std::string("/t_parking/active_segment")));
   nav2_util::declare_parameter_if_not_declared(
-    node, plugin_name_ + ".reverse_wheel_base", rclcpp::ParameterValue(0.77));
+    node, plugin_name_ + ".reverse_wheel_base", rclcpp::ParameterValue(0.73));
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name_ + ".reverse_hard_steering_limit_deg",
-    rclcpp::ParameterValue(27.0));
+    rclcpp::ParameterValue(22.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, plugin_name_ + ".reverse_fault_on_steering_limit",
+    rclcpp::ParameterValue(false));
   nav2_util::declare_parameter_if_not_declared(
     node, plugin_name_ + ".reverse_profile_window",
     rclcpp::ParameterValue(0.25));
@@ -105,6 +108,9 @@ void DirectionLockedRPP::configure(
   node->get_parameter(
     plugin_name_ + ".reverse_hard_steering_limit_deg",
     reverse_hard_steering_limit_deg_);
+  node->get_parameter(
+    plugin_name_ + ".reverse_fault_on_steering_limit",
+    reverse_fault_on_steering_limit_);
   node->get_parameter(plugin_name_ + ".reverse_profile_window", reverse_profile_window_);
   node->get_parameter(plugin_name_ + ".reverse_lateral_gain", reverse_lateral_gain_);
   node->get_parameter(plugin_name_ + ".reverse_heading_gain", reverse_heading_gain_);
@@ -126,7 +132,7 @@ void DirectionLockedRPP::configure(
   }
   if (reverse_wheel_base_ <= 0.0 || reverse_profile_window_ <= 0.0 ||
     reverse_hard_steering_limit_deg_ <= 0.0 ||
-    reverse_hard_steering_limit_deg_ > 27.0 || reverse_lateral_gain_ < 0.0 ||
+    reverse_hard_steering_limit_deg_ > 22.0 || reverse_lateral_gain_ < 0.0 ||
     reverse_heading_gain_ < 0.0 ||
     reverse_lateral_correction_limit_deg_ < 0.0 ||
     reverse_soft_limit_margin_deg_ < 0.0 || terminal_capture_distance_ < 0.0)
@@ -1039,14 +1045,13 @@ geometry_msgs::msg::TwistStamped DirectionLockedRPP::computeVelocityCommands(
       cumulative_arc_length_.back());
     path_curvature = reverseControllerCurvature(curvature_sample_arc);
     const double delta_feedforward = std::atan(reverse_wheel_base_ * path_curvature);
-    const auto & projection_start =
-      segment_plan_.poses[reverse_projection.segment_index].pose.position;
-    const auto & projection_end =
-      segment_plan_.poses[reverse_projection.segment_index + 1].pose.position;
-    const double path_travel_heading = std::atan2(
-      projection_end.y - projection_start.y,
-      projection_end.x - projection_start.x);
-    const double desired_vehicle_heading = normalizeAngle(path_travel_heading + kPi);
+    const double start_heading = tf2::getYaw(
+      segment_plan_.poses[reverse_projection.segment_index].pose.orientation);
+    const double end_heading = tf2::getYaw(
+      segment_plan_.poses[reverse_projection.segment_index + 1].pose.orientation);
+    const double desired_vehicle_heading = normalizeAngle(
+      start_heading + reverse_projection.ratio *
+      normalizeAngle(end_heading - start_heading));
     reverse_heading_error = normalizeAngle(
       tf2::getYaw(robot_plan_pose.pose.orientation) - desired_vehicle_heading);
     const double delta_feedback = std::clamp(
@@ -1055,6 +1060,16 @@ geometry_msgs::msg::TwistStamped DirectionLockedRPP::computeVelocityCommands(
       -degreesToRadians(reverse_lateral_correction_limit_deg_),
       degreesToRadians(reverse_lateral_correction_limit_deg_));
     const double requested_delta = delta_feedforward + delta_feedback;
+    if (reverse_fault_on_steering_limit_ &&
+      std::abs(requested_delta) >
+      degreesToRadians(reverse_hard_steering_limit_deg_) + 1.0e-9)
+    {
+      RCLCPP_ERROR(
+        logger_,
+        "[STEERING LIMIT FAULT] requested=%+.3f deg limit=+/-%0.3f deg; drive stopped",
+        radiansToDegrees(requested_delta), reverse_hard_steering_limit_deg_);
+      throw nav2_core::NoValidControl("STEERING_LIMIT_FAULT");
+    }
     const double soft_limited_delta = std::clamp(
       requested_delta, -degreesToRadians(reverse_soft_limit_deg_),
       degreesToRadians(reverse_soft_limit_deg_));

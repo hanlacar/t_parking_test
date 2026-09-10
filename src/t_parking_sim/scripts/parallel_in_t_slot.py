@@ -22,6 +22,10 @@ from auto_parallel_parking import (
 )
 from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import Path
+from parallel_entry_reference import (
+    rear_axle_to_vehicle_center,
+    vehicle_center_to_rear_axle,
+)
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
@@ -66,7 +70,7 @@ class ParallelInTSlot(AutoParallelParking):
             'goal_longitudinal_offsets': [0.0, -0.05, 0.05, -0.10, 0.10],
             'goal_depth_offsets': [0.0, -0.05, 0.05, -0.10, 0.10],
             'safety_margin': 0.03,
-            'steering_limit_deg': 27.0,
+            'steering_limit_deg': 22.0,
             'road_min_y': -2.10,
             'road_max_y': 2.10,
             'road_center_y': 0.0,
@@ -105,6 +109,65 @@ class ParallelInTSlot(AutoParallelParking):
                 return slot
         self._log_error('no obstacle-free half of the existing T bay was found')
         return None
+
+    def _analyze_entry_path(
+            self, path: Path, final_pose: PoseStamped) -> PathMetrics:
+        """Measure steering curvature at the rear axle of a centre path."""
+        metrics = super()._analyze_path(path, final_pose)
+        if not path.poses:
+            return metrics
+
+        wheel_base = float(self.get_parameter('wheel_base').value)
+        rear_path = Path()
+        rear_path.header = path.header
+        for centre in path.poses:
+            yaw = yaw_from_quaternion(centre.pose.orientation)
+            rear_x, rear_y, _ = vehicle_center_to_rear_axle(
+                (centre.pose.position.x, centre.pose.position.y, yaw),
+                wheel_base)
+            rear = PoseStamped()
+            rear.header = centre.header
+            rear.pose.position.x = rear_x
+            rear.pose.position.y = rear_y
+            rear.pose.position.z = centre.pose.position.z
+            rear.pose.orientation = centre.pose.orientation
+            rear_path.poses.append(rear)
+
+        # The centre locus has a tangent jump when steering changes
+        # instantaneously.  That is not rear-axle curvature and must not be
+        # compared with tan(max_steering) / wheel_base.
+        rear_metrics = super()._analyze_path(
+            rear_path, rear_path.poses[-1])
+        return PathMetrics(
+            metrics.total_length,
+            metrics.forward_length,
+            metrics.reverse_length,
+            metrics.cusp_count,
+            metrics.first_reverse_index,
+            metrics.directions,
+            rear_metrics.max_curvature,
+            metrics.final_position_error,
+            metrics.final_yaw_error)
+
+    def _validate_entry_path(
+            self, slot: Slot, named: Dict[str, PoseStamped], path: Path,
+            metrics: PathMetrics,
+            maximum_cusps: Optional[int] = None) -> Tuple[bool, str]:
+        """Validate a centre-reference entry with rear steering curvature."""
+        entry_metrics = self._analyze_entry_path(path, named['parked'])
+        return super()._validate_entry_path(
+            slot, named, path, entry_metrics, maximum_cusps)
+
+    def _prepare_executable_entry(
+            self, candidate: EntryCandidate
+    ) -> Optional[Tuple[Path, PathMetrics]]:
+        """Keep executable entry metrics in the bicycle reference contract."""
+        executable = super()._prepare_executable_entry(candidate)
+        if executable is None:
+            return None
+        path, _ = executable
+        return path, self._analyze_entry_path(
+            path, candidate.named_poses['parked'])
 
     # ------------------------------------------------------------------
     # Swapped-axis geometry: slot length is odom X, depth is odom Y.
@@ -159,20 +222,42 @@ class ParallelInTSlot(AutoParallelParking):
         lane_x = park_x
         approach_x = lane_x + approach_offset * forward[0]
         approach_y = lane_y + approach_offset * forward[1]
-        transition_x = (
-            park_x + radius * math.sin(arc_angle) * forward[0]
-            - 0.5 * lateral * left[0])
-        transition_y = (
-            park_y + radius * math.sin(arc_angle) * forward[1]
-            - 0.5 * lateral * left[1])
-        transition_yaw = normalize_angle(
-            yaw - math.copysign(arc_angle, lateral))
+        spacing = max(
+            0.02, float(self.get_parameter('entry_pose_spacing').value))
+        wheel_base = float(self.get_parameter('wheel_base').value)
+        center_approach = (approach_x, approach_y, yaw)
+        center_goal = (park_x, park_y, yaw)
+        rear_goal = vehicle_center_to_rear_axle(center_goal, wheel_base)
+        rear_samples = [vehicle_center_to_rear_axle(
+            center_approach, wheel_base)]
+        if straight_lead > 1.0e-6:
+            self._integrate_bicycle_motion(
+                rear_samples, -straight_lead, 0.0, spacing)
+        turn_sign = math.copysign(1.0, lateral)
+        self._integrate_bicycle_motion(
+            rear_samples, -radius * arc_angle, turn_sign / radius, spacing)
+        transition_index = len(rear_samples) - 1
+        self._integrate_bicycle_motion(
+            rear_samples, -radius * arc_angle, -turn_sign / radius, spacing)
 
+        rear_endpoint = rear_samples[-1]
+        if (math.hypot(
+                rear_endpoint[0] - rear_goal[0],
+                rear_endpoint[1] - rear_goal[1]) > 1.0e-4
+                or abs(normalize_angle(
+                    rear_endpoint[2] - rear_goal[2])) > 1.0e-4):
+            self._log_error('rear-axle entry integration endpoint mismatch')
+            return None
+
+        center_samples = [
+            rear_axle_to_vehicle_center(sample, wheel_base)
+            for sample in rear_samples
+        ]
         odom_named = {
-            'staging': (approach_x, approach_y, yaw),
-            'approach': (approach_x, approach_y, yaw),
-            'transition': (transition_x, transition_y, transition_yaw),
-            'parked': (park_x, park_y, yaw),
+            'staging': center_approach,
+            'approach': center_approach,
+            'transition': center_samples[transition_index],
+            'parked': center_goal,
         }
         named: Dict[str, PoseStamped] = {}
         for name, values in odom_named.items():
@@ -181,19 +266,8 @@ class ParallelInTSlot(AutoParallelParking):
                 return None
             named[name] = pose
 
-        spacing = max(
-            0.02, float(self.get_parameter('entry_pose_spacing').value))
-        samples = [(approach_x, approach_y, yaw)]
-        if straight_lead > 1.0e-6:
-            self._integrate_bicycle_motion(samples, -straight_lead, 0.0, spacing)
-        turn_sign = math.copysign(1.0, lateral)
-        self._integrate_bicycle_motion(
-            samples, -radius * arc_angle, turn_sign / radius, spacing)
-        self._integrate_bicycle_motion(
-            samples, -radius * arc_angle, -turn_sign / radius, spacing)
-
         path = Path()
-        for x, y, sample_yaw in samples:
+        for x, y, sample_yaw in center_samples:
             pose = self._odom_pose_to_map(x, y, sample_yaw)
             if pose is None:
                 return None
@@ -267,11 +341,11 @@ class ParallelInTSlot(AutoParallelParking):
         if configured_radius + 1.0e-9 < physical_radius:
             self._log_error(
                 '[PARALLEL_T_SLOT] infeasible\n'
-                'reason: required steering exceeds 27 deg')
+                'reason: required steering exceeds 22 deg')
             return None
         self._log_info(
             f'[PARALLEL_T_SLOT] bicycle minimum radius={physical_radius:.3f}m '
-            f'(wheelbase={wheelbase:.3f}m, steering=27.0deg); '
+            f'(wheelbase={wheelbase:.3f}m, steering=22.0deg); '
             f'planner radius={configured_radius:.3f}m')
 
         lane_offsets = [float(value) for value in self.get_parameter(
@@ -310,7 +384,8 @@ class ParallelInTSlot(AutoParallelParking):
                             last_reason = 'staging footprint leaves the road'
                             continue
                         path = self._dedupe_stationary_poses(path)
-                        metrics = self._analyze_path(path, named['parked'])
+                        metrics = self._analyze_entry_path(
+                            path, named['parked'])
                         if self._first_drive_direction(metrics) >= 0:
                             last_reason = 'entry does not start in reverse'
                             continue
@@ -347,13 +422,38 @@ class ParallelInTSlot(AutoParallelParking):
                 '[PARALLEL_T_SLOT] infeasible\n'
                 'reason: no collision-free reverse S-curve path')
             return None
-        # Prefer clearance first; path length and curvature break near ties.
+
+        # The staging route ends at the nominal approach built from the first
+        # lane candidate and the shortest approach candidate.  Correcting the
+        # footprint reference changes clearance scores, but must not select an
+        # entry whose start no longer matches the pose we just staged at.
+        waypoint_groups = self._staging_waypoints(
+            slot, lane_offsets[0], min(approach_offsets))
+        if not waypoint_groups:
+            return None
+        nominal_approach = self._odom_pose_to_map(
+            *waypoint_groups[-1][-1])
+        if nominal_approach is None:
+            return None
+
+        def candidate_key(item: Tuple[EntryCandidate, float]):
+            candidate, candidate_clearance = item
+            approach = candidate.named_poses['approach']
+            capture_error = math.hypot(
+                approach.pose.position.x
+                - nominal_approach.pose.position.x,
+                approach.pose.position.y
+                - nominal_approach.pose.position.y)
+            return (
+                round(capture_error, 2),
+                -round(candidate_clearance, 2),
+                candidate.metrics.total_length,
+                candidate.metrics.max_curvature)
+
+        # Within the staged-pose contract, prefer clearance; path length and
+        # curvature break near ties.
         chosen, clearance = min(
-            candidates,
-            key=lambda item: (
-                -round(item[1], 2),
-                item[0].metrics.total_length,
-                item[0].metrics.max_curvature))
+            candidates, key=candidate_key)
         self.selected_candidate = chosen
         self.selected_clearance = clearance
         if not self.execute_path and not self._plan_staging_preview(chosen):
@@ -504,7 +604,11 @@ class ParallelInTSlot(AutoParallelParking):
         maximum_cusps = int(
             self.get_parameter('staging_turnaround_cusps').value)
         if metrics.max_curvature > curvature_limit + 1.0e-3:
-            self._log_error(f'{context} exceeds the 27 deg steering constraint')
+            steering_limit = float(
+                self.get_parameter('steering_limit_deg').value)
+            self._log_error(
+                f'{context} exceeds the {steering_limit:.1f} deg '
+                'steering constraint')
             return False
         if metrics.cusp_count > maximum_cusps:
             self._log_error(
@@ -575,7 +679,7 @@ class ParallelInTSlot(AutoParallelParking):
         metrics = self.full_plan_metrics
         steering = math.degrees(math.atan(
             float(self.get_parameter('wheel_base').value)
-            * metrics.max_curvature))
+            * candidate.metrics.max_curvature))
         goal = candidate.named_poses['parked']
         staging = candidate.named_poses['staging']
         self._log_info(

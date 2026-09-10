@@ -8,6 +8,14 @@ t_parking_auto:
     stop_when_all_wheels_inside: true
     exit_mode: "forward_right"
     exit_planner_id: "ForwardExit"
+    # Fixed return target for this base map. This is deliberately independent
+    # from the localization/parking initial pose captured at START.
+    exit_goal:
+      x: 9.70
+      y: 0.0
+      yaw: 0.0
+      position_tolerance: 0.05
+      yaw_tolerance: 0.05
     require_forward_only_exit: true
     require_right_turn_exit: true
     max_reverse_distance_during_exit: 0.01
@@ -46,11 +54,10 @@ t_parking_auto:
     road_min_y: -2.16
     road_max_y: 2.16
     approach_lead: 0.50
-    # Setup is measured beyond the slot's far side.  With a 1.83 m slot and
-    # 1.52 m turn radius, R-slot_half_width = 0.605 m places the first
-    # quarter-turn centre on the slot centreline. Larger values are sampled
-    # only as modest clearance alternatives; pulling a full vehicle length
-    # past the slot forces a physically impossible sharp swing back.
+    # Setup is measured beyond the slot's far side. Candidate geometry is
+    # validated against the measured 1.82 m planning radius and full swept
+    # footprint; pulling a full vehicle length past the slot still forces an
+    # infeasible swing back.
     setup_offset_candidates: [0.60, 0.75, 0.90, 1.05]
     # Minimum gap between the vehicle footprint and the slot's side walls
     # anywhere inside the bay, checked over the whole entry path rather than
@@ -73,22 +80,25 @@ t_parking_auto:
     # The planned endpoint is the safe target itself; no arbitrary path
     # overshoot or post-plan trimming is used.
     final_pose_overshoot: 0.0
-    # Exact wheel links and geometry from turtle_car.urdf.xacro.  TF is the
-    # primary source; wheel_base/track are only used if wheel TF is unavailable.
+    # Exact wheel links and geometry from turtle_car.urdf.xacro. TF is the
+    # primary source; these values are the fallback if wheel TF is unavailable.
     wheel_frames:
       - "front_left_wheel_link"
       - "front_right_wheel_link"
       - "rear_left_wheel_link"
       - "rear_right_wheel_link"
-    wheel_radius: 0.14
-    wheel_base: 0.77
-    wheel_track: 0.67
+    wheel_radius: 0.135
+    wheel_base: 0.73
+    front_wheel_track: 0.775
+    rear_wheel_track: 0.785
+    mechanical_steering_max_deg: 22.0
+    maximum_command_steering_deg: 22.0
     wheel_inside_margin: 0.01
     wheel_inside_confirm_count: 5
     wheel_check_period: 0.10
     stop_confirm_count: 3
-    # 0.77 / tan(27 deg) = 1.511 m; keep equal to Nav2's rounded-up value.
-    minimum_turning_radius: 1.52
+    # 0.730 / tan(22 deg) = 1.8068 m; match Nav2's rounded-up setting.
+    minimum_turning_radius: 1.82
     curvature_tolerance_factor: 1.00
     minimum_reverse_length: 0.30
     # Reject overlapping multi-switch paths that RPP can oscillate across.
@@ -119,8 +129,8 @@ t_parking_auto:
     # Let Nav2 stop first; publish a zero safety pulse only if still moving.
     parking_stop_grace_timeout: 2.0
 
-    # Capture the real map->base_link pose before the first motion and use
-    # it as the final entrance-return target.
+    # Capture the real map->base_link pose before the first motion. This is
+    # the actual parking start only; the exit target is exit_goal above.
     entrance_pose_sample_count: 5
     entrance_pose_sample_interval: 0.10
     entrance_pose_capture_timeout: 10.0
@@ -131,13 +141,11 @@ t_parking_auto:
     entrance_pose_position_stability: 0.03
     entrance_pose_yaw_stability: 0.05
     # The exact initial footprint begins as unknown under the stationary car.
-    # Return to this known-free staging point, then let lidar clear the goal.
+    # Move to this known-free staging point, then let lidar clear the map.
     entrance_staging_distance: 1.0
     entrance_remap_timeout: 15.0
-    entrance_return_position_tolerance: 0.10
-    entrance_return_yaw_tolerance: 0.12
     maximum_exit_cusps: 4
-    # Safety margins subtracted from the latest legal R=1.70 m turn start.
+    # Safety margins subtracted from the latest legal turn start.
     # The rear tyres cannot fully leave the mouth on a straight and still fit
     # the quarter turn; the complete swept footprint and slot-wall clearance
     # are checked instead.  Larger margins begin the turn earlier and increase
@@ -145,9 +153,9 @@ t_parking_auto:
     forward_clear_distance_candidates: [0.02, 0.07, 0.12, 0.17]
     right_turn_lead_candidates: [0.00, 0.05, 0.10]
     lane_merge_distance_candidates: [0.80]
-    # Match ForwardExit's conservative Smac lattice radius.  The physical
-    # minimum remains 1.511 m and the strict validator remains 1/1.52 1/m.
-    exit_planning_turn_radius: 1.70
+    # Smac plan-only testing showed discretization can tighten a nominal arc;
+    # generate at 2.30 m while validating every sampled path at >=1.82 m.
+    exit_planning_turn_radius: 2.30
     final_position_tolerance: 0.08
     final_yaw_tolerance: 0.12
     # Strict odometry settling allowance after Nav2 reports goal.

@@ -9,8 +9,8 @@ bench_virtual_vehicle:
     odom_topic: "/bench/odom"
     odom_frame: "bench_odom"
     base_frame: "bench_base_link"
-    wheel_base: 0.77
-    steering_limit_deg: 27.0
+    wheel_base: 0.73
+    steering_limit_deg: 22.0
     stopped_speed_epsilon: 0.01
     input_timeout_sec: 0.50
     publish_frequency: 50.0

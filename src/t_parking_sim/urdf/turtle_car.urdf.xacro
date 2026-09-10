@@ -1,6 +1,9 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="turtle_car">
-  <xacro:arg name="lidar_ground_height" default="0.52"/>
+  <xacro:arg name="include_gazebo" default="true"/>
+  <xacro:arg name="use_base_footprint" default="true"/>
+  <xacro:arg name="front_laser_z_from_base" default="-0.030"/>
+  <xacro:arg name="rear_laser_z_from_base" default="0.020"/>
 
   <!-- Vehicle dimensions (metres unless noted otherwise). -->
   <xacro:property name="vehicle_length" value="1.33"/>
@@ -10,26 +13,29 @@
   <xacro:property name="body_height" value="0.70"/>
   <xacro:property name="body_bottom_from_ground" value="0.20"/>
   <xacro:property name="body_center_x" value="0.020"/>
-  <xacro:property name="wheel_base" value="0.77"/>
-  <xacro:property name="wheel_track" value="0.67"/>
-  <!-- No separate kingpin measurement was supplied.  Place each steering
-       pivot at its wheel centre so the measured 0.67 m track is exact. -->
-  <xacro:property name="kingpin_width" value="${wheel_track}"/>
-  <xacro:property name="front_axle_x" value="0.385"/>
-  <xacro:property name="rear_axle_x" value="-0.385"/>
-  <xacro:property name="wheel_radius" value="0.14"/>
+  <xacro:property name="wheel_base" value="0.730"/>
+  <xacro:property name="front_wheel_track" value="0.775"/>
+  <xacro:property name="rear_wheel_track" value="0.785"/>
+  <!-- No separate kingpin measurement was supplied. Place each steering
+       pivot at its front wheel centre. -->
+  <xacro:property name="kingpin_width" value="${front_wheel_track}"/>
+  <xacro:property name="front_axle_x" value="0.365"/>
+  <xacro:property name="rear_axle_x" value="-0.365"/>
+  <xacro:property name="wheel_radius" value="0.135"/>
   <xacro:property name="wheel_width" value="0.11"/>
-  <!-- Shared MCU/Gazebo maximum steering angle: exactly 27 deg. -->
-  <xacro:property name="steering_limit" value="0.471238898"/>
+  <!-- Measured physical steering travel: exactly +/-22 deg. -->
+  <xacro:property name="steering_limit" value="0.383972435"/>
   <xacro:property name="steering_link_radius" value="0.020"/>
   <xacro:property name="steering_link_height" value="0.040"/>
-  <!-- base_link is the axle midpoint, 0.020 m behind the physical geometric
-       centre.  These offsets therefore reproduce the measured physical
-       LiDAR centres at +0.7025/-0.7025 m about the geometric centre. -->
-  <xacro:property name="front_laser_x" value="0.7225"/>
-  <xacro:property name="rear_laser_x" value="-0.6825"/>
-  <xacro:property name="laser_z_from_ground"
-                  value="${float(xacro.arg('lidar_ground_height'))}"/>
+  <!-- Directly measured base_link -> LiDAR transforms. base_link is at the
+       wheel centre height (0.135 m above ground); do not add that height a
+       second time to these relative z offsets. -->
+  <xacro:property name="front_laser_x" value="0.730"/>
+  <xacro:property name="front_laser_z"
+                  value="${float(xacro.arg('front_laser_z_from_base'))}"/>
+  <xacro:property name="rear_laser_x" value="-0.680"/>
+  <xacro:property name="rear_laser_z"
+                  value="${float(xacro.arg('rear_laser_z_from_base'))}"/>
   <xacro:property name="laser_radius" value="0.0375"/>
   <xacro:property name="laser_height" value="0.040"/>
 
@@ -112,7 +118,8 @@
   </xacro:macro>
 
   <!-- Root at the tyre/ground contact plane. -->
-  <link name="base_footprint">
+  <xacro:if value="$(arg use_base_footprint)">
+    <link name="base_footprint">
     <!--
       Gazebo's URDF-to-SDF converter requires an inertial block when this
       fixed root is explicitly preserved. It has no geometry or collision.
@@ -122,7 +129,8 @@
       <inertia ixx="0.0001" ixy="0" ixz="0"
                iyy="0.0001" iyz="0" izz="0.0001"/>
     </inertial>
-  </link>
+    </link>
+  </xacro:if>
 
   <link name="base_link">
     <inertial>
@@ -132,11 +140,13 @@
     </inertial>
   </link>
 
-  <joint name="base_footprint_joint" type="fixed">
-    <parent link="base_footprint"/>
-    <child link="base_link"/>
-    <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
-  </joint>
+  <xacro:if value="$(arg use_base_footprint)">
+    <joint name="base_footprint_joint" type="fixed">
+      <parent link="base_footprint"/>
+      <child link="base_link"/>
+      <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
+    </joint>
+  </xacro:if>
 
   <link name="chassis_link">
     <inertial>
@@ -199,7 +209,7 @@
   <joint name="front_left_wheel_joint" type="continuous">
     <parent link="front_left_steering_link"/>
     <child link="front_left_wheel_link"/>
-    <origin xyz="0 ${(wheel_track - kingpin_width) / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="0 ${(front_wheel_track - kingpin_width) / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="30" velocity="30"/>
     <dynamics damping="0.02" friction="0.002"/>
@@ -208,7 +218,7 @@
   <joint name="front_right_wheel_joint" type="continuous">
     <parent link="front_right_steering_link"/>
     <child link="front_right_wheel_link"/>
-    <origin xyz="0 ${-(wheel_track - kingpin_width) / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="0 ${-(front_wheel_track - kingpin_width) / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="30" velocity="30"/>
     <dynamics damping="0.02" friction="0.002"/>
@@ -217,7 +227,7 @@
   <joint name="rear_left_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="rear_left_wheel_link"/>
-    <origin xyz="${rear_axle_x} ${wheel_track / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="${rear_axle_x} ${rear_wheel_track / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="50" velocity="30"/>
     <dynamics damping="0.02" friction="0.002"/>
@@ -226,7 +236,7 @@
   <joint name="rear_right_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="rear_right_wheel_link"/>
-    <origin xyz="${rear_axle_x} ${-wheel_track / 2.0} 0" rpy="0 0 0"/>
+    <origin xyz="${rear_axle_x} ${-rear_wheel_track / 2.0} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="50" velocity="30"/>
     <dynamics damping="0.02" friction="0.002"/>
@@ -249,11 +259,10 @@
   <joint name="laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="laser_link"/>
-    <origin xyz="${front_laser_x} 0 ${laser_z_from_ground - wheel_radius}" rpy="0 0 0"/>
+    <origin xyz="${front_laser_x} 0 ${front_laser_z}" rpy="0 0 0"/>
   </joint>
 
-  <!-- Rear sensor is physically symmetric about the vehicle geometric centre,
-       which is intentionally not the base_link origin. -->
+  <!-- Rear scan frame preserves the measured asymmetric installation. -->
   <link name="rear_laser_link">
     <inertial>
       <mass value="${laser_mass}"/>
@@ -271,9 +280,11 @@
   <joint name="rear_laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="rear_laser_link"/>
-    <origin xyz="${rear_laser_x} 0 ${laser_z_from_ground - wheel_radius}"
+    <origin xyz="${rear_laser_x} 0 ${rear_laser_z}"
             rpy="0 0 ${pi}"/>
   </joint>
 
-  <xacro:include filename="turtle_car.gazebo.xacro"/>
+  <xacro:if value="$(arg include_gazebo)">
+    <xacro:include filename="turtle_car.gazebo.xacro"/>
+  </xacro:if>
 </robot>

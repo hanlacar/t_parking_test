@@ -113,15 +113,16 @@ private:
   bool reverse_projection_initialized_{false};
   double last_projection_arc_length_{0.0};
 
-  double reverse_wheel_base_{0.77};
-  double reverse_hard_steering_limit_deg_{27.0};
+  double reverse_wheel_base_{0.73};
+  double reverse_hard_steering_limit_deg_{22.0};
+  bool reverse_fault_on_steering_limit_{false};
   double reverse_profile_window_{0.25};
   double reverse_lateral_gain_{0.35};
   double reverse_heading_gain_{0.8};
   double reverse_lateral_correction_limit_deg_{3.0};
   double reverse_soft_limit_margin_deg_{1.5};
   double reverse_soft_limit_override_deg_{0.0};
-  double reverse_soft_limit_deg_{27.0};
+  double reverse_soft_limit_deg_{22.0};
   double reverse_profile_min_curvature_{0.0};
   double reverse_profile_max_curvature_{0.0};
   double reverse_profile_min_steering_deg_{0.0};

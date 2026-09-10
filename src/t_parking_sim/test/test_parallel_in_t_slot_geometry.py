@@ -1,5 +1,6 @@
 """Static-map regression checks for the parallel-in-T-slot experiment."""
 
+import importlib.util
 import math
 from pathlib import Path
 
@@ -11,13 +12,21 @@ MAP_RESOLUTION = 0.05
 VEHICLE_LENGTH = 1.33
 VEHICLE_WIDTH = 0.78
 BODY_CENTER_X = 0.020
-WHEELBASE = 0.77
-STEERING_LIMIT = math.radians(27.0)
-TURN_RADIUS = 1.70
+WHEELBASE = 0.73
+STEERING_LIMIT = math.radians(22.0)
+TURN_RADIUS = 1.82
 SLOTS = {
     'slot_1': (4.73, 6.46, 2.16, 7.59, 0.0),
     'slot_2': (6.54, 8.27, 2.16, 7.59, math.pi),
 }
+
+REFERENCE_SCRIPT = (
+    Path(__file__).parents[1]
+    / 'scripts' / 'parallel_entry_reference.py')
+REFERENCE_SPEC = importlib.util.spec_from_file_location(
+    'parallel_entry_reference', REFERENCE_SCRIPT)
+REFERENCE = importlib.util.module_from_spec(REFERENCE_SPEC)
+REFERENCE_SPEC.loader.exec_module(REFERENCE)
 
 
 def _read_pgm(path: Path):
@@ -81,20 +90,25 @@ def _entry_path(slot):
     angle = math.acos(1.0 - abs(lateral) / (2.0 * TURN_RADIUS))
     required = 2.0 * TURN_RADIUS * math.sin(angle)
     approach = required + 0.10
-    samples = [(
+    center_approach = (
         park_x + approach * math.cos(yaw),
         lane_y + approach * math.sin(yaw),
-        yaw)]
-    _integrate(samples, -(approach - required), 0.0)
+        yaw)
+    rear_samples = [REFERENCE.vehicle_center_to_rear_axle(
+        center_approach, WHEELBASE)]
+    _integrate(rear_samples, -(approach - required), 0.0)
     sign = math.copysign(1.0, lateral)
-    _integrate(samples, -TURN_RADIUS * angle, sign / TURN_RADIUS)
-    _integrate(samples, -TURN_RADIUS * angle, -sign / TURN_RADIUS)
-    return samples
+    _integrate(rear_samples, -TURN_RADIUS * angle, sign / TURN_RADIUS)
+    _integrate(rear_samples, -TURN_RADIUS * angle, -sign / TURN_RADIUS)
+    return [
+        REFERENCE.rear_axle_to_vehicle_center(pose, WHEELBASE)
+        for pose in rear_samples
+    ]
 
 
 def test_vehicle_and_steering_fit_are_physical():
     minimum_radius = WHEELBASE / math.tan(STEERING_LIMIT)
-    assert minimum_radius == pytest.approx(1.511214, abs=1.0e-5)
+    assert minimum_radius == pytest.approx(1.806813, abs=1.0e-5)
     assert TURN_RADIUS >= minimum_radius
     for min_x, max_x, min_y, max_y, _yaw in SLOTS.values():
         assert max_x - min_x >= VEHICLE_LENGTH + 2.0 * 0.03

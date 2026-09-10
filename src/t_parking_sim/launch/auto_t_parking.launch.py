@@ -197,7 +197,7 @@ def generate_launch_description():
             'use_sim_time': ParameterValue(use_sim_time, value_type=bool),
             'drive_scale_mps': 0.30,
             'wheel_base': wheel_base,
-            'wheel_limit_deg': 27,
+            'wheel_limit_deg': 22,
             # Nav2's velocity smoother emits at 20 Hz.  Ten missed samples
             # stop Gazebo while avoiding false trips from normal jitter.
             'command_timeout_sec': 0.50,

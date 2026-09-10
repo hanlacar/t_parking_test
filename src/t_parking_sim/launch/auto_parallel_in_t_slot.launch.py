@@ -158,7 +158,7 @@ def generate_launch_description():
             'use_sim_time': ParameterValue(use_sim_time, value_type=bool),
             'drive_scale_mps': 0.30,
             'wheel_base': wheel_base,
-            'wheel_limit_deg': 27,
+            'wheel_limit_deg': 22,
             'command_timeout_sec': 0.50,
             'publish_frequency': 20.0,
         }],

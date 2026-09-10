@@ -51,11 +51,13 @@ class RvizFakeVehicle(Node):
         self.declare_parameter('reverse_speed_mps', 0.20)
         self.declare_parameter('update_rate_hz', 20.0)
         self.declare_parameter('cusp_pause_sec', 0.5)
-        self.declare_parameter('return_pose_yaw', 0.0)
-        self.declare_parameter('return_position_tolerance', 0.05)
-        self.declare_parameter('return_yaw_tolerance', 0.05)
-        self.declare_parameter('wheel_base', 0.77)
-        self.declare_parameter('wheel_radius', 0.14)
+        self.declare_parameter('exit_goal.x', 0.0)
+        self.declare_parameter('exit_goal.y', 0.0)
+        self.declare_parameter('exit_goal.yaw', 0.0)
+        self.declare_parameter('exit_goal.position_tolerance', 0.05)
+        self.declare_parameter('exit_goal.yaw_tolerance', 0.05)
+        self.declare_parameter('wheel_base', 0.73)
+        self.declare_parameter('wheel_radius', 0.135)
 
         self.x = float(self.get_parameter('initial_pose_x').value)
         self.y = float(self.get_parameter('initial_pose_y').value)
@@ -68,12 +70,15 @@ class RvizFakeVehicle(Node):
             1.0, float(self.get_parameter('update_rate_hz').value))
         self.cusp_pause = max(
             0.0, float(self.get_parameter('cusp_pause_sec').value))
-        self.return_yaw = float(self.get_parameter('return_pose_yaw').value)
-        self.return_position_tolerance = max(
+        self.exit_goal_x = float(self.get_parameter('exit_goal.x').value)
+        self.exit_goal_y = float(self.get_parameter('exit_goal.y').value)
+        self.exit_goal_yaw = float(self.get_parameter('exit_goal.yaw').value)
+        self.exit_goal_position_tolerance = max(
             0.0, float(
-                self.get_parameter('return_position_tolerance').value))
-        self.return_yaw_tolerance = max(
-            0.0, float(self.get_parameter('return_yaw_tolerance').value))
+                self.get_parameter('exit_goal.position_tolerance').value))
+        self.exit_goal_yaw_tolerance = max(
+            0.0, float(
+                self.get_parameter('exit_goal.yaw_tolerance').value))
         self.wheel_base = float(self.get_parameter('wheel_base').value)
         self.wheel_radius = float(self.get_parameter('wheel_radius').value)
 
@@ -110,8 +115,6 @@ class RvizFakeVehicle(Node):
         self.exit_directions: List[int] = []
         self.exit_pending = False
         self.finish_pending = False
-        self.return_x = self.x
-        self.return_y = self.y
         self.linear_velocity = 0.0
         self.angular_velocity = 0.0
         self.wheel_rotation = 0.0
@@ -185,10 +188,6 @@ class RvizFakeVehicle(Node):
             self.get_logger().error('could not classify parking Path directions')
             return
 
-        # Save only the original position.  The return yaw is an independent
-        # requirement and must never be copied from the starting orientation.
-        self.return_x = self.x
-        self.return_y = self.y
         self.exit_poses = []
         self.exit_directions = []
 
@@ -199,8 +198,8 @@ class RvizFakeVehicle(Node):
         self.get_logger().info(
             f'parking Path accepted: poses={len(poses)} '
             f'forward_edges={forward_edges} reverse_edges={reverse_edges} '
-            f'cusps={cusps}; return goal=({self.return_x:.3f}, '
-            f'{self.return_y:.3f}, {self.return_yaw:.3f})')
+            f'cusps={cusps}; exit goal=({self.exit_goal_x:.3f}, '
+            f'{self.exit_goal_y:.3f}, {self.exit_goal_yaw:.3f})')
 
     def _exit_path_callback(self, message: Path) -> None:
         if len(message.poses) < 2:
@@ -218,14 +217,14 @@ class RvizFakeVehicle(Node):
 
         endpoint = poses[-1]
         position_error = math.hypot(
-            endpoint.position.x - self.return_x,
-            endpoint.position.y - self.return_y)
+            endpoint.position.x - self.exit_goal_x,
+            endpoint.position.y - self.exit_goal_y)
         yaw_error = abs(normalize_angle(
-            yaw_from_pose(endpoint) - self.return_yaw))
-        if (position_error > self.return_position_tolerance
-                or yaw_error > self.return_yaw_tolerance):
+            yaw_from_pose(endpoint) - self.exit_goal_yaw))
+        if (position_error > self.exit_goal_position_tolerance
+                or yaw_error > self.exit_goal_yaw_tolerance):
             self.get_logger().error(
-                'ForwardExit endpoint does not satisfy RETURN_POSE: '
+                'ForwardExit endpoint does not satisfy configured exit_goal: '
                 f'position_error={position_error:.4f} '
                 f'yaw_error={yaw_error:.4f}')
             self._publish_status('EXIT_PLAN_FAILED')
@@ -345,10 +344,11 @@ class RvizFakeVehicle(Node):
             return
         if self.playback_kind == 'exit':
             position_error = math.hypot(
-                self.x - self.return_x, self.y - self.return_y)
-            yaw_error = abs(normalize_angle(self.yaw - self.return_yaw))
-            if (position_error > self.return_position_tolerance
-                    or yaw_error > self.return_yaw_tolerance):
+                self.x - self.exit_goal_x, self.y - self.exit_goal_y)
+            yaw_error = abs(normalize_angle(
+                self.yaw - self.exit_goal_yaw))
+            if (position_error > self.exit_goal_position_tolerance
+                    or yaw_error > self.exit_goal_yaw_tolerance):
                 self.get_logger().error(
                     'actual return failed: '
                     f'final=({self.x:.4f}, {self.y:.4f}, {self.yaw:.4f}) '
@@ -358,7 +358,7 @@ class RvizFakeVehicle(Node):
                 self._publish_status('RETURN_VALIDATION_FAILED')
                 return
             self.get_logger().info(
-                'RETURNED_TO_START: '
+                'EXIT_GOAL_REACHED: '
                 f'final=({self.x:.4f}, {self.y:.4f}, {self.yaw:.4f}) '
                 f'position_error={position_error:.4f} '
                 f'yaw_error={yaw_error:.4f}; vehicle faces east')
@@ -417,7 +417,7 @@ class RvizFakeVehicle(Node):
         if abs(self.linear_velocity) > 1.0e-3:
             steering = math.atan(
                 self.wheel_base * self.angular_velocity / self.linear_velocity)
-            steering = max(-math.radians(27.0), min(math.radians(27.0), steering))
+            steering = max(-math.radians(22.0), min(math.radians(22.0), steering))
         self.wheel_rotation += (
             self.linear_velocity / max(1.0e-3, self.wheel_radius)
             / self.update_rate)

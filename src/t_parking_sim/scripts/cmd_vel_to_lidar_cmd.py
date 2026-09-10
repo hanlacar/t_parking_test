@@ -11,7 +11,8 @@ from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, Int32, String
+from rclpy.signals import SignalHandlerOptions
+from std_msgs.msg import Bool, Float32, Int32, Int32MultiArray, String
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,17 @@ class ConvertedCommand:
 
 ZERO_COMMAND = ConvertedCommand(0.0, 0, 0.0)
 DEFAULT_PARKING_MODES = frozenset({'T_PARK', 'PARALLEL_PARK'})
+VALID_LIDAR_DRIVE_VALUES = frozenset({-1.0, 0.0, 1.0, 2.0, 3.0})
+
+
+def validated_lidar_drive_value(value: float) -> float:
+    """Return one exact Float32 drive stage or reject it without rounding."""
+    value = float(value)
+    if not math.isfinite(value) or value not in VALID_LIDAR_DRIVE_VALUES:
+        raise ValueError(
+            f'invalid /lidar_drive value: {value!r}; '
+            'allowed values are -1.0, 0.0, 1.0, 2.0, 3.0')
+    return value
 
 
 def any_stop_active(*stop_requests: bool) -> bool:
@@ -62,7 +74,8 @@ def convert_command(
         mcu_wheel_limit_deg: int,
         stopped_speed_epsilon: float,
         forward_drive_stage: float,
-        reverse_drive_stage: float) -> ConvertedCommand:
+        reverse_drive_stage: float,
+        fault_on_steering_limit: bool = False) -> ConvertedCommand:
     """
     Convert Twist values to the established mcu_manager lidar contract.
 
@@ -72,6 +85,8 @@ def convert_command(
     sign while reversing.
     """
     if not math.isfinite(linear_x) or not math.isfinite(angular_z):
+        if fault_on_steering_limit:
+            raise ValueError('non-finite Twist is invalid for FIELD control')
         return ConvertedCommand(0.0, 0, 0.0)
 
     if abs(linear_x) < stopped_speed_epsilon:
@@ -79,6 +94,14 @@ def convert_command(
 
     steering_rad = math.atan(wheel_base * angular_z / linear_x)
     steering_deg_ros = math.degrees(steering_rad)
+    effective_limit_deg = min(
+        float(steering_limit_deg), float(mcu_wheel_limit_deg))
+    if (fault_on_steering_limit
+            and abs(steering_deg_ros) > effective_limit_deg + 1.0e-9):
+        raise ValueError(
+            'FIELD steering limit exceeded: '
+            f'required={steering_deg_ros:+.3f}deg '
+            f'limit=+/-{effective_limit_deg:.3f}deg')
     steering_deg_ros = max(
         -steering_limit_deg,
         min(steering_limit_deg, steering_deg_ros),
@@ -87,7 +110,8 @@ def convert_command(
     # Existing /lidar_wheel -> /mcu_wheel contract: -left, +right, degrees.
     wheel_deg = int(round(-steering_deg_ros))
     wheel_deg = max(-mcu_wheel_limit_deg, min(mcu_wheel_limit_deg, wheel_deg))
-    drive_stage = forward_drive_stage if linear_x > 0.0 else reverse_drive_stage
+    drive_stage = validated_lidar_drive_value(
+        forward_drive_stage if linear_x > 0.0 else reverse_drive_stage)
     return ConvertedCommand(drive_stage, wheel_deg, steering_deg_ros)
 
 
@@ -108,6 +132,7 @@ class CmdVelToLidarCmd(Node):
 
         # These values are the existing mcu_manager/mcu_bridge protocol.
         self.declare_parameter('mcu_wheel_limit_deg', 27)
+        self.declare_parameter('fault_on_steering_limit', False)
         self.declare_parameter('stopped_speed_epsilon', 0.01)
         self.declare_parameter('forward_drive_stage', 1.0)
         self.declare_parameter('reverse_drive_stage', -1.0)
@@ -116,6 +141,7 @@ class CmdVelToLidarCmd(Node):
         # Production keeps the request topic as its compatibility default.
         # BENCH overrides this with the MCU manager's applied-mode topic.
         self.declare_parameter('mode_topic', '/vehicle_mode')
+        self.declare_parameter('require_parking_mode', True)
         # The front motion detector owns this immediate 0.5 m ROI safety
         # result.  Keep it separate from the parking controller's stop so a
         # false message from either producer cannot clear the other one.
@@ -139,6 +165,8 @@ class CmdVelToLidarCmd(Node):
             self.get_parameter('steering_limit_deg').value)
         self.mcu_wheel_limit_deg = int(
             self.get_parameter('mcu_wheel_limit_deg').value)
+        self.fault_on_steering_limit = bool(
+            self.get_parameter('fault_on_steering_limit').value)
         self.stopped_speed_epsilon = float(
             self.get_parameter('stopped_speed_epsilon').value)
         self.forward_drive_stage = float(
@@ -151,6 +179,8 @@ class CmdVelToLidarCmd(Node):
         self.input_timeout_sec = float(
             self.get_parameter('input_timeout_sec').value)
         self.mode_topic = str(self.get_parameter('mode_topic').value)
+        self.require_parking_mode = bool(
+            self.get_parameter('require_parking_mode').value)
         self.lidar_safety_stop_topic = str(
             self.get_parameter('lidar_safety_stop_topic').value)
         self.parking_modes = {
@@ -188,7 +218,7 @@ class CmdVelToLidarCmd(Node):
             raise ValueError('output_frequency must be at least 4 Hz')
         if self.input_timeout_sec <= 0.0:
             raise ValueError('input_timeout_sec must be > 0')
-        if not self.mode_topic:
+        if self.require_parking_mode and not self.mode_topic:
             raise ValueError('mode_topic must not be empty')
         if not self.lidar_safety_stop_topic:
             raise ValueError('lidar_safety_stop_topic must not be empty')
@@ -201,9 +231,14 @@ class CmdVelToLidarCmd(Node):
         self.last_input_time: Optional[float] = None
         self.emergency_stop = False
         self.lidar_safety_stop = False
+        self.command_fault_latched = False
         self.current_mode = ''
         self.mode_exit_zero_until: Optional[float] = None
         self.stop_release_pending = False
+        self.active_segment_number = -1
+        self.active_segment_direction = 0
+        self.last_bench_command_log = None
+        self.last_bench_command_log_time = 0.0
 
         self.drive_publisher = self.create_publisher(
             Float32, '/lidar_drive', 10)
@@ -211,6 +246,8 @@ class CmdVelToLidarCmd(Node):
             Int32, '/lidar_wheel', 10)
         self.stop_publisher = self.create_publisher(
             Bool, '/lidar_stop', 10)
+        self.emergency_stop_publisher = self.create_publisher(
+            Bool, '/t_parking/emergency_stop_request', 10)
         self.cmd_subscription = self.create_subscription(
             Twist, self.input_topic, self._cmd_vel_callback, 10)
         self.stop_subscription = self.create_subscription(
@@ -219,8 +256,13 @@ class CmdVelToLidarCmd(Node):
         self.lidar_safety_stop_subscription = self.create_subscription(
             Bool, self.lidar_safety_stop_topic,
             self._lidar_safety_stop_callback, 10)
-        self.mode_subscription = self.create_subscription(
-            String, self.mode_topic, self._mode_callback, 10)
+        self.mode_subscription = None
+        if self.require_parking_mode:
+            self.mode_subscription = self.create_subscription(
+                String, self.mode_topic, self._mode_callback, 10)
+        self.segment_subscription = self.create_subscription(
+            Int32MultiArray, '/t_parking/active_segment',
+            self._segment_callback, 10)
         self.output_timer = self.create_timer(
             1.0 / self.output_frequency,
             self._publish_tick,
@@ -241,11 +283,15 @@ class CmdVelToLidarCmd(Node):
         self.get_logger().info(
             '[LIDAR_COMMAND] fixed output rate=%.1fHz, input timeout=%.2fs'
             % (self.output_frequency, self.input_timeout_sec))
-        self.get_logger().info(
-            '[LIDAR_COMMAND] mode source=%s' % self.mode_topic)
-        self.get_logger().info(
-            '[LIDAR_COMMAND] silent outside vehicle modes: %s'
-            % sorted(self.parking_modes))
+        if self.require_parking_mode:
+            self.get_logger().info(
+                '[LIDAR_COMMAND] mode source=%s' % self.mode_topic)
+            self.get_logger().info(
+                '[LIDAR_COMMAND] silent outside vehicle modes: %s'
+                % sorted(self.parking_modes))
+        else:
+            self.get_logger().info(
+                '[LIDAR_COMMAND] FIELD direct mode: no vehicle_mode required')
         self.get_logger().info(
             '[LIDAR_SAFETY] %s -> /lidar_stop (all vehicle modes)'
             % self.lidar_safety_stop_topic)
@@ -261,16 +307,27 @@ class CmdVelToLidarCmd(Node):
     def _cmd_vel_callback(self, msg: Twist) -> None:
         linear_x = float(msg.linear.x)
         angular_z = float(msg.angular.z)
-        converted = convert_command(
-            linear_x=linear_x,
-            angular_z=angular_z,
-            wheel_base=self.wheel_base,
-            steering_limit_deg=self.steering_limit_deg,
-            mcu_wheel_limit_deg=self.mcu_wheel_limit_deg,
-            stopped_speed_epsilon=self.stopped_speed_epsilon,
-            forward_drive_stage=self.forward_drive_stage,
-            reverse_drive_stage=self.reverse_drive_stage,
-        )
+        try:
+            converted = convert_command(
+                linear_x=linear_x,
+                angular_z=angular_z,
+                wheel_base=self.wheel_base,
+                steering_limit_deg=self.steering_limit_deg,
+                mcu_wheel_limit_deg=self.mcu_wheel_limit_deg,
+                stopped_speed_epsilon=self.stopped_speed_epsilon,
+                forward_drive_stage=self.forward_drive_stage,
+                reverse_drive_stage=self.reverse_drive_stage,
+                fault_on_steering_limit=self.fault_on_steering_limit,
+            )
+        except ValueError as exc:
+            self.current_command = ZERO_COMMAND
+            self.last_input_time = time.monotonic()
+            if not self.command_fault_latched:
+                self.command_fault_latched = True
+                self.emergency_stop_publisher.publish(Bool(data=True))
+                self.get_logger().error(
+                    f'[CMD_SPLITTER FAULT] {exc}; drive=0 wheel=0 stop=true')
+            return
         if self.bench_interlock_enabled and not self.bench_motion_allowed:
             self.current_command = ZERO_COMMAND
             if abs(linear_x) >= self.stopped_speed_epsilon:
@@ -301,7 +358,11 @@ class CmdVelToLidarCmd(Node):
         self._record_stop_transition(previous)
 
     def _stop_active(self) -> bool:
-        return any_stop_active(self.emergency_stop, self.lidar_safety_stop)
+        return any_stop_active(
+            self.emergency_stop,
+            self.lidar_safety_stop,
+            self.command_fault_latched,
+        )
 
     def _record_stop_transition(self, previous: bool) -> None:
         if previous and not self._stop_active():
@@ -345,14 +406,80 @@ class CmdVelToLidarCmd(Node):
                     '[LIDAR_COMMAND] vehicle mode %s: command output enabled'
                     % new_mode)
 
+    def _segment_callback(self, msg: Int32MultiArray) -> None:
+        if len(msg.data) < 2:
+            return
+        self.active_segment_number = int(msg.data[0])
+        self.active_segment_direction = int(msg.data[1])
+
+    @staticmethod
+    def _command_meaning(command: ConvertedCommand, stop_active: bool) -> str:
+        if stop_active:
+            return 'EMERGENCY STOP'
+        drive = (
+            'FORWARD' if command.drive_stage > 0.0
+            else 'REVERSE' if command.drive_stage < 0.0
+            else 'STOP')
+        steering = (
+            'LEFT' if command.wheel_deg < 0
+            else 'RIGHT' if command.wheel_deg > 0
+            else 'CENTER')
+        return f'{drive} + {steering}'
+
+    def _log_bench_command(
+            self, command: ConvertedCommand, stop_active: bool,
+            now: float) -> None:
+        if not self.bench_interlock_enabled:
+            return
+        key = (
+            self.active_segment_number,
+            command.drive_stage,
+            command.wheel_deg,
+            stop_active,
+        )
+        if key == self.last_bench_command_log \
+                and now - self.last_bench_command_log_time < 1.0:
+            return
+        self.last_bench_command_log = key
+        self.last_bench_command_log_time = now
+        controller = (
+            'ParkingReverse' if self.active_segment_direction < 0
+            else 'ParkingForward' if self.active_segment_direction > 0
+            else 'NONE')
+        self.get_logger().info(
+            '[BENCH CMD] '
+            f'segment={self.active_segment_number} '
+            f'controller={controller} '
+            f'drive={command.drive_stage:+.1f} '
+            f'wheel={command.wheel_deg:+d}deg '
+            f'stop={str(stop_active).lower()} '
+            f'meaning={self._command_meaning(command, stop_active)}')
+
     def _publish_stop(self, active: bool) -> None:
         self.stop_publisher.publish(Bool(data=bool(active)))
+
+    def publish_shutdown_stop(self, repeats: int = 5) -> None:
+        """Best-effort explicit stop before this command owner disappears."""
+        self.current_command = ZERO_COMMAND
+        self.last_input_time = None
+        self.emergency_stop = True
+        drive_msg = Float32(data=validated_lidar_drive_value(0.0))
+        wheel_msg = Int32(data=0)
+        for _ in range(max(1, repeats)):
+            self.wheel_publisher.publish(wheel_msg)
+            self.drive_publisher.publish(drive_msg)
+            self._publish_stop(True)
+            time.sleep(0.05)
+        self.get_logger().warning(
+            '[LIDAR_COMMAND] shutdown final: drive=0.0 wheel=0 stop=true')
 
     def _publish_tick(self) -> None:
         now = time.monotonic()
         stop_active = self._stop_active()
-        parking_active = mode_allows_lidar_commands(
-            self.current_mode, self.parking_modes)
+        parking_active = (
+            not self.require_parking_mode
+            or mode_allows_lidar_commands(
+                self.current_mode, self.parking_modes))
         exit_zero_active = (
             self.mode_exit_zero_until is not None
             and now <= self.mode_exit_zero_until)
@@ -383,7 +510,10 @@ class CmdVelToLidarCmd(Node):
             command = ZERO_COMMAND
 
         drive_msg = Float32()
-        drive_msg.data = command.drive_stage
+        # Float32 carries a numeric value, not a decimal text representation.
+        # Validate the stage immediately before publication so an internal
+        # regression can never leak a fractional or out-of-range drive value.
+        drive_msg.data = validated_lidar_drive_value(command.drive_stage)
         wheel_msg = Int32()
         wheel_msg.data = command.wheel_deg
         # Publish steering first.  Both the Gazebo bridge and mcu_manager run
@@ -392,6 +522,7 @@ class CmdVelToLidarCmd(Node):
         self.wheel_publisher.publish(wheel_msg)
         self.drive_publisher.publish(drive_msg)
         self._publish_stop(stop_active)
+        self._log_bench_command(command, stop_active, now)
         if not stop_active:
             self.stop_release_pending = False
 
@@ -408,13 +539,16 @@ class CmdVelToLidarCmd(Node):
 
 
 def main(args=None) -> None:
-    rclpy.init(args=args)
+    rclpy.init(
+        args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = CmdVelToLidarCmd()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        if rclpy.ok():
+            node.publish_shutdown_stop()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Plan and execute a Nav2-only T parking and entrance-return cycle."""
 
+from collections import deque
 import copy
 from dataclasses import dataclass
 import math
@@ -22,6 +23,7 @@ from nav2_msgs.action import ComputePathThroughPoses, FollowPath
 from nav2_msgs.msg import Costmap
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
+import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -53,6 +55,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 SLOT_UNKNOWN = 'UNKNOWN'
 SLOT_FREE = 'FREE'
 SLOT_OCCUPIED = 'OCCUPIED'
+SLOT_EXTERNAL_MAP = {
+    'slot_1': 'T_B',
+    'slot_2': 'T_A',
+}
+SLOT_EXTERNAL_NONE = 'NONE'
 
 
 @dataclass
@@ -88,6 +95,11 @@ class PlanCandidate:
     named_poses: Dict[str, PoseStamped]
     path: Path
     metrics: PathMetrics
+    approach_path: Optional[Path] = None
+    recenter_distance: float = 0.0
+    recenter_path_length: float = 0.0
+    straight_lead_distance: float = 0.0
+    recenter_heading_mode: str = 'none'
 
 
 @dataclass
@@ -113,6 +125,30 @@ class DirectionSegment:
     length: float
 
 
+@dataclass(frozen=True)
+class SlotObservation:
+    """Fail-closed live-scan classification for one configured slot."""
+
+    state: str
+    valid_frames: int
+    valid_rays: int
+    observed_ratio: float
+    obstacle_points: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class ObservationRay:
+    """One timestamped scan ray already transformed into the map frame."""
+
+    origin_x: float
+    origin_y: float
+    end_x: float
+    end_y: float
+    obstacle_return: bool
+    frame_key: str
+
+
 def yaw_from_quaternion(quaternion) -> float:
     sin_yaw = 2.0 * (
         quaternion.w * quaternion.z + quaternion.x * quaternion.y)
@@ -128,6 +164,17 @@ def normalize_angle(angle: float) -> float:
 def set_pose_yaw(pose: Pose, yaw: float) -> None:
     pose.orientation.z = math.sin(0.5 * yaw)
     pose.orientation.w = math.cos(0.5 * yaw)
+
+
+def required_steering_deg(wheel_base: float, curvature: float) -> float:
+    """Return the absolute bicycle-model steering needed for a curvature."""
+    return math.degrees(math.atan(abs(wheel_base * curvature)))
+
+
+def steering_within_command_limit(
+        wheel_base: float, curvature: float, limit_deg: float) -> bool:
+    """Return whether a planned curvature respects the command contract."""
+    return required_steering_deg(wheel_base, curvature) <= limit_deg + 1.0e-9
 
 
 class AutoTParking(Node):
@@ -148,6 +195,8 @@ class AutoTParking(Node):
         self.auto_start = bool(self.get_parameter('auto_start').value)
         self.execute_path = (
             bool(self.get_parameter('execute').value) and not self.rviz_only)
+        self.require_mcu_status = bool(
+            self.get_parameter('require_mcu_status').value)
         self.slots = [self._load_slot('slot_1'), self._load_slot('slot_2')]
 
         self.worker_lock = threading.Lock()
@@ -165,6 +214,8 @@ class AutoTParking(Node):
             String, '/t_parking/status', transient_qos)
         self.path_publisher = self.create_publisher(
             Path, '/t_parking/planned_path', transient_qos)
+        self.approach_publisher = self.create_publisher(
+            Path, '/t_parking/approach_path', transient_qos)
         self.exit_path_publisher = self.create_publisher(
             Path, '/t_parking/exit_path', transient_qos)
         self.forward_publisher = self.create_publisher(
@@ -177,6 +228,12 @@ class AutoTParking(Node):
             MarkerArray, '/t_parking/markers', transient_qos)
         self.segment_state_publisher = self.create_publisher(
             Int32MultiArray, '/t_parking/active_segment', transient_qos)
+        self.slot_state_publishers = {
+            name: self.create_publisher(
+                String, f'/t_parking/{name}_state', transient_qos)
+            for name in ('slot_1', 'slot_2')}
+        self.selected_slot_publisher = self.create_publisher(
+            String, '/t_parking/selected_slot', transient_qos)
         # A zero-only safety output for cancellation, failure, and settling
         # after Nav2 has completed a FollowPath goal.  This clears the
         # velocity smoother input; the smoother then feeds the sole
@@ -204,11 +261,24 @@ class AutoTParking(Node):
         self.rear_scan_received_at = 0.0
         self.front_scan_count = 0
         self.rear_scan_count = 0
+        observation_buffer_size = max(
+            20, int(self.get_parameter(
+                'slot_observation.buffer_frames').value))
+        self.slot_observation_active = False
+        self.slot_scan_buffers = {
+            'front': deque(maxlen=observation_buffer_size),
+            'rear': deque(maxlen=observation_buffer_size),
+        }
         self.global_costmap_count = 0
         self.local_costmap_count = 0
         self.global_costmap_received_at = 0.0
         self.local_costmap_received_at = 0.0
+        self.map_received_at = 0.0
+        self.odom_received_at = 0.0
         self.obstacle_observation_ready = False
+        self.obstacle_observation_ready_at = 0.0
+        self.obstacle_observation_counts = (0, 0, 0, 0)
+        self.pre_race_costmap_reset_at = 0.0
         self.cmd_vel_nonzero_seen = False
         self.cmd_vel_direction: Optional[str] = None
         self.last_cmd_vel = Twist()
@@ -216,9 +286,11 @@ class AutoTParking(Node):
         self.last_cmd_vel_control = Twist()
         self.last_lidar_drive = 0.0
         self.last_lidar_wheel = 0
+        self.last_lidar_stop = False
         self.bench_zero_drive_samples = 0
         self.bench_consecutive_zero_drive_samples = 0
         self.bench_consecutive_zero_wheel_samples = 0
+        self.bench_consecutive_stop_false_samples = 0
         self.bench_anchor_ready = False
         self.mcu_connected = False
         self.mcu_ready = False
@@ -232,6 +304,7 @@ class AutoTParking(Node):
         self.estop_received_at = 0.0
         self.lidar_drive_received_at = 0.0
         self.lidar_wheel_received_at = 0.0
+        self.lidar_stop_received_at = 0.0
         self.last_command_trace = 0.0
         self.reverse_motion_start_logged = False
         self.reverse_steering_start_logged = False
@@ -247,8 +320,29 @@ class AutoTParking(Node):
         self.last_stop_linear_speed = float('inf')
         self.last_stop_angular_speed = float('inf')
         self.data_lock = threading.Lock()
+        self._footprint_local_cache: Dict[
+            Tuple[float, float, float, bool],
+            List[Tuple[float, float]]] = {}
         self.readiness_lock = threading.Lock()
         self.readiness_cache: Dict[str, bool] = {}
+        self.readiness_changed = threading.Event()
+        self.readiness_last_log_at = 0.0
+        self.readiness_last_logged: Dict[str, bool] = {}
+        self.pre_race_lock = threading.Lock()
+        self.pre_race_observation_lock = threading.Lock()
+        self.pre_race_entrance_samples: List[
+            Tuple[float, float, float, float]] = []
+        self.pre_race_entrance_pose: Optional[PoseStamped] = None
+        self.pre_race_entrance_pose_at = 0.0
+        self.pre_race_preparation_started = False
+        self.pre_race_preparation_complete = False
+        self.pre_race_status_armed = True
+        self.pre_race_preparation_thread: Optional[threading.Thread] = None
+        self.planner_warmup_complete = False
+        self.planner_warmup_timings: List[Tuple[float, bool]] = []
+        self.slot_timing: Dict[str, float] = {}
+        self.slot_observation_results: Dict[str, SlotObservation] = {}
+        self.selected_slot_name = ''
 
         self.create_subscription(
             OccupancyGrid, '/map', self._map_callback, transient_qos,
@@ -294,17 +388,26 @@ class AutoTParking(Node):
                 Int32, '/lidar_wheel', self._lidar_wheel_callback, 10,
                 callback_group=self.callback_group)
             self.create_subscription(
-                Bool, '/mcu/connected', self._mcu_connected_callback, 10,
+                Bool, '/lidar_stop', self._lidar_stop_callback, 10,
                 callback_group=self.callback_group)
-            self.create_subscription(
-                Bool, '/mcu/ready', self._mcu_ready_callback, 10,
-                callback_group=self.callback_group)
-            self.create_subscription(
-                String, '/mcu/current_mode', self._mcu_mode_callback, 10,
-                callback_group=self.callback_group)
-            self.create_subscription(
-                String, '/mcu/safety_state', self._mcu_safety_callback, 10,
-                callback_group=self.callback_group)
+            if self.require_mcu_status:
+                self.create_subscription(
+                    Bool, str(self.get_parameter(
+                        'mcu_connected_topic').value),
+                    self._mcu_connected_callback, 10,
+                    callback_group=self.callback_group)
+                self.create_subscription(
+                    Bool, str(self.get_parameter('mcu_ready_topic').value),
+                    self._mcu_ready_callback, 10,
+                    callback_group=self.callback_group)
+                self.create_subscription(
+                    String, str(self.get_parameter('mcu_mode_topic').value),
+                    self._mcu_mode_callback, 10,
+                    callback_group=self.callback_group)
+                self.create_subscription(
+                    String, str(self.get_parameter('mcu_safety_topic').value),
+                    self._mcu_safety_callback, 10,
+                    callback_group=self.callback_group)
             self.create_subscription(
                 Bool, '/estop_lock', self._estop_lock_callback, 10,
                 callback_group=self.callback_group)
@@ -374,6 +477,16 @@ class AutoTParking(Node):
         self.active_motion_metrics: Optional[PathMetrics] = None
         self.active_motion_final: Optional[PoseStamped] = None
         self.forward_exit_poses: Dict[str, PoseStamped] = {}
+        self.planning_timing_lock = threading.Lock()
+        self.planning_timing: Dict[str, float] = {}
+        self.planning_request_count = 0
+        self.nav2_candidate_request_count = 0
+        self.nav2_exit_request_count = 0
+        self.exit_preplan_lock = threading.Lock()
+        self.exit_preplan_thread: Optional[threading.Thread] = None
+        self.exit_preplan_result: Optional[ForwardExitCandidate] = None
+        self.exit_preplan_error = ''
+        self.exit_preplan_elapsed_ms = 0.0
         self.state = 'WAITING'
         self.selected_candidate: Optional[PlanCandidate] = None
         self.last_feedback_log = 0.0
@@ -396,8 +509,14 @@ class AutoTParking(Node):
                 self._log_info(
                     '[BENCH ONLY - VEHICLE MUST BE OFF THE GROUND]')
         self._publish_status('WAITING')
+        self._publish_selected_slot()
         self.readiness_timer = self.create_timer(
-            1.0, self._readiness_timer_callback,
+            float(self.get_parameter('readiness_poll_period').value),
+            self._readiness_timer_callback,
+            callback_group=self.callback_group)
+        self.pre_race_pose_timer = self.create_timer(
+            float(self.get_parameter('entrance_pose_sample_interval').value),
+            self._pre_race_pose_timer_callback,
             callback_group=self.callback_group)
         if self.auto_start:
             self.create_timer(
@@ -408,15 +527,67 @@ class AutoTParking(Node):
         defaults = {
             'target_slot': 'auto', 'auto_start': True, 'execute': True,
             'rviz_only': False,
+            'plan_exit': False,
+            'fast_planning': False,
+            'preferred_candidate.slot': '',
+            'preferred_candidate.setup_offset': -1.0,
+            'preferred_candidate.entry_depth': -1.0,
+            'preferred_candidates.slot_1.setup_offset': -1.0,
+            'preferred_candidates.slot_1.entry_depth': -1.0,
+            'preferred_candidates.slot_2.setup_offset': -1.0,
+            'preferred_candidates.slot_2.entry_depth': -1.0,
+            'preplan_exit_during_parking': False,
+            'exit_cache_start_position_tolerance': 0.08,
+            'exit_cache_start_yaw_tolerance': 0.12,
+            'pre_race_readiness': False,
+            'planner_warmup_before_start': False,
+            'readiness_poll_period': 0.10,
+            'pre_race_pose_max_age': 0.50,
             'bench_mode': False,
             'wheels_off_ground': False,
             'bench_plan_exit': False,
             'robot_base_frame': 'base_link',
             'odom_topic': '/odom',
+            'mcu_connected_topic': '/arduino/connected',
+            'mcu_ready_topic': '/mcu/ready',
+            'mcu_mode_topic': '/mcu/current_mode',
+            'mcu_safety_topic': '/mcu/safety_state',
+            'require_mcu_status': True,
             'return_to_entrance': True,
             'stop_when_all_wheels_inside': True,
             'exit_mode': 'forward_right',
             'exit_planner_id': 'ForwardExit',
+            'exit_goal.x': 0.0,
+            'exit_goal.y': 0.0,
+            'exit_goal.yaw': 0.0,
+            'exit_goal.position_tolerance': 0.05,
+            'exit_goal.yaw_tolerance': 0.05,
+            'exit.slot_2.clearance_margin_candidates': [0.20, 0.40, 0.60],
+            'recenter.enabled': False,
+            'recenter.lateral_step': 0.20,
+            'recenter.max_lateral_shift': 1.50,
+            'recenter.turn_radius': 2.30,
+            'recenter.straight_lead': 0.50,
+            'recenter.longitudinal_margin': 0.30,
+            'recenter.position_tolerance': 0.05,
+            'recenter.yaw_tolerance': 0.05,
+            'recenter.join_position_tolerance': 0.002,
+            'recenter.join_yaw_tolerance': 0.01,
+            'recenter.max_heading_change_deg': 120.0,
+            'recenter.recoverable_start_max_index': 2,
+            'recenter.slot_2.correction_candidates': [
+                0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.80,
+                1.00, 1.20, 1.40, 1.50],
+            'recenter.slot_2.straight_lead_candidates': [0.0, 0.25, 0.50],
+            'recenter.slot_2.heading_modes': ['preserve', 'road'],
+            'recenter.slot_2.turn_radius': 3.00,
+            'recenter.slot_2.longitudinal_margin': 0.30,
+            'recenter.slot_2.preferred_unknown.correction': 0.0,
+            'recenter.slot_2.preferred_unknown.straight_lead': 0.25,
+            'recenter.slot_2.preferred_unknown.heading_mode': 'preserve',
+            'recenter.slot_2.preferred_geometry.correction': 0.50,
+            'recenter.slot_2.preferred_geometry.straight_lead': 0.25,
+            'recenter.slot_2.preferred_geometry.heading_mode': 'preserve',
             'require_forward_only_exit': True,
             'require_right_turn_exit': True,
             'max_reverse_distance_during_exit': 0.01,
@@ -431,11 +602,10 @@ class AutoTParking(Node):
             'opposite_start_yaw': math.pi,
             # Return to the captured start position facing east.  This is
             # intentionally independent of the captured outbound yaw=pi.
-            'rviz_return_yaw': 0.0,
             'opposite_staging_lead': 0.50,
             'opposite_setup_inset_candidates': [0.45, 0.30, 0.15, 0.0],
-            # R-slot_half_width = 1.52-0.915 = 0.605 m is the geometry-based
-            # nominal setup for the expanded real-vehicle bay.
+            # Candidate setup geometry is checked against the measured
+            # steering/radius contract and the complete swept footprint.
             'setup_offset_candidates': [0.60, 0.75, 0.90, 1.05],
             'wall_clearance': 0.08,
             'entry_depth_candidates': [0.10, 0.20, 0.30],
@@ -467,14 +637,17 @@ class AutoTParking(Node):
             'wheel_frames': [
                 'front_left_wheel_link', 'front_right_wheel_link',
                 'rear_left_wheel_link', 'rear_right_wheel_link'],
-            'wheel_radius': 0.14,
-            'wheel_base': 0.77,
-            'wheel_track': 0.67,
+            'wheel_radius': 0.135,
+            'wheel_base': 0.73,
+            'mechanical_steering_max_deg': 22.0,
+            'maximum_command_steering_deg': 22.0,
+            'front_wheel_track': 0.775,
+            'rear_wheel_track': 0.785,
             'wheel_inside_margin': 0.01,
             'wheel_inside_confirm_count': 5,
             'wheel_check_period': 0.10,
             'stop_confirm_count': 3,
-            'minimum_turning_radius': 1.52,
+            'minimum_turning_radius': 1.82,
             'curvature_tolerance_factor': 1.00,
             'minimum_reverse_length': 0.30,
             'maximum_cusps': 2,
@@ -484,6 +657,25 @@ class AutoTParking(Node):
             'obstacle_observation_frames': 10,
             'costmap_observation_updates': 3,
             'obstacle_observation_settle_time': 1.0,
+            'slot_observation.enabled': True,
+            'slot_observation.min_frames': 10,
+            'slot_observation.buffer_frames': 40,
+            'slot_observation.max_scan_age': 2.0,
+            'slot_observation.timeout': 4.0,
+            'slot_observation.min_coverage': 0.55,
+            'slot_observation.min_valid_rays': 40,
+            'slot_observation.obstacle_point_threshold': 4,
+            'slot_observation.obstacle_frame_threshold': 2,
+            'slot_observation.coverage_resolution': 0.10,
+            'slot_observation.wall_margin': 0.15,
+            'slot_observation.curb_margin': 0.20,
+            'slot_observation.lateral_clearance': 0.10,
+            'slot_observation.required_sensors': ['front', 'rear'],
+            'slot_observation.viewpoints': [
+                'nearest_slot_mouth', 'midpoint', 'farthest_slot_mouth'],
+            'slot_observation.max_viewpoints': 3,
+            'slot_observation.approach_position_tolerance': 0.15,
+            'slot_observation.preferred_free_slot': 'slot_1',
             'rear_emergency_stop_distance': 0.15,
             'rear_emergency_sector_deg': 30.0,
             'observation_odom_x': 6.50,
@@ -502,13 +694,11 @@ class AutoTParking(Node):
             'entrance_pose_yaw_stability': 0.05,
             'entrance_staging_distance': 1.0,
             'entrance_remap_timeout': 15.0,
-            'entrance_return_position_tolerance': 0.10,
-            'entrance_return_yaw_tolerance': 0.12,
             'maximum_exit_cusps': 4,
             'forward_clear_distance_candidates': [0.02, 0.07, 0.12, 0.17],
             'right_turn_lead_candidates': [0.00, 0.05, 0.10],
             'lane_merge_distance_candidates': [0.80],
-            'exit_planning_turn_radius': 1.70,
+            'exit_planning_turn_radius': 2.30,
             'final_position_tolerance': 0.08,
             'final_yaw_tolerance': 0.12,
             # Upper bound only: the strict sustained-odometry stop check
@@ -612,6 +802,7 @@ class AutoTParking(Node):
     def _map_callback(self, msg: OccupancyGrid) -> None:
         with self.data_lock:
             self.map_msg = msg
+            self.map_received_at = time.monotonic()
 
     def _global_costmap_callback(self, msg: Costmap) -> None:
         with self.data_lock:
@@ -628,18 +819,27 @@ class AutoTParking(Node):
     def _scan_callback(self, msg: LaserScan) -> None:
         with self.data_lock:
             self.front_scan_msg = msg
-            self.scan_received_at = time.monotonic()
+            received_at = time.monotonic()
+            self.scan_received_at = received_at
             self.front_scan_count += 1
+            if self.slot_observation_active:
+                self.slot_scan_buffers['front'].append(
+                    (received_at, self.front_scan_count, msg))
 
     def _rear_scan_callback(self, msg: LaserScan) -> None:
         with self.data_lock:
             self.rear_scan_msg = msg
-            self.rear_scan_received_at = time.monotonic()
+            received_at = time.monotonic()
+            self.rear_scan_received_at = received_at
             self.rear_scan_count += 1
+            if self.slot_observation_active:
+                self.slot_scan_buffers['rear'].append(
+                    (received_at, self.rear_scan_count, msg))
 
     def _odom_callback(self, msg: Odometry) -> None:
         with self.data_lock:
             self.odom_msg = msg
+            self.odom_received_at = time.monotonic()
 
     def _real_odom_callback(self, msg: Odometry) -> None:
         with self.data_lock:
@@ -753,7 +953,11 @@ class AutoTParking(Node):
                 if (abs(value) >= 2
                         and stats['first_major_lidar_wheel'] == 0):
                     stats['first_major_lidar_wheel'] = value
-                saturated = abs(value) >= 27
+                command_limit = float(self.get_parameter(
+                    'maximum_command_steering_deg').value)
+                saturated = abs(value) >= command_limit
+                if abs(value) > command_limit:
+                    stats['lidar_wheel_over_limit_samples'] += 1
                 if saturated:
                     stats['lidar_wheel_saturation_samples'] += 1
                     if not stats['lidar_wheel_saturation_active']:
@@ -775,6 +979,18 @@ class AutoTParking(Node):
                 self.reverse_steering_start_logged = True
         if log_reverse_steering:
             self._trace_command_chain('REVERSE_STEERING_ACTIVE')
+
+    def _lidar_stop_callback(self, msg: Bool) -> None:
+        if not self._runtime_ok():
+            return
+        value = bool(msg.data)
+        with self.data_lock:
+            self.last_lidar_stop = value
+            self.lidar_stop_received_at = time.monotonic()
+            if value:
+                self.bench_consecutive_stop_false_samples = 0
+            else:
+                self.bench_consecutive_stop_false_samples += 1
 
     def _mcu_connected_callback(self, msg: Bool) -> None:
         with self.data_lock:
@@ -825,6 +1041,7 @@ class AutoTParking(Node):
             cmd_control = copy.deepcopy(self.last_cmd_vel_control)
             drive = self.last_lidar_drive
             wheel = self.last_lidar_wheel
+            stop = self.last_lidar_stop
             cmd_vel = copy.deepcopy(self.last_cmd_vel)
             segment_number = self.active_segment_number
             direction = 0 if segment is None else segment.direction
@@ -836,6 +1053,7 @@ class AutoTParking(Node):
             f'cmd_vel_nav=({cmd_nav.linear.x:+.4f},{cmd_nav.angular.z:+.4f}) '
             f'cmd_vel_control=({cmd_control.linear.x:+.4f},{cmd_control.angular.z:+.4f}) '
             f'lidar_drive={drive:+.1f} lidar_wheel={wheel:+d} '
+            f'lidar_stop={str(stop).lower()} '
             f'cmd_vel=({cmd_vel.linear.x:+.4f},{cmd_vel.angular.z:+.4f})')
 
     def _record_direction_sample_locked(
@@ -996,35 +1214,47 @@ class AutoTParking(Node):
             estop = self.estop_lock
             drive = self.last_lidar_drive
             wheel = self.last_lidar_wheel
+            stop = self.last_lidar_stop
             connected_fresh = now - self.mcu_connected_received_at < 2.0
             mode_fresh = now - self.mcu_mode_received_at < 2.0
             safety_fresh = now - self.mcu_safety_received_at < 2.0
             drive_fresh = now - self.lidar_drive_received_at < 1.0
             wheel_fresh = now - self.lidar_wheel_received_at < 1.0
+            stop_fresh = now - self.lidar_stop_received_at < 1.0
             drive_zero_samples = self.bench_consecutive_zero_drive_samples
             wheel_zero_samples = self.bench_consecutive_zero_wheel_samples
+            stop_false_samples = self.bench_consecutive_stop_false_samples
         drive_publishers = len(
             self.get_publishers_info_by_topic('/lidar_drive'))
         wheel_publishers = len(
             self.get_publishers_info_by_topic('/lidar_wheel'))
+        stop_publishers = len(
+            self.get_publishers_info_by_topic('/lidar_stop'))
         checks = {
-            'mcu_connected': mcu_connected,
-            'vehicle_mode_T_PARK': mode == 'T_PARK',
-            'mcu_safety_state_OK': safety_state == 'OK',
             'estop_unlocked': not estop,
             'lidar_drive_single_publisher': drive_publishers == 1,
             'lidar_wheel_single_publisher': wheel_publishers == 1,
+            'lidar_stop_single_publisher': stop_publishers == 1,
             'lidar_drive_fresh': drive_fresh,
             'lidar_wheel_fresh': wheel_fresh,
+            'lidar_stop_fresh': stop_fresh,
             'lidar_drive_zero': abs(drive) < 1.0e-6,
             'lidar_wheel_zero': wheel == 0,
+            'lidar_stop_false': not stop,
             'lidar_drive_zero_continuous': drive_zero_samples >= 3,
             'lidar_wheel_zero_continuous': wheel_zero_samples >= 3,
+            'lidar_stop_false_continuous': stop_false_samples >= 3,
         }
         # Official MCU state topics can be event-driven. Fresh reception is a
         # startup observation requirement; later segments still require the
         # last fail-closed state values plus fresh zero command heartbeats.
-        if require_fresh_status:
+        if self.require_mcu_status:
+            checks.update({
+                'mcu_connected': mcu_connected,
+                'vehicle_mode_T_PARK': mode == 'T_PARK',
+                'mcu_safety_state_OK': safety_state == 'OK',
+            })
+        if require_fresh_status and self.require_mcu_status:
             checks.update({
                 'connected_status_fresh': connected_fresh,
                 'mode_status_fresh': mode_fresh,
@@ -1038,16 +1268,21 @@ class AutoTParking(Node):
                 'BENCH MOTION INHIBITED: physical-output preflight failed\n'
                 + '\n'.join(f'- {name}=false' for name in missing))
             return False
+        contract = (
+            'mcu_connected=true\nvehicle_mode=T_PARK\n'
+            'mcu_safety_state=OK\n'
+            if self.require_mcu_status
+            else 'field_firmware_direct_serial=true\n')
         self._log_info(
             '[BENCH MOTION PREFLIGHT]\n'
-            'mcu_connected=true\n'
-            'vehicle_mode=T_PARK\n'
-            'mcu_safety_state=OK\n'
-            'estop_lock=false\n'
+            + contract
+            + 'estop_lock=false\n'
             'lidar_drive_publishers=1\n'
             'lidar_wheel_publishers=1\n'
+            'lidar_stop_publishers=1\n'
             'lidar_drive=0.0\n'
             'lidar_wheel=0\n'
+            'lidar_stop=false\n'
             f'status_freshness_required={require_fresh_status}\n'
             f'mcu_ready_diagnostic={mcu_ready}')
         return True
@@ -1069,12 +1304,17 @@ class AutoTParking(Node):
             self.execute_path = (
                 bool(self.get_parameter('execute').value)
                 and not self.rviz_only)
+            self.require_mcu_status = bool(
+                self.get_parameter('require_mcu_status').value)
+            self.selected_slot_name = ''
+            self._publish_selected_slot()
             if self.bench_mode and not self._bench_runtime_graph_ok():
                 return False
             if self.bench_mode and self.execute_path:
                 if not self._bench_motion_preflight():
                     return False
             self.cancel_requested.clear()
+            self.pre_race_status_armed = False
             self._set_emergency_stop_request(False)
             self.cmd_vel_nonzero_seen = False
             self.cmd_vel_direction = None
@@ -1085,16 +1325,57 @@ class AutoTParking(Node):
             self.segment_execution_stats = []
             self._last_direction_sign = {}
             self.last_direction_diagnostic = {}
-            self.obstacle_observation_ready = False
+            if not bool(self.get_parameter('pre_race_readiness').value):
+                self.obstacle_observation_ready = False
             self.course_entrance_pose = None
             self.parking_wheels_inside = False
             self.wheel_inside_confirm_count = 0
             self.last_wheel_states = None
             self.last_wheel_log = 0.0
+            with self.data_lock:
+                self.slot_observation_active = False
+                for buffer in self.slot_scan_buffers.values():
+                    buffer.clear()
+            self.slot_observation_results = {}
             self.motion_phase = 'idle'
             self.active_motion_path = None
             self.active_motion_metrics = None
             self.active_motion_final = None
+            with self.planning_timing_lock:
+                self.planning_timing = {
+                    'wait_system_ms': 0.0,
+                    'slot_select_ms': 0.0,
+                    'candidate_generation_ms': 0.0,
+                    'nav2_candidate_total_ms': 0.0,
+                    'recenter_planning_ms': 0.0,
+                    'parking_validation_ms': 0.0,
+                    'footprint_validation_ms': 0.0,
+                    'exit_planning_ms': 0.0,
+                    'parking_path_ready_ms': 0.0,
+                    'total_plan_ms': 0.0,
+                }
+                self.planning_request_count = 0
+                self.nav2_candidate_request_count = 0
+                self.nav2_exit_request_count = 0
+            with self.exit_preplan_lock:
+                self.exit_preplan_result = None
+                self.exit_preplan_error = ''
+                self.exit_preplan_elapsed_ms = 0.0
+            self.exit_preplan_thread = None
+            self.slot_timing = {
+                'map_wait_ms': 0.0,
+                'costmap_wait_ms': 0.0,
+                'observation_settle_ms': 0.0,
+                'observation_frame_wait_ms': 0.0,
+                'slot_geometry_ms': 0.0,
+                'slot_occupancy_ms': 0.0,
+                'target_filter_ms': 0.0,
+                'fixed_sleep_ms': 0.0,
+                'retry_sleep_ms': 0.0,
+                'entrance_pose_ms': 0.0,
+                'wheel_tf_ms': 0.0,
+                'costmap_reset_ms': 0.0,
+            }
             self._log_info(
                 '[AUTO PARKING PARAMETERS]\n'
                 f'rviz_only={str(self.rviz_only).lower()}\n'
@@ -1102,7 +1383,8 @@ class AutoTParking(Node):
                 f'wheels_off_ground={str(self.wheels_off_ground).lower()}\n'
                 f'auto_start={str(self.auto_start).lower()}\n'
                 f'execute={str(self.execute_path).lower()}\n'
-                f'target_slot={self.target_slot}')
+                f'target_slot={self.target_slot}\n'
+                f'fast_planning={str(bool(self.get_parameter("fast_planning").value)).lower()}')
             self._worker_thread = threading.Thread(
                 target=self._run_state_machine,
                 name='t_parking_worker', daemon=False)
@@ -1120,7 +1402,19 @@ class AutoTParking(Node):
         if (thread is not None and thread.is_alive()
                 and thread is not threading.current_thread()):
             thread.join(timeout=join_timeout)
-        return thread is None or not thread.is_alive()
+        exit_thread = self.exit_preplan_thread
+        if (exit_thread is not None and exit_thread.is_alive()
+                and exit_thread is not threading.current_thread()):
+            exit_thread.join(timeout=join_timeout)
+        preparation_thread = self.pre_race_preparation_thread
+        if (preparation_thread is not None and preparation_thread.is_alive()
+                and preparation_thread is not threading.current_thread()):
+            preparation_thread.join(timeout=join_timeout)
+        return (
+            (thread is None or not thread.is_alive())
+            and (exit_thread is None or not exit_thread.is_alive())
+            and (preparation_thread is None
+                 or not preparation_thread.is_alive()))
 
     def _publish_status(self, status: str, detail: str = '') -> None:
         if not self._runtime_ok():
@@ -1133,45 +1427,159 @@ class AutoTParking(Node):
         msg.data = status if not detail else f'{status}: {detail}'
         self._safe_publish(self.status_publisher, msg)
 
+    def _timing_add(self, name: str, elapsed_ms: float) -> None:
+        with self.planning_timing_lock:
+            self.planning_timing[name] = (
+                self.planning_timing.get(name, 0.0) + elapsed_ms)
+
+    def _timing_set(self, name: str, elapsed_ms: float) -> None:
+        with self.planning_timing_lock:
+            self.planning_timing[name] = elapsed_ms
+
+    def _slot_timing_add(self, name: str, elapsed_ms: float) -> None:
+        self.slot_timing[name] = self.slot_timing.get(name, 0.0) + elapsed_ms
+
+    def _log_slot_timing(self, total_ms: float) -> None:
+        timing = dict(self.slot_timing)
+        self._log_info(
+            '[SLOT TIMING]\n'
+            f'map_wait_ms={timing.get("map_wait_ms", 0.0):.3f}\n'
+            f'costmap_wait_ms={timing.get("costmap_wait_ms", 0.0):.3f}\n'
+            f'observation_settle_ms='
+            f'{timing.get("observation_settle_ms", 0.0):.3f}\n'
+            f'observation_frame_wait_ms='
+            f'{timing.get("observation_frame_wait_ms", 0.0):.3f}\n'
+            f'slot_geometry_ms={timing.get("slot_geometry_ms", 0.0):.3f}\n'
+            f'slot_occupancy_ms={timing.get("slot_occupancy_ms", 0.0):.3f}\n'
+            f'target_filter_ms={timing.get("target_filter_ms", 0.0):.3f}\n'
+            f'fixed_sleep_ms={timing.get("fixed_sleep_ms", 0.0):.3f}\n'
+            f'retry_sleep_ms={timing.get("retry_sleep_ms", 0.0):.3f}\n'
+            f'entrance_pose_ms={timing.get("entrance_pose_ms", 0.0):.3f}\n'
+            f'wheel_tf_ms={timing.get("wheel_tf_ms", 0.0):.3f}\n'
+            f'costmap_reset_ms={timing.get("costmap_reset_ms", 0.0):.3f}\n'
+            f'total_ms={total_ms:.3f}')
+
+    def _log_planning_timing(self, stage: str) -> None:
+        started = getattr(self, '_planning_started_at', time.monotonic())
+        self._timing_set(
+            'total_plan_ms', (time.monotonic() - started) * 1000.0)
+        with self.planning_timing_lock:
+            timing = dict(self.planning_timing)
+            request_count = self.planning_request_count
+            candidate_request_count = self.nav2_candidate_request_count
+            exit_request_count = self.nav2_exit_request_count
+        parking_ms = sum(timing.get(name, 0.0) for name in (
+            'candidate_generation_ms', 'nav2_candidate_total_ms',
+            'parking_validation_ms'))
+        self._log_info(
+            '[PLANNING TIMING]\n'
+            f'stage={stage}\n'
+            f'wait_system_ms={timing.get("wait_system_ms", 0.0):.3f}\n'
+            f'slot_select_ms={timing.get("slot_select_ms", 0.0):.3f}\n'
+            f'candidate_generation_ms='
+            f'{timing.get("candidate_generation_ms", 0.0):.3f}\n'
+            f'nav2_candidate_total_ms='
+            f'{timing.get("nav2_candidate_total_ms", 0.0):.3f}\n'
+            f'recenter_planning_ms='
+            f'{timing.get("recenter_planning_ms", 0.0):.3f}\n'
+            f'parking_validation_ms='
+            f'{timing.get("parking_validation_ms", 0.0):.3f}\n'
+            f'footprint_validation_ms='
+            f'{timing.get("footprint_validation_ms", 0.0):.3f}\n'
+            f'parking_planning_ms={parking_ms:.3f}\n'
+            f'exit_planning_ms={timing.get("exit_planning_ms", 0.0):.3f}\n'
+            f'parking_path_ready_ms='
+            f'{timing.get("parking_path_ready_ms", 0.0):.3f}\n'
+            f'total_plan_ms={timing.get("total_plan_ms", 0.0):.3f}\n'
+            f'nav2_request_count={request_count}\n'
+            f'nav2_candidate_request_count={candidate_request_count}\n'
+            f'nav2_exit_request_count={exit_request_count}')
+
     def _run_state_machine(self) -> None:
         try:
+            self._planning_started_at = time.monotonic()
             if self._abort_requested():
                 return
             self._publish_status('WAIT_SYSTEM')
+            wait_started = time.monotonic()
             if not self._wait_for_system():
+                self._timing_set(
+                    'wait_system_ms',
+                    (time.monotonic() - wait_started) * 1000.0)
                 if not self._abort_requested():
                     self._fail('system readiness timeout')
                 return
+            self._timing_set(
+                'wait_system_ms',
+                (time.monotonic() - wait_started) * 1000.0)
             if self._abort_requested():
                 self._cancelled()
                 return
+            self._publish_status('STARTED')
 
+            slot_select_started = time.monotonic()
+            target_filter_started = time.monotonic()
+            requested = self.target_slot
+            if requested not in ('auto', 'slot_1', 'slot_2'):
+                self._fail(f'invalid target_slot={requested!r}')
+                return
+            slots_to_check = (
+                list(self.slots) if requested == 'auto'
+                else [slot for slot in self.slots if slot.name == requested])
+            self._slot_timing_add(
+                'target_filter_ms',
+                (time.monotonic() - target_filter_started) * 1000.0)
+
+            entrance_started = time.monotonic()
             if not self._capture_course_entrance_pose():
+                self._slot_timing_add(
+                    'entrance_pose_ms',
+                    (time.monotonic() - entrance_started) * 1000.0)
                 if self._abort_requested():
                     self._cancelled()
                 else:
                     self._fail('could not capture a stable course entrance pose')
                 return
+            self._slot_timing_add(
+                'entrance_pose_ms',
+                (time.monotonic() - entrance_started) * 1000.0)
+            wheel_tf_started = time.monotonic()
             if self._wheel_centers_map() is None:
+                self._slot_timing_add(
+                    'wheel_tf_ms',
+                    (time.monotonic() - wheel_tf_started) * 1000.0)
                 self._fail('wheel TF and base-footprint geometry are unavailable')
                 return
-
-            # ComputePathThroughPoses is called directly, so this node does
-            # not pass through Nav2 BT recovery nodes that normally clear a
-            # world-frame obstacle layer after localization changes.  Clear
-            # only the global costmap after the stable entrance pose has been
-            # captured.  The mandatory fresh scan/costmap window below then
-            # restores all current obstacles before slot classification or
-            # planning; no collision or inflation check is bypassed.
-            if (not self.rviz_only and not self.bench_mode
-                    and not self._clear_global_costmap()):
-                self._fail(
-                    'could not reset stale global obstacle data after '
-                    'localization settled')
-                return
+            self._slot_timing_add(
+                'wheel_tf_ms',
+                (time.monotonic() - wheel_tf_started) * 1000.0)
 
             self._publish_status('WAIT_MAP')
-            if self.rviz_only:
+            auto_fallback_slots: List[Slot] = []
+            if requested == 'auto':
+                if self.rviz_only or self.bench_mode:
+                    self._fail(
+                        'SLOT_OBSERVATION_UNAVAILABLE: target_slot=auto '
+                        'requires live post-stop LaserScan input')
+                    return
+                selected_slot, observation_reason = (
+                    self._run_auto_slot_observation())
+                if selected_slot is None:
+                    self._fail(observation_reason)
+                    return
+                available_slots = [selected_slot]
+                auto_fallback_slots = [
+                    slot for slot in self.slots
+                    if (slot.name != selected_slot.name
+                        and self.slot_observation_results.get(
+                            slot.name,
+                            SlotObservation(
+                                SLOT_UNKNOWN, 0, 0, 0.0, 0,
+                                'not_observed')).state == SLOT_FREE)]
+                self._log_info(
+                    f'automatic observation selected {selected_slot.name}; '
+                    'connecting to the existing validated planner')
+            elif self.rviz_only:
                 # The dry-run deliberately has no LaserScan source.  Slot
                 # geometry is still the same deterministic Slot data used by
                 # the real planner; only live occupancy classification is
@@ -1180,7 +1588,7 @@ class AutoTParking(Node):
                     map_ready = self.map_msg is not None
                     costmap_ready = self.global_costmap is not None
                 available_slots = (
-                    list(self.slots) if map_ready and costmap_ready else [])
+                    slots_to_check if map_ready and costmap_ready else [])
                 self._log_info(
                     '[RVIZ ONLY] using configured deterministic slot geometry; '
                     'LaserScan occupancy detection is disabled')
@@ -1190,16 +1598,15 @@ class AutoTParking(Node):
                     costmap_ready = (
                         self.global_costmap is not None
                         and self.local_costmap is not None)
-                available_slots = [
-                    slot for slot in self.slots
-                    if slot.name == 'slot_1' and map_ready and costmap_ready]
+                available_slots = (
+                    slots_to_check if map_ready and costmap_ready else [])
                 self._log_info(
                     '[BENCH MODE]\n'
                     'LIVE OBSTACLE VALIDATION DISABLED FOR '
                     'WHEELS-OFF-GROUND TEST ONLY')
             else:
                 self._publish_status('WAIT_OBSTACLE_OBSERVATION')
-                if not self._wait_for_stable_obstacle_observation():
+                if not self._ensure_live_observation():
                     if self._abort_requested():
                         self._cancelled()
                     else:
@@ -1208,7 +1615,7 @@ class AutoTParking(Node):
                             'did not provide a '
                             'stable obstacle observation window')
                     return
-                available_slots = self._wait_for_map_and_slots()
+                available_slots = self._wait_for_map_and_slots(slots_to_check)
             if not available_slots:
                 if self._abort_requested():
                     self._cancelled()
@@ -1217,24 +1624,38 @@ class AutoTParking(Node):
                     'parking slots are unknown, occupied, or costmaps are unavailable')
                 return
 
-            self._publish_status('SELECT_SLOT')
-            requested = self.target_slot
-            if requested not in ('auto', 'slot_1', 'slot_2'):
-                self._fail(f'invalid target_slot={requested!r}')
-                return
             if requested != 'auto':
-                available_slots = [
-                    slot for slot in available_slots if slot.name == requested]
-                if not available_slots:
-                    self._fail(f'requested {requested} is not safely available')
-                    return
+                # The auto path already published SELECT_SLOT from inside
+                # _run_auto_slot_observation for the winning viewpoint;
+                # publishing it again here would be a duplicate of the same
+                # decision event.
+                self._publish_status('SELECT_SLOT')
+            if requested != 'auto' and not available_slots:
+                self._fail(f'requested {requested} is not safely available')
+                return
+            slot_select_ms = (
+                time.monotonic() - slot_select_started) * 1000.0
+            self._timing_set(
+                'slot_select_ms', slot_select_ms)
+            self._log_slot_timing(slot_select_ms)
 
             self._publish_status('BUILD_PARKING_POSES')
             self._publish_status('PLANNING_PARKING')
             for slot in available_slots:
                 self._log_parking_geometry(slot)
             candidates = self._plan_all_candidates(available_slots)
+            if not candidates and auto_fallback_slots:
+                fallback = auto_fallback_slots[0]
+                self._log_warn(
+                    '[SLOT DECISION] preferred FREE slot failed the complete '
+                    f'parking validators; trying observed FREE {fallback.name}')
+                available_slots = [fallback]
+                self.selected_slot_name = fallback.name
+                self._publish_slot_observations(
+                    self.slot_observation_results, fallback.name)
+                candidates = self._plan_all_candidates(available_slots)
             if not candidates:
+                self._log_planning_timing('PARKING_FAILED')
                 if self._abort_requested():
                     self._cancelled()
                     return
@@ -1252,10 +1673,47 @@ class AutoTParking(Node):
                     -item.metrics.reverse_length,
                 ))
             candidate = self.selected_candidate
+            if not self._log_pose_contract(candidate):
+                self._fail('configured exit_goal is invalid')
+                return
+            self.selected_slot_name = candidate.slot.name
+            self._publish_selected_slot(candidate.slot.name)
             self._log_info(f'selected: {candidate.slot.name}')
             self._log_info(
                 f'selected {candidate.slot.name}: setup_offset='
                 f'{candidate.setup_offset:.2f}, entry_depth={candidate.entry_depth:.2f}')
+            self._log_info(
+                '[SELECTED METRICS]\n'
+                f'poses={len(candidate.path.poses)}\n'
+                f'total_length={candidate.metrics.total_length:.3f}\n'
+                f'forward_length={candidate.metrics.forward_length:.3f}\n'
+                f'reverse_length={candidate.metrics.reverse_length:.3f}\n'
+                f'cusps={candidate.metrics.cusp_count}\n'
+                f'max_curvature={candidate.metrics.max_curvature:.6f}\n'
+                f'minimum_wall_clearance='
+                f'{self._path_wall_clearance(candidate.slot, candidate.path):.3f}')
+            required_steering = required_steering_deg(
+                float(self.get_parameter('wheel_base').value),
+                candidate.metrics.max_curvature)
+            turning_radius = (
+                1.0 / candidate.metrics.max_curvature
+                if candidate.metrics.max_curvature > 1.0e-9
+                else float('inf'))
+            self._log_info(
+                '[SELECTED CANDIDATE]\n'
+                f'slot={candidate.slot.name}\n'
+                f'setup_offset={candidate.setup_offset:.3f}\n'
+                f'entry_depth={candidate.entry_depth:.3f}\n'
+                f'max_curvature={candidate.metrics.max_curvature:.6f}\n'
+                f'required_steering_deg={required_steering:.3f}\n'
+                f'turning_radius={turning_radius:.3f}\n'
+                f'path_length={candidate.metrics.total_length:.3f}\n'
+                f'cusp_count={candidate.metrics.cusp_count}\n'
+                f'recenter_used={str(candidate.approach_path is not None).lower()}\n'
+                f'recenter_distance={candidate.recenter_distance:.3f}\n'
+                f'recenter_path_length={candidate.recenter_path_length:.3f}\n'
+                f'straight_lead={candidate.straight_lead_distance:.3f}\n'
+                f'recenter_heading_mode={candidate.recenter_heading_mode}')
             for name, pose in candidate.named_poses.items():
                 self._log_info(
                     f'{name}_pose map=({pose.pose.position.x:.3f}, '
@@ -1289,12 +1747,32 @@ class AutoTParking(Node):
                         for number, segment in enumerate(segments)))
 
             self._publish_status('PLAN_VALID')
+            self._timing_set(
+                'parking_path_ready_ms',
+                (time.monotonic() - self._planning_started_at) * 1000.0)
 
             if self.rviz_only:
-                self._publish_status('PLANNING_RVIZ_RETURN')
+                plan_exit = bool(self.get_parameter('plan_exit').value)
+                legacy_return = bool(
+                    self.get_parameter('return_to_entrance').value)
+                if not (plan_exit or legacy_return):
+                    self._log_planning_timing('PARKING_READY')
+                    self._publish_status('FINISHED')
+                    self._log_info(
+                        'rviz_only: parking Paths published; '
+                        'plan_exit=false and return_to_entrance=false, so no '
+                        'exit plan or '
+                        'FollowPath/vehicle command was requested')
+                    return
+                self._publish_status('PLANNING_EXIT')
+                exit_started = time.monotonic()
                 rviz_return = self._plan_rviz_return(
                     candidate.named_poses['final'], candidate.slot)
+                self._timing_set(
+                    'exit_planning_ms',
+                    (time.monotonic() - exit_started) * 1000.0)
                 if rviz_return is None:
+                    self._log_planning_timing('EXIT_FAILED')
                     self._fail(
                         'could not build a collision-free RViz return path')
                     return
@@ -1310,16 +1788,19 @@ class AutoTParking(Node):
                     f'position_error='
                     f'{rviz_return.metrics.final_position_error:.3f}m '
                     f'yaw_error={rviz_return.metrics.final_yaw_error:.3f}rad')
-                self._publish_status('RVIZ_RETURN_PLAN_VALID')
+                self._publish_status('EXIT_PLAN_VALID')
+                self._log_planning_timing('ALL_PLANS_READY')
                 self._log_info(
                     'rviz_only: parking and planner-generated return Paths '
                     'published; fake vehicle owns visual playback and no '
                     'FollowPath or command output exists')
+                self._publish_status('FINISHED')
                 return
 
             if not self.execute_path:
                 if (self.bench_mode and not bool(self.get_parameter(
                         'bench_plan_exit').value)):
+                    self._log_planning_timing('PARKING_READY')
                     self._log_info(
                         'execute=false: BENCH parking plan validated; '
                         'no FollowPath goal or wheel motion was requested')
@@ -1335,14 +1816,21 @@ class AutoTParking(Node):
                 self._log_info(
                     '[T-PARK][EXIT PLAN] mode=plan_only '
                     'start=configured PARKED pose '
-                    'goal=captured course entrance planner=ForwardExit(DUBIN)')
+                    'goal=fixed configured exit_goal '
+                    'planner=ForwardExit(DUBIN)')
+                exit_started = time.monotonic()
                 forward_exit = self._plan_forward_right_exit(
                     parking_stop_pose, candidate.slot, use_current_start=False)
+                self._timing_set(
+                    'exit_planning_ms',
+                    (time.monotonic() - exit_started) * 1000.0)
                 if forward_exit is None:
+                    self._log_planning_timing('EXIT_FAILED')
                     self._fail('could not build a safe forward-right exit path')
                     return
                 self._publish_forward_exit_plan(forward_exit)
                 self._publish_status('FORWARD_EXIT_PLAN_VALID')
+                self._log_planning_timing('ALL_PLANS_READY')
                 self._log_info(
                     'execute=false: parking and forward-right exit plans are '
                     'validated and published; vehicle remains stopped')
@@ -1360,6 +1848,9 @@ class AutoTParking(Node):
                 self._log_info(
                     'SLAM measurements paused during FollowPath; '
                     'map->odom remains fixed')
+
+            self._log_planning_timing('PARKING_READY')
+            self._start_exit_preplan(candidate)
 
             self.parking_wheels_inside = False
             self.wheel_inside_confirm_count = 0
@@ -1422,7 +1913,16 @@ class AutoTParking(Node):
                 if not self._confirm_command_zero('FINAL ZERO'):
                     self._fail('final command zero confirmation failed')
                     return
-                self._publish_status('SUCCESS', 'return_to_entrance=false')
+                if self.bench_mode:
+                    self._log_info(
+                        '[BENCH FINISHED]\n'
+                        'final drive=0.0, wheel=0 command confirmed\n'
+                        'lidar_stop=false (normal completion; not E-stop)')
+                    self._publish_status(
+                        'FINISHED', 'return_to_entrance=false')
+                else:
+                    self._publish_status(
+                        'SUCCESS', 'return_to_entrance=false')
                 return
             if str(self.get_parameter('exit_mode').value) != 'forward_right':
                 self._fail('unsupported exit_mode; only forward_right is safe')
@@ -1430,17 +1930,28 @@ class AutoTParking(Node):
 
             self._publish_status('BUILD_FORWARD_EXIT_POSES')
             self._publish_status('PLANNING_FORWARD_EXIT')
-            self._log_info(
-                '[T-PARK][EXIT PLAN] start=validated PARKED pose '
-                'goal=captured course entrance planner=ForwardExit(DUBIN)')
-            forward_exit = self._plan_forward_right_exit(
-                parking_stop_pose, candidate.slot, use_current_start=True)
+            forward_exit = self._consume_exit_preplan(
+                parking_stop_pose, candidate.slot)
+            if forward_exit is None:
+                self._log_info(
+                    '[T-PARK][EXIT PLAN] cache_miss=true '
+                    'start=validated PARKED pose '
+                    'goal=fixed configured exit_goal '
+                    'planner=ForwardExit(DUBIN)')
+                exit_started = time.monotonic()
+                forward_exit = self._plan_forward_right_exit(
+                    parking_stop_pose, candidate.slot,
+                    use_current_start=True)
+                self._timing_set(
+                    'exit_planning_ms',
+                    (time.monotonic() - exit_started) * 1000.0)
             if forward_exit is None:
                 if self._abort_requested():
                     self._cancelled()
                 else:
                     self._fail('could not build a safe forward-right exit path')
                 return
+            self._log_planning_timing('ALL_PLANS_READY')
             self._publish_forward_exit_plan(forward_exit)
             self._publish_status('FORWARD_EXIT_PLAN_VALID')
             self._log_info(
@@ -1466,19 +1977,19 @@ class AutoTParking(Node):
                 self._fail('vehicle did not stop after forward exit path')
                 return
 
-            self._publish_status('VERIFY_ENTRANCE_RETURN')
-            position_error, yaw_error = self._verify_entrance_return()
+            self._publish_status('VERIFY_EXIT_GOAL')
+            position_error, yaw_error = self._verify_exit_goal_reached()
             if position_error > float(self.get_parameter(
-                    'entrance_return_position_tolerance').value):
+                    'exit_goal.position_tolerance').value):
                 self._fail(
-                    f'entrance return position error {position_error:.3f}m')
+                    f'exit goal position error {position_error:.3f}m')
                 return
             if yaw_error > float(self.get_parameter(
-                    'entrance_return_yaw_tolerance').value):
-                self._fail(f'entrance return yaw error {yaw_error:.3f}rad')
+                    'exit_goal.yaw_tolerance').value):
+                self._fail(f'exit goal yaw error {yaw_error:.3f}rad')
                 return
             self._publish_status(
-                'RETURNED_TO_ENTRANCE',
+                'EXIT_GOAL_REACHED',
                 f'position_error={position_error:.3f}m '
                 f'yaw_error={yaw_error:.3f}rad')
             self._log_info(
@@ -1488,9 +1999,20 @@ class AutoTParking(Node):
             if not self._confirm_command_zero('FINAL ZERO'):
                 self._fail('final command zero confirmation failed')
                 return
-            self._publish_status(
-                'SUCCESS',
-                f'position_error={position_error:.3f}m yaw_error={yaw_error:.3f}rad')
+            if self.bench_mode:
+                self._log_info(
+                    '[BENCH FINISHED]\n'
+                    'final drive=0.0, wheel=0 command confirmed\n'
+                    'lidar_stop=false (normal completion; not E-stop)')
+                self._publish_status(
+                    'FINISHED',
+                    f'position_error={position_error:.3f}m '
+                    f'yaw_error={yaw_error:.3f}rad')
+            else:
+                self._publish_status(
+                    'SUCCESS',
+                    f'position_error={position_error:.3f}m '
+                    f'yaw_error={yaw_error:.3f}rad')
         except Exception as exc:  # Keep a failed parking run fail-safe.
             if self._runtime_ok():
                 self._log_error(
@@ -1526,15 +2048,56 @@ class AutoTParking(Node):
         return response is not None and bool(response.status)
 
     def _wait_for_system(self) -> bool:
-        deadline = time.monotonic() + float(
+        started = time.monotonic()
+        deadline = started + float(
             self.get_parameter('system_wait_timeout').value)
+        milestones: Dict[str, Optional[float]] = {
+            'robot_spawned_ms': None,
+            'odom_ready_ms': None,
+            'map_ready_ms': None,
+            'map_to_base_tf_ms': None,
+            'planner_active_ms': None,
+            'compute_path_server_ms': None,
+            'global_costmap_ms': None,
+            'safety_dependencies_ms': None,
+            'pre_race_ready_ms': None,
+        }
+        retry_sleep_ms = 0.0
+        pre_race_required = bool(
+            self.get_parameter('pre_race_readiness').value)
+        readiness: Dict[str, bool] = {}
         while time.monotonic() < deadline and not self._abort_requested():
             with self.readiness_lock:
                 readiness = dict(self.readiness_cache)
-            if readiness and all(readiness.values()) and self._vehicle_stopped():
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            component_states = self._readiness_timing_states(readiness)
+            for name, ready in component_states.items():
+                if ready and milestones[name] is None:
+                    milestones[name] = elapsed_ms
+            dependencies_ready = (
+                bool(readiness) and all(readiness.values())
+                and self._vehicle_stopped())
+            if (dependencies_ready
+                    and milestones['safety_dependencies_ms'] is None):
+                milestones['safety_dependencies_ms'] = elapsed_ms
+            pre_race_ready = (
+                not pre_race_required
+                or self._pre_race_ready_now(readiness))
+            if pre_race_ready and milestones['pre_race_ready_ms'] is None:
+                milestones['pre_race_ready_ms'] = elapsed_ms
+            if dependencies_ready and pre_race_ready:
+                self._log_wait_system_timing(
+                    milestones, retry_sleep_ms,
+                    (time.monotonic() - started) * 1000.0)
                 return True
-            if not self._interruptible_sleep(0.25):
-                return False
+            sleep_started = time.monotonic()
+            self.readiness_changed.wait(timeout=0.05)
+            self.readiness_changed.clear()
+            retry_sleep_ms += (
+                time.monotonic() - sleep_started) * 1000.0
+        self._log_wait_system_timing(
+            milestones, retry_sleep_ms,
+            (time.monotonic() - started) * 1000.0)
         with self.readiness_lock:
             readiness = dict(self.readiness_cache)
         missing = [name for name, ready in readiness.items() if not ready]
@@ -1546,6 +2109,49 @@ class AutoTParking(Node):
             'system readiness timeout\nMissing:\n'
             + '\n'.join(f'- {name}' for name in missing))
         return False
+
+    @staticmethod
+    def _readiness_timing_states(
+            readiness: Dict[str, bool]) -> Dict[str, bool]:
+        robot_ready = bool(
+            readiness.get('robot_spawned')
+            or readiness.get('virtual_bench_odom'))
+        map_ready = bool(readiness.get('map') or readiness.get('saved_map'))
+        global_costmap_ready = bool(
+            readiness.get('global_costmap')
+            or readiness.get('global_costmap_static_only'))
+        return {
+            'robot_spawned_ms': robot_ready,
+            'odom_ready_ms': bool(readiness.get('odom') or robot_ready),
+            'map_ready_ms': map_ready,
+            'map_to_base_tf_ms': bool(readiness.get('map_to_base_tf')),
+            'planner_active_ms': bool(readiness.get('planner_active')),
+            'compute_path_server_ms': bool(
+                readiness.get('compute_path_server')),
+            'global_costmap_ms': global_costmap_ready,
+        }
+
+    def _log_wait_system_timing(
+            self, milestones: Dict[str, Optional[float]],
+            retry_sleep_ms: float, total_ms: float) -> None:
+        def value(name: str) -> float:
+            result = milestones.get(name)
+            return total_ms if result is None else result
+
+        self._log_info(
+            '[WAIT SYSTEM TIMING]\n'
+            f'robot_spawned_ms={value("robot_spawned_ms"):.3f}\n'
+            f'odom_ready_ms={value("odom_ready_ms"):.3f}\n'
+            f'map_ready_ms={value("map_ready_ms"):.3f}\n'
+            f'map_to_base_tf_ms={value("map_to_base_tf_ms"):.3f}\n'
+            f'planner_active_ms={value("planner_active_ms"):.3f}\n'
+            f'compute_path_server_ms={value("compute_path_server_ms"):.3f}\n'
+            f'global_costmap_ms={value("global_costmap_ms"):.3f}\n'
+            f'safety_dependencies_ms={value("safety_dependencies_ms"):.3f}\n'
+            f'pre_race_ready_ms={value("pre_race_ready_ms"):.3f}\n'
+            'fixed_sleep_ms=0.000\n'
+            f'retry_sleep_ms={retry_sleep_ms:.3f}\n'
+            f'total_ms={total_ms:.3f}')
 
     def _clear_global_costmap(self) -> bool:
         """Reset stale map-frame observations before the fresh sensor gate."""
@@ -1565,12 +2171,89 @@ class AutoTParking(Node):
         if response is None:
             self._log_error('global costmap reset failed or timed out')
             return False
+        self.pre_race_costmap_reset_at = time.monotonic()
+        self.obstacle_observation_ready = False
         self._log_info(
             '[GLOBAL COSTMAP RESET]\n'
             'reason=discard map-frame obstacle markings from before the '
             'stable entrance localization\n'
             'next_gate=fresh scans and costmap updates required')
         return True
+
+    def _ensure_live_observation(
+            self, record_slot_timing: bool = True) -> bool:
+        """Reuse a still-fresh post-reset safety window or create a new one."""
+        with self.pre_race_observation_lock:
+            if self._stable_observation_is_reusable():
+                self._log_info(
+                    '[OBSTACLE OBSERVATION CACHE]\n'
+                    'reused=true\nfixed_wait_ms=0.000')
+                return True
+            reset_started = time.monotonic()
+            if not self._clear_global_costmap():
+                if record_slot_timing:
+                    self._slot_timing_add(
+                        'costmap_reset_ms',
+                        (time.monotonic() - reset_started) * 1000.0)
+                return False
+            if record_slot_timing:
+                self._slot_timing_add(
+                    'costmap_reset_ms',
+                    (time.monotonic() - reset_started) * 1000.0)
+            return self._wait_for_stable_obstacle_observation(
+                record_slot_timing=record_slot_timing)
+
+    def _stable_observation_is_reusable(self) -> bool:
+        if not self.obstacle_observation_ready:
+            return False
+        now = time.monotonic()
+        scan_timeout = float(self.get_parameter('scan_timeout').value)
+        with self.data_lock:
+            front_scan = self.front_scan_msg
+            rear_scan = self.rear_scan_msg
+            ages = (
+                now - self.scan_received_at,
+                now - self.rear_scan_received_at,
+                now - self.global_costmap_received_at,
+                now - self.local_costmap_received_at,
+            )
+            counts = (
+                self.front_scan_count,
+                self.rear_scan_count,
+                self.global_costmap_count,
+                self.local_costmap_count,
+            )
+        if (self.pre_race_costmap_reset_at <= 0.0
+                or any(age >= scan_timeout for age in ages)
+                or any(
+                    current < accepted
+                    for current, accepted in zip(
+                        counts, self.obstacle_observation_counts))):
+            return False
+        sector_half_width = math.radians(float(
+            self.get_parameter('rear_emergency_sector_deg').value))
+        front_sector_valid, _ = self._zero_angle_scan_sector_valid(
+            front_scan, sector_half_width)
+        rear_sector_valid, _ = self._zero_angle_scan_sector_valid(
+            rear_scan, sector_half_width)
+        front_frame = (
+            front_scan.header.frame_id.lstrip('/')
+            if front_scan is not None else '')
+        rear_frame = (
+            rear_scan.header.frame_id.lstrip('/')
+            if rear_scan is not None else '')
+        return (
+            self._vehicle_stopped()
+            and front_sector_valid
+            and rear_sector_valid
+            and bool(front_frame)
+            and bool(rear_frame)
+            and self.tf_buffer.can_transform(
+                'map', front_frame, Time(),
+                timeout=Duration(seconds=0.05))
+            and self.tf_buffer.can_transform(
+                'map', rear_frame, Time(),
+                timeout=Duration(seconds=0.05)))
 
     def _readiness_timer_callback(self) -> None:
         # A timer makes readiness observable even when auto_start=false and the
@@ -1591,11 +2274,213 @@ class AutoTParking(Node):
             return
         finally:
             self.readiness_lock.release()
-        lines = ['[READINESS]']
-        lines.extend(
-            f'{name}={str(value).lower()}'
-            for name, value in readiness.items())
-        self._log_info('\n'.join(lines))
+        self.readiness_changed.set()
+        pre_race_enabled = bool(
+            self.get_parameter('pre_race_readiness').value)
+        if pre_race_enabled:
+            if all(readiness.values()) and self._pre_race_pose_is_fresh():
+                self._start_pre_race_preparation()
+        ready = (
+            bool(readiness) and all(readiness.values())
+            and self._vehicle_stopped()
+            and (not pre_race_enabled
+                 or self._pre_race_ready_now(readiness)))
+        running = (
+            self._worker_thread is not None
+            and self._worker_thread.is_alive())
+        if pre_race_enabled and self.pre_race_status_armed and not running:
+            self._publish_status('READY' if ready else 'PREPARING')
+        now = time.monotonic()
+        if (readiness != self.readiness_last_logged
+                or now - self.readiness_last_log_at >= 1.0):
+            lines = ['[READINESS]']
+            lines.extend(
+                f'{name}={str(value).lower()}'
+                for name, value in readiness.items())
+            if pre_race_enabled:
+                lines.append(f'pre_race_ready={str(ready).lower()}')
+            self._log_info('\n'.join(lines))
+            self.readiness_last_logged = dict(readiness)
+            self.readiness_last_log_at = now
+
+    def _pre_race_pose_timer_callback(self) -> None:
+        if (not self._runtime_ok()
+                or not bool(self.get_parameter('pre_race_readiness').value)):
+            return
+        # A COLD auto-start worker may already exist while it is still
+        # motionless in WAIT_SYSTEM. Continue collecting the exact same
+        # stability evidence until that gate completes; never sample through
+        # planning or any command-capable state.
+        if self.state in ('WAITING', 'PREPARING', 'READY', 'WAIT_SYSTEM'):
+            self._update_pre_race_entrance_pose()
+
+    def _update_pre_race_entrance_pose(self) -> None:
+        if not self._vehicle_stopped():
+            with self.pre_race_lock:
+                self.pre_race_entrance_samples = []
+                self.pre_race_entrance_pose = None
+            return
+        pose = self._current_map_pose()
+        if pose is None:
+            return
+        now = time.monotonic()
+        interval = max(0.02, float(self.get_parameter(
+            'entrance_pose_sample_interval').value))
+        stability_duration = max(interval, float(self.get_parameter(
+            'localization_stability_duration').value))
+        required = max(
+            max(1, int(self.get_parameter(
+                'entrance_pose_sample_count').value)),
+            int(math.ceil(stability_duration / interval)) + 1)
+        position_limit = float(self.get_parameter(
+            'entrance_pose_position_stability').value)
+        yaw_limit = float(self.get_parameter(
+            'entrance_pose_yaw_stability').value)
+        with self.pre_race_lock:
+            samples = self.pre_race_entrance_samples
+            samples.append((now, *pose))
+            # Keep more than the mathematical minimum. Timer jitter can make
+            # exactly ``required`` nominal 0.10 s samples span 4.99 s and
+            # otherwise make READY oscillate even though localization never
+            # moved. A longer already-stable window is strictly stronger.
+            self.pre_race_entrance_samples = samples[-2 * required:]
+            samples = list(self.pre_race_entrance_samples)
+            if (len(samples) < required
+                    or samples[-1][0] - samples[0][0] < stability_duration):
+                return
+            sample_count = len(samples)
+            average_x = sum(item[1] for item in samples) / sample_count
+            average_y = sum(item[2] for item in samples) / sample_count
+            average_yaw = math.atan2(
+                sum(math.sin(item[3]) for item in samples),
+                sum(math.cos(item[3]) for item in samples))
+            maximum_position_delta = max(
+                math.hypot(item[1] - average_x, item[2] - average_y)
+                for item in samples)
+            maximum_yaw_delta = max(
+                abs(normalize_angle(item[3] - average_yaw))
+                for item in samples)
+            if (maximum_position_delta > position_limit
+                    or maximum_yaw_delta > yaw_limit):
+                self.pre_race_entrance_pose = None
+                return
+            captured = PoseStamped()
+            captured.header.frame_id = 'map'
+            captured.header.stamp = self.get_clock().now().to_msg()
+            captured.pose.position.x = average_x
+            captured.pose.position.y = average_y
+            set_pose_yaw(captured.pose, average_yaw)
+            self.pre_race_entrance_pose = captured
+            self.pre_race_entrance_pose_at = now
+
+    def _pre_race_pose_is_fresh(self) -> bool:
+        maximum_age = max(0.05, float(self.get_parameter(
+            'pre_race_pose_max_age').value))
+        with self.pre_race_lock:
+            return (
+                self.pre_race_entrance_pose is not None
+                and time.monotonic() - self.pre_race_entrance_pose_at
+                <= maximum_age)
+
+    def _reuse_pre_race_entrance_pose(self) -> bool:
+        if not bool(self.get_parameter('pre_race_readiness').value):
+            return False
+        maximum_age = max(0.05, float(self.get_parameter(
+            'pre_race_pose_max_age').value))
+        with self.pre_race_lock:
+            pose = copy.deepcopy(self.pre_race_entrance_pose)
+            age = time.monotonic() - self.pre_race_entrance_pose_at
+        current = self._current_map_pose()
+        if pose is None or current is None or age > maximum_age:
+            return False
+        position_error = math.hypot(
+            current[0] - pose.pose.position.x,
+            current[1] - pose.pose.position.y)
+        yaw_error = abs(normalize_angle(
+            current[2] - yaw_from_quaternion(pose.pose.orientation)))
+        if (position_error > float(self.get_parameter(
+                'entrance_pose_position_stability').value)
+                or yaw_error > float(self.get_parameter(
+                    'entrance_pose_yaw_stability').value)
+                or not self._vehicle_stopped()):
+            return False
+        pose.header.stamp = self.get_clock().now().to_msg()
+        self.course_entrance_pose = pose
+        self._log_info(
+            '[ENTRANCE POSE CACHE]\n'
+            f'reused=true\ncache_age={age:.3f}s\n'
+            f'position_error={position_error:.6f}m\n'
+            f'yaw_error={yaw_error:.6f}rad')
+        return True
+
+    def _start_pre_race_preparation(self) -> None:
+        with self.pre_race_lock:
+            if (self.pre_race_preparation_started
+                    or self.pre_race_preparation_complete):
+                return
+            self.pre_race_preparation_started = True
+        self.pre_race_preparation_thread = threading.Thread(
+            target=self._pre_race_preparation_worker,
+            name='t_parking_pre_race', daemon=False)
+        self.pre_race_preparation_thread.start()
+
+    def _pre_race_preparation_worker(self) -> None:
+        successful = False
+        try:
+            if bool(self.get_parameter('planner_warmup_before_start').value):
+                self._run_planner_warmup()
+            else:
+                self.planner_warmup_complete = True
+            if self.rviz_only or self.bench_mode:
+                successful = True
+            else:
+                successful = self._ensure_live_observation(
+                    record_slot_timing=False)
+        finally:
+            with self.pre_race_lock:
+                self.pre_race_preparation_complete = successful
+                self.pre_race_preparation_started = successful
+            self.readiness_changed.set()
+
+    def _run_planner_warmup(self) -> None:
+        current = self._current_map_pose()
+        timings: List[Tuple[float, bool]] = []
+        if current is not None:
+            start = self._map_pose(*current)
+            for _ in range(2):
+                request_started = time.monotonic()
+                path = self._request_plan_impl(
+                    [copy.deepcopy(start)],
+                    str(self.get_parameter('planner_id').value),
+                    copy.deepcopy(start))
+                timings.append((
+                    (time.monotonic() - request_started) * 1000.0,
+                    path is not None))
+        self.planner_warmup_timings = timings
+        self.planner_warmup_complete = True
+        first = timings[0] if len(timings) > 0 else (0.0, False)
+        second = timings[1] if len(timings) > 1 else (0.0, False)
+        self._log_info(
+            '[PLANNER WARM-UP TIMING]\n'
+            f'first_request_ms={first[0]:.3f}\n'
+            f'first_success={str(first[1]).lower()}\n'
+            f'second_request_ms={second[0]:.3f}\n'
+            f'second_success={str(second[1]).lower()}\n'
+            'vehicle_command_sent=false\n'
+            'parking_candidate_selected=false')
+
+    def _pre_race_ready_now(
+            self, readiness: Optional[Dict[str, bool]] = None) -> bool:
+        if readiness is not None and (
+                not readiness or not all(readiness.values())):
+            return False
+        with self.pre_race_lock:
+            preparation_complete = self.pre_race_preparation_complete
+        if not preparation_complete or not self._pre_race_pose_is_fresh():
+            return False
+        if self.rviz_only or self.bench_mode:
+            return True
+        return self._stable_observation_is_reusable()
 
     def _readiness_snapshot(self) -> Dict[str, bool]:
         if not self._runtime_ok():
@@ -1620,10 +2505,9 @@ class AutoTParking(Node):
                 'map': map_ready,
                 'map_to_base_tf': bool(self.tf_buffer.can_transform(
                     'map', self.robot_base_frame, Time(),
-                    timeout=Duration(seconds=0.05))),
+                    timeout=Duration(seconds=0.0))),
                 'planner_active': lifecycle['planner_server'],
-                'compute_path_server': self.plan_client.wait_for_server(
-                    timeout_sec=0.05),
+                'compute_path_server': self.plan_client.server_is_ready(),
                 'global_costmap': global_costmap_ready,
             }
         if self.bench_mode:
@@ -1633,13 +2517,11 @@ class AutoTParking(Node):
                 'bench_anchor': bench_anchor_ready,
                 'map_to_base_tf': bool(self.tf_buffer.can_transform(
                     'map', self.robot_base_frame, Time(),
-                    timeout=Duration(seconds=0.05))),
+                    timeout=Duration(seconds=0.0))),
                 'planner_active': lifecycle['planner_server'],
                 'controller_active': lifecycle['controller_server'],
-                'compute_path_server': self.plan_client.wait_for_server(
-                    timeout_sec=0.05),
-                'follow_path_server': self.follow_client.wait_for_server(
-                    timeout_sec=0.05),
+                'compute_path_server': self.plan_client.server_is_ready(),
+                'follow_path_server': self.follow_client.server_is_ready(),
                 'global_costmap_static_only': global_costmap_ready,
                 'local_costmap_static_only': local_costmap_ready,
             }
@@ -1651,13 +2533,11 @@ class AutoTParking(Node):
             'map': map_ready,
             'map_to_base_tf': bool(self.tf_buffer.can_transform(
                 'map', self.robot_base_frame, Time(),
-                timeout=Duration(seconds=0.05))),
+                timeout=Duration(seconds=0.0))),
             'planner_active': lifecycle['planner_server'],
             'controller_active': lifecycle['controller_server'],
-            'compute_path_server': self.plan_client.wait_for_server(
-                timeout_sec=0.05),
-            'follow_path_server': self.follow_client.wait_for_server(
-                timeout_sec=0.05),
+            'compute_path_server': self.plan_client.server_is_ready(),
+            'follow_path_server': self.follow_client.server_is_ready(),
             'global_costmap': global_costmap_ready,
             'local_costmap': local_costmap_ready,
         }
@@ -1741,6 +2621,8 @@ class AutoTParking(Node):
             and abs(twist.angular.z) < 0.03)
 
     def _capture_course_entrance_pose(self) -> bool:
+        if self._reuse_pre_race_entrance_pose():
+            return True
         required = max(1, int(self.get_parameter(
             'entrance_pose_sample_count').value))
         interval = max(0.02, float(self.get_parameter(
@@ -1827,21 +2709,21 @@ class AutoTParking(Node):
         if current is None:
             return None
         wheel_base = float(self.get_parameter('wheel_base').value)
-        wheel_track = float(self.get_parameter('wheel_track').value)
-        if wheel_base <= 0.0 or wheel_track <= 0.0:
+        front_track = float(self.get_parameter('front_wheel_track').value)
+        rear_track = float(self.get_parameter('rear_wheel_track').value)
+        if wheel_base <= 0.0 or front_track <= 0.0 or rear_track <= 0.0:
             return None
         if self.wheel_position_source != 'geometry':
             self._log_warn(
-                'wheel-link TF unavailable; using URDF wheel-base/track '
+                'wheel-link TF unavailable; using measured axle/track '
                 f'geometry relative to map->{self.robot_base_frame}')
             self.wheel_position_source = 'geometry'
         half_base = 0.5 * wheel_base
-        half_track = 0.5 * wheel_track
         local = {
-            'front_left': (half_base, half_track),
-            'front_right': (half_base, -half_track),
-            'rear_left': (-half_base, half_track),
-            'rear_right': (-half_base, -half_track),
+            'front_left': (half_base, 0.5 * front_track),
+            'front_right': (half_base, -0.5 * front_track),
+            'rear_left': (-half_base, 0.5 * rear_track),
+            'rear_right': (-half_base, -0.5 * rear_track),
         }
         cosine = math.cos(current[2])
         sine = math.sin(current[2])
@@ -1995,22 +2877,41 @@ class AutoTParking(Node):
         self._log_info('PARKING POSITION ACCEPTED')
         return True
 
-    def _wait_for_map_and_slots(self) -> List[Slot]:
+    def _wait_for_map_and_slots(
+            self, slots: Optional[Sequence[Slot]] = None) -> List[Slot]:
+        slots_to_check = list(self.slots if slots is None else slots)
+        started = time.monotonic()
         deadline = time.monotonic() + float(
             self.get_parameter('map_wait_timeout').value)
         observation_attempted = False
         last_states = None
+        map_ready_at: Optional[float] = None
+        costmap_ready_at: Optional[float] = None
         while time.monotonic() < deadline and not self._abort_requested():
-            states = {slot.name: self._slot_state(slot) for slot in self.slots}
-            state_tuple = tuple(states[slot.name] for slot in self.slots)
+            now = time.monotonic()
+            with self.data_lock:
+                map_ready = self.map_msg is not None
+                costmap_ready = self.global_costmap is not None
+            if map_ready and map_ready_at is None:
+                map_ready_at = now
+                self._slot_timing_add(
+                    'map_wait_ms', (now - started) * 1000.0)
+            if costmap_ready and costmap_ready_at is None:
+                costmap_ready_at = now
+                self._slot_timing_add(
+                    'costmap_wait_ms', (now - started) * 1000.0)
+            states = {
+                slot.name: self._slot_state(slot) for slot in slots_to_check}
+            state_tuple = tuple(
+                states[slot.name] for slot in slots_to_check)
             if state_tuple != last_states:
                 self._log_info(
                     '[SLOT CHECK]\n' + '\n'.join(
                         f'{slot.name}: {states[slot.name]}'
-                        for slot in self.slots))
+                        for slot in slots_to_check))
                 last_states = state_tuple
             available = [
-                slot for slot in self.slots
+                slot for slot in slots_to_check
                 if states[slot.name] == SLOT_FREE]
             if available:
                 return available
@@ -2024,16 +2925,608 @@ class AutoTParking(Node):
                 self._publish_status('MAP_PARKING_BAY')
                 if not self._observe_parking_bay():
                     return []
+                fixed_sleep_started = time.monotonic()
                 if not self._interruptible_sleep(float(self.get_parameter(
                         'map_observation_settle_time').value)):
                     return []
+                self._slot_timing_add(
+                    'fixed_sleep_ms',
+                    (time.monotonic() - fixed_sleep_started) * 1000.0)
                 self.obstacle_observation_ready = False
                 if not self._wait_for_stable_obstacle_observation():
                     return []
                 continue
+            retry_started = time.monotonic()
             if not self._interruptible_sleep(0.5):
                 return []
+            self._slot_timing_add(
+                'retry_sleep_ms',
+                (time.monotonic() - retry_started) * 1000.0)
         return []
+
+    @staticmethod
+    def _slot_decision(
+            slot_1_state: str, slot_2_state: str,
+            preferred_free_slot: str) -> Tuple[str, str, bool]:
+        """Return (slot, reason, terminal) without guessing UNKNOWN."""
+        states = {
+            'slot_1': slot_1_state,
+            'slot_2': slot_2_state,
+        }
+        free = [name for name, state in states.items()
+                if state == SLOT_FREE]
+        if len(free) == 1:
+            other = 'slot_2' if free[0] == 'slot_1' else 'slot_1'
+            return free[0], f'{free[0]}=FREE,{other}={states[other]}', True
+        if len(free) == 2:
+            selected = (
+                preferred_free_slot
+                if preferred_free_slot in free else 'slot_1')
+            return selected, (
+                f'both=FREE,preferred_free_slot={selected}'), True
+        if all(state == SLOT_OCCUPIED for state in states.values()):
+            return '', 'NO_FREE_SLOT', True
+        return '', 'insufficient_observation;next_viewpoint', False
+
+    def _slot_observation_roi(
+            self, slot: Slot) -> Tuple[float, float, float, float]:
+        """Derive the useful vehicle corridor from the configured bay."""
+        side_margin = max(0.0, float(self.get_parameter(
+            'slot_observation.wall_margin').value))
+        end_margin = max(0.0, float(self.get_parameter(
+            'slot_observation.curb_margin').value))
+        lateral_clearance = max(0.0, float(self.get_parameter(
+            'slot_observation.lateral_clearance').value))
+        vehicle_width = float(self.get_parameter('vehicle_width').value)
+        half_corridor = 0.5 * vehicle_width + lateral_clearance
+        longitudinal_is_x = abs(math.cos(slot.yaw)) >= abs(
+            math.sin(slot.yaw))
+        if longitudinal_is_x:
+            min_x = slot.min_x + end_margin
+            max_x = slot.max_x - end_margin
+            min_y = max(slot.min_y + side_margin,
+                        slot.odom_y - half_corridor)
+            max_y = min(slot.max_y - side_margin,
+                        slot.odom_y + half_corridor)
+        else:
+            min_x = max(slot.min_x + side_margin,
+                        slot.odom_x - half_corridor)
+            max_x = min(slot.max_x - side_margin,
+                        slot.odom_x + half_corridor)
+            min_y = slot.min_y + end_margin
+            max_y = slot.max_y - end_margin
+        return min_x, max_x, min_y, max_y
+
+    @staticmethod
+    def _clip_ray_to_roi(
+            ray: ObservationRay,
+            roi: Tuple[float, float, float, float]
+            ) -> Optional[Tuple[float, float]]:
+        """Return entry/exit ratios for a segment clipped to an AABB."""
+        min_x, max_x, min_y, max_y = roi
+        dx = ray.end_x - ray.origin_x
+        dy = ray.end_y - ray.origin_y
+        lower = 0.0
+        upper = 1.0
+        for origin, delta, minimum, maximum in (
+                (ray.origin_x, dx, min_x, max_x),
+                (ray.origin_y, dy, min_y, max_y)):
+            if abs(delta) < 1.0e-12:
+                if origin < minimum or origin > maximum:
+                    return None
+                continue
+            first = (minimum - origin) / delta
+            second = (maximum - origin) / delta
+            if first > second:
+                first, second = second, first
+            lower = max(lower, first)
+            upper = min(upper, second)
+            if lower > upper:
+                return None
+        return lower, upper
+
+    @staticmethod
+    def _classify_slot_rays(
+            rays: Sequence[ObservationRay],
+            roi: Tuple[float, float, float, float],
+            required_frames: int, required_sensors: Sequence[str],
+            minimum_coverage: float, minimum_valid_rays: int,
+            obstacle_point_threshold: int,
+            obstacle_frame_threshold: int,
+            coverage_resolution: float) -> SlotObservation:
+        """Classify transformed rays; no saved-map cell is live evidence."""
+        min_x, max_x, min_y, max_y = roi
+        if (max_x <= min_x or max_y <= min_y
+                or coverage_resolution <= 0.0):
+            return SlotObservation(
+                SLOT_UNKNOWN, 0, 0, 0.0, 0, 'invalid_roi')
+        sensor_frames: Dict[str, set] = {
+            sensor: set() for sensor in required_sensors}
+        visible_cells = set()
+        obstacle_points = 0
+        obstacle_frames = set()
+        valid_rays = 0
+        columns = max(1, int(math.ceil(
+            (max_x - min_x) / coverage_resolution)))
+        rows = max(1, int(math.ceil(
+            (max_y - min_y) / coverage_resolution)))
+        for ray in rays:
+            sensor = ray.frame_key.split(':', 1)[0]
+            if sensor not in sensor_frames:
+                continue
+            clipped = AutoTParking._clip_ray_to_roi(ray, roi)
+            if clipped is None:
+                continue
+            sensor_frames[sensor].add(ray.frame_key)
+            valid_rays += 1
+            first, last = clipped
+            segment_length = math.hypot(
+                ray.end_x - ray.origin_x,
+                ray.end_y - ray.origin_y) * max(0.0, last - first)
+            sample_count = max(1, int(math.ceil(
+                segment_length / (0.5 * coverage_resolution))))
+            for sample_index in range(sample_count + 1):
+                ratio = first + (last - first) * (
+                    sample_index / sample_count)
+                x = ray.origin_x + ratio * (ray.end_x - ray.origin_x)
+                y = ray.origin_y + ratio * (ray.end_y - ray.origin_y)
+                column = min(columns - 1, max(0, int(
+                    (x - min_x) / coverage_resolution)))
+                row = min(rows - 1, max(0, int(
+                    (y - min_y) / coverage_resolution)))
+                visible_cells.add((column, row))
+            endpoint_inside = (
+                min_x <= ray.end_x <= max_x
+                and min_y <= ray.end_y <= max_y)
+            if ray.obstacle_return and endpoint_inside:
+                obstacle_points += 1
+                obstacle_frames.add(ray.frame_key)
+
+        frame_counts = {
+            sensor: len(frames)
+            for sensor, frames in sensor_frames.items()}
+        valid_frames = sum(frame_counts.values())
+        observed_ratio = len(visible_cells) / float(columns * rows)
+        missing = [
+            f'{sensor}={frame_counts[sensor]}/{required_frames}'
+            for sensor in required_sensors
+            if frame_counts[sensor] < required_frames]
+        if missing:
+            return SlotObservation(
+                SLOT_UNKNOWN, valid_frames, valid_rays, observed_ratio,
+                obstacle_points, 'insufficient_frames:' + ','.join(missing))
+        if (obstacle_points >= obstacle_point_threshold
+                and len(obstacle_frames) >= obstacle_frame_threshold):
+            return SlotObservation(
+                SLOT_OCCUPIED, valid_frames, valid_rays, observed_ratio,
+                obstacle_points,
+                f'live_obstacle_evidence_frames={len(obstacle_frames)}')
+        if valid_rays < minimum_valid_rays:
+            return SlotObservation(
+                SLOT_UNKNOWN, valid_frames, valid_rays, observed_ratio,
+                obstacle_points, 'insufficient_valid_rays')
+        if observed_ratio < minimum_coverage:
+            return SlotObservation(
+                SLOT_UNKNOWN, valid_frames, valid_rays, observed_ratio,
+                obstacle_points, 'insufficient_coverage')
+        return SlotObservation(
+            SLOT_FREE, valid_frames, valid_rays, observed_ratio,
+            obstacle_points, 'coverage_and_obstacle_threshold_pass')
+
+    def _scan_header_fresh(
+            self, scan: LaserScan, max_age: float) -> Tuple[bool, str]:
+        stamp_ns = (
+            int(scan.header.stamp.sec) * 1_000_000_000
+            + int(scan.header.stamp.nanosec))
+        if stamp_ns <= 0:
+            return False, 'zero_scan_stamp'
+        age = (self.get_clock().now().nanoseconds - stamp_ns) / 1.0e9
+        if age < -0.05:
+            return False, f'future_scan_stamp:{age:.3f}s'
+        if age > max_age:
+            return False, f'stale_scan_stamp:{age:.3f}s'
+        return True, 'fresh'
+
+    def _scan_to_map_rays(
+            self, sensor: str, frame_number: int, scan: LaserScan
+            ) -> Tuple[List[ObservationRay], str]:
+        frame = scan.header.frame_id.lstrip('/')
+        if not frame:
+            return [], 'missing_scan_frame'
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', frame, Time.from_msg(scan.header.stamp),
+                timeout=Duration(seconds=0.03))
+        except tf2_ros.TransformException:
+            return [], 'tf_missing_at_scan_stamp'
+        tf_yaw = yaw_from_quaternion(transform.transform.rotation)
+        origin_x = float(transform.transform.translation.x)
+        origin_y = float(transform.transform.translation.y)
+        frame_key = f'{sensor}:{frame_number}'
+        rays = []
+        for index, raw_range in enumerate(scan.ranges):
+            distance = float(raw_range)
+            obstacle_return = math.isfinite(distance)
+            if obstacle_return:
+                if not scan.range_min <= distance <= scan.range_max:
+                    continue
+            elif math.isinf(distance) and distance > 0.0:
+                distance = float(scan.range_max)
+            else:
+                continue
+            angle = tf_yaw + scan.angle_min + index * scan.angle_increment
+            rays.append(ObservationRay(
+                origin_x, origin_y,
+                origin_x + distance * math.cos(angle),
+                origin_y + distance * math.sin(angle),
+                obstacle_return, frame_key))
+        return rays, 'valid' if rays else 'no_valid_ranges'
+
+    def _evaluate_slot_scan_buffers(self) -> Dict[str, SlotObservation]:
+        now = time.monotonic()
+        max_age = float(self.get_parameter(
+            'slot_observation.max_scan_age').value)
+        required_sensors = [str(value) for value in self.get_parameter(
+            'slot_observation.required_sensors').value]
+        with self.data_lock:
+            snapshots = {
+                sensor: list(self.slot_scan_buffers.get(sensor, ()))
+                for sensor in required_sensors}
+        rays: List[ObservationRay] = []
+        failures = []
+        for sensor, frames in snapshots.items():
+            for received_at, frame_number, scan in frames:
+                if now - received_at > max_age:
+                    failures.append(f'{sensor}:stale_receive_time')
+                    continue
+                fresh, reason = self._scan_header_fresh(scan, max_age)
+                if not fresh:
+                    failures.append(f'{sensor}:{reason}')
+                    continue
+                transformed, reason = self._scan_to_map_rays(
+                    sensor, frame_number, scan)
+                if not transformed:
+                    failures.append(f'{sensor}:{reason}')
+                    continue
+                rays.extend(transformed)
+        values = {
+            'required_frames': max(1, int(self.get_parameter(
+                'slot_observation.min_frames').value)),
+            'required_sensors': required_sensors,
+            'minimum_coverage': float(self.get_parameter(
+                'slot_observation.min_coverage').value),
+            'minimum_valid_rays': int(self.get_parameter(
+                'slot_observation.min_valid_rays').value),
+            'obstacle_point_threshold': int(self.get_parameter(
+                'slot_observation.obstacle_point_threshold').value),
+            'obstacle_frame_threshold': int(self.get_parameter(
+                'slot_observation.obstacle_frame_threshold').value),
+            'coverage_resolution': float(self.get_parameter(
+                'slot_observation.coverage_resolution').value),
+        }
+        results = {
+            slot.name: self._classify_slot_rays(
+                rays, self._slot_observation_roi(slot), **values)
+            for slot in self.slots}
+        if failures and not rays:
+            reason = failures[0]
+            results = {
+                slot.name: SlotObservation(
+                    SLOT_UNKNOWN, 0, 0, 0.0, 0, reason)
+                for slot in self.slots}
+        return results
+
+    def _slot_mouth(self, slot: Slot) -> Tuple[float, float]:
+        forward_x = math.cos(slot.yaw)
+        forward_y = math.sin(slot.yaw)
+        if abs(forward_x) >= abs(forward_y):
+            return (
+                slot.max_x if forward_x > 0.0 else slot.min_x,
+                0.5 * (slot.min_y + slot.max_y))
+        return (
+            0.5 * (slot.min_x + slot.max_x),
+            slot.max_y if forward_y > 0.0 else slot.min_y)
+
+    def _observation_viewpoints(self) -> List[PoseStamped]:
+        """Build configured views from slot mouths and the road centreline."""
+        mouths = {slot.name: self._slot_mouth(slot) for slot in self.slots}
+        current = self._current_map_pose()
+        current_x = current[0] if current is not None else 0.0
+        nearest = min(
+            mouths, key=lambda name: abs(mouths[name][0] - current_x))
+        farthest = 'slot_2' if nearest == 'slot_1' else 'slot_1'
+        midpoint_x = sum(value[0] for value in mouths.values()) / len(mouths)
+        locations = {
+            'nearest_slot_mouth': mouths[nearest][0],
+            'farthest_slot_mouth': mouths[farthest][0],
+            'slot_1_mouth': mouths['slot_1'][0],
+            'slot_2_mouth': mouths['slot_2'][0],
+            'midpoint': midpoint_x,
+        }
+        yaw = (
+            yaw_from_quaternion(self.course_entrance_pose.pose.orientation)
+            if self.course_entrance_pose is not None
+            else float(self.get_parameter('opposite_start_yaw').value))
+        road_y = float(self.get_parameter('road_center_y').value)
+        configured = [str(value) for value in self.get_parameter(
+            'slot_observation.viewpoints').value]
+        maximum = max(1, int(self.get_parameter(
+            'slot_observation.max_viewpoints').value))
+        result = []
+        used = set()
+        for name in configured:
+            if name not in locations:
+                self._log_warn(
+                    f'ignoring unknown observation viewpoint {name!r}')
+                continue
+            key = round(locations[name], 6)
+            if key in used:
+                continue
+            used.add(key)
+            result.append(self._map_pose(locations[name], road_y, yaw))
+            if len(result) >= maximum:
+                break
+        return result
+
+    def _publish_slot_observations(
+            self, results: Dict[str, SlotObservation], selected: str = ''
+            ) -> None:
+        for name, result in results.items():
+            message = String()
+            message.data = result.state
+            self._safe_publish(self.slot_state_publishers[name], message)
+        self._safe_publish(
+            self.marker_publisher,
+            self._make_slot_observation_markers(results, selected))
+
+    def _publish_selected_slot(self, selected: str = '') -> None:
+        message = String()
+        message.data = SLOT_EXTERNAL_MAP.get(selected, SLOT_EXTERNAL_NONE)
+        self._safe_publish(self.selected_slot_publisher, message)
+
+    def _make_slot_observation_markers(
+            self, results: Dict[str, SlotObservation], selected: str = ''
+            ) -> MarkerArray:
+        markers = MarkerArray()
+        stamp = self.get_clock().now().to_msg()
+        colors = {
+            SLOT_FREE: ColorRGBA(r=0.1, g=1.0, b=0.2, a=0.30),
+            SLOT_OCCUPIED: ColorRGBA(r=1.0, g=0.1, b=0.1, a=0.30),
+            SLOT_UNKNOWN: ColorRGBA(r=1.0, g=0.75, b=0.1, a=0.30),
+        }
+        for index, slot in enumerate(self.slots):
+            result = results.get(slot.name, SlotObservation(
+                SLOT_UNKNOWN, 0, 0, 0.0, 0, 'not_observed'))
+            min_x, max_x, min_y, max_y = self._slot_observation_roi(slot)
+            roi = Marker()
+            roi.header.frame_id = 'map'
+            roi.header.stamp = stamp
+            roi.ns = 'slot_observation_roi'
+            roi.id = 100 + index
+            roi.type = Marker.CUBE
+            roi.action = Marker.ADD
+            roi.pose.position.x = 0.5 * (min_x + max_x)
+            roi.pose.position.y = 0.5 * (min_y + max_y)
+            roi.pose.position.z = 0.03
+            roi.pose.orientation.w = 1.0
+            roi.scale.x = max_x - min_x
+            roi.scale.y = max_y - min_y
+            roi.scale.z = 0.05
+            roi.color = colors[result.state]
+            markers.markers.append(roi)
+            label = Marker()
+            label.header = roi.header
+            label.ns = 'slot_observation_state'
+            label.id = 110 + index
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose = copy.deepcopy(roi.pose)
+            label.pose.position.z = 0.45
+            label.scale.z = 0.32
+            label.color = copy.deepcopy(colors[result.state])
+            label.color.a = 1.0
+            suffix = ' SELECTED' if selected == slot.name else ''
+            label.text = f'{slot.name}: {result.state}{suffix}'
+            markers.markers.append(label)
+        return markers
+
+    def _move_to_observation_viewpoint(
+            self, index: int, pose: PoseStamped) -> bool:
+        current = self._current_map_pose()
+        position_error = (
+            float('inf') if current is None else math.hypot(
+                current[0] - pose.pose.position.x,
+                current[1] - pose.pose.position.y))
+        tolerance = float(self.get_parameter(
+            'slot_observation.approach_position_tolerance').value)
+        already_at_view = position_error <= tolerance
+        if already_at_view:
+            stopped = self._wait_until_stopped(float(self.get_parameter(
+                'stop_wait_timeout').value))
+            self._log_info(
+                '[OBSERVATION POSE]\n'
+                f'index={index}\n'
+                f'pose=({pose.pose.position.x:.6f},'
+                f'{pose.pose.position.y:.6f},'
+                f'{yaw_from_quaternion(pose.pose.orientation):.6f})\n'
+                f'vehicle_stopped={str(stopped).lower()}\n'
+                'front_scan_fresh=false\n'
+                'rear_scan_fresh=false')
+            return stopped
+        if not self.execute_path:
+            self._log_error(
+                'automatic slot observation requires execute=true to reach '
+                f'viewpoint {index}; no actuator command was issued')
+            return False
+        path = self._request_plan([pose])
+        if path is None or len(path.poses) < 2:
+            self._log_error(
+                f'observation viewpoint {index} has no valid Nav2 path')
+            return False
+        metrics = self._analyze_path(path, pose)
+        valid, code, reason = self._validate_recenter_path(path, metrics)
+        if not valid:
+            self._log_error(
+                f'observation approach rejected: {code}: {reason}')
+            return False
+        self._safe_publish(self.approach_publisher, path)
+        if not self._execute_segmented_path(
+                path, metrics, monitor_slot=None):
+            self._log_error(f'observation viewpoint {index} execution failed')
+            return False
+        stopped = self._confirm_motion_stop('observation approach')
+        self._log_info(
+            '[OBSERVATION POSE]\n'
+            f'index={index}\n'
+            f'pose=({pose.pose.position.x:.6f},'
+            f'{pose.pose.position.y:.6f},'
+            f'{yaw_from_quaternion(pose.pose.orientation):.6f})\n'
+            f'vehicle_stopped={str(stopped).lower()}\n'
+            'front_scan_fresh=false\n'
+            'rear_scan_fresh=false')
+        return stopped
+
+    def _collect_slot_observation(
+            self, viewpoint_index: int
+            ) -> Tuple[Dict[str, SlotObservation], float]:
+        """Accumulate only scans received after the stopped-view gate."""
+        required_sensors = [str(value) for value in self.get_parameter(
+            'slot_observation.required_sensors').value]
+        required_frames = max(1, int(self.get_parameter(
+            'slot_observation.min_frames').value))
+        timeout = float(self.get_parameter(
+            'slot_observation.timeout').value)
+        with self.data_lock:
+            for buffer in self.slot_scan_buffers.values():
+                buffer.clear()
+            self.slot_observation_active = True
+        started = time.monotonic()
+        deadline = started + timeout
+        results = {
+            slot.name: SlotObservation(
+                SLOT_UNKNOWN, 0, 0, 0.0, 0, 'no_post_stop_scan')
+            for slot in self.slots}
+        try:
+            while time.monotonic() < deadline and not self._abort_requested():
+                with self.data_lock:
+                    counts = tuple(
+                        len(self.slot_scan_buffers.get(sensor, ()))
+                        for sensor in required_sensors)
+                enough_received = (
+                    len(counts) == len(required_sensors)
+                    and all(count >= required_frames for count in counts))
+                if enough_received:
+                    break
+                if not self._interruptible_sleep(0.01):
+                    break
+            results = self._evaluate_slot_scan_buffers()
+        finally:
+            with self.data_lock:
+                self.slot_observation_active = False
+                sensor_timestamps = {
+                    sensor: [
+                        received_at for received_at, _, _
+                        in self.slot_scan_buffers.get(sensor, ())]
+                    for sensor in required_sensors}
+                timestamps = [
+                    stamp for values in sensor_timestamps.values()
+                    for stamp in values]
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        span_ms = (
+            (max(timestamps) - min(timestamps)) * 1000.0
+            if len(timestamps) >= 2 else 0.0)
+        rates = {}
+        for sensor, values in sensor_timestamps.items():
+            sensor_span = (
+                max(values) - min(values) if len(values) >= 2 else 0.0)
+            rates[sensor] = (
+                (len(values) - 1) / sensor_span
+                if sensor_span > 1.0e-9 else 0.0)
+        limiting_rate = min(rates.values()) if rates else 0.0
+        expected_minimum_ms = (
+            1000.0 * (required_frames - 1) / limiting_rate
+            if limiting_rate > 1.0e-9 else float('inf'))
+        finished_at = time.monotonic()
+        sensor_fresh = {
+            sensor: bool(values) and finished_at - max(values) <= float(
+                self.get_parameter(
+                    'slot_observation.max_scan_age').value)
+            for sensor, values in sensor_timestamps.items()}
+        current = self._current_map_pose()
+        pose_text = (
+            'unavailable' if current is None
+            else f'({current[0]:.6f},{current[1]:.6f},{current[2]:.6f})')
+        self._log_info(
+            '[OBSERVATION POSE]\n'
+            f'index={viewpoint_index}\n'
+            f'pose={pose_text}\n'
+            'vehicle_stopped=true\n'
+            f'front_scan_fresh='
+            f'{str(sensor_fresh.get("front", False)).lower()}\n'
+            f'rear_scan_fresh='
+            f'{str(sensor_fresh.get("rear", False)).lower()}')
+        for slot in self.slots:
+            result = results[slot.name]
+            self._log_info(
+                '[SLOT OBSERVATION]\n'
+                f'slot={slot.name}\n'
+                f'valid_frames={result.valid_frames}\n'
+                f'valid_rays={result.valid_rays}\n'
+                f'observed_ratio={result.observed_ratio:.6f}\n'
+                f'obstacle_points={result.obstacle_points}\n'
+                f'state={result.state}\n'
+                f'reason={result.reason}\n'
+                f'viewpoint={viewpoint_index}\n'
+                f'frame_span_ms={span_ms:.3f}\n'
+                f'front_rate_hz={rates.get("front", 0.0):.3f}\n'
+                f'rear_rate_hz={rates.get("rear", 0.0):.3f}\n'
+                f'minimum_{required_frames}_frame_latency_ms='
+                f'{expected_minimum_ms:.3f}\n'
+                f'observation_latency_ms={elapsed_ms:.3f}')
+        return results, elapsed_ms
+
+    def _run_auto_slot_observation(self) -> Tuple[Optional[Slot], str]:
+        if not bool(self.get_parameter('slot_observation.enabled').value):
+            return None, 'SLOT_OBSERVATION_DISABLED'
+        viewpoints = self._observation_viewpoints()
+        if not viewpoints:
+            return None, 'SLOT_OBSERVATION_NO_VIEWPOINT'
+        preferred = str(self.get_parameter(
+            'slot_observation.preferred_free_slot').value)
+        observation_started = time.monotonic()
+        for index, pose in enumerate(viewpoints, start=1):
+            self._publish_status('OBSERVATION_APPROACH')
+            if not self._move_to_observation_viewpoint(index, pose):
+                return None, 'SLOT_OBSERVATION_APPROACH_FAILED'
+            self._publish_status('WAIT_OBSERVATION_SETTLE')
+            if not self._wait_until_stopped(float(self.get_parameter(
+                    'stop_wait_timeout').value)):
+                return None, 'SLOT_OBSERVATION_VEHICLE_NOT_STOPPED'
+            self._publish_status('OBSERVE_SLOTS')
+            results, _ = self._collect_slot_observation(index)
+            self.slot_observation_results = results
+            selected, reason, terminal = self._slot_decision(
+                results['slot_1'].state, results['slot_2'].state,
+                preferred)
+            self._publish_status('SELECT_SLOT')
+            self._publish_slot_observations(results, selected)
+            elapsed_ms = (
+                time.monotonic() - observation_started) * 1000.0
+            self._log_info(
+                '[SLOT DECISION]\n'
+                f'slot_1={results["slot_1"].state}\n'
+                f'slot_2={results["slot_2"].state}\n'
+                f'selected={selected or "NONE"}\n'
+                f'decision_reason={reason}\n'
+                f'viewpoint_count={index}\n'
+                f'elapsed_ms={elapsed_ms:.3f}')
+            if selected:
+                self.selected_slot_name = selected
+                return next(
+                    slot for slot in self.slots if slot.name == selected), reason
+            if terminal:
+                return None, reason
+        return None, 'SLOT_OBSERVATION_UNCERTAIN'
 
     def _observe_parking_bay(self) -> bool:
         pose = self._odom_pose_to_map(
@@ -2065,7 +3558,8 @@ class AutoTParking(Node):
             'parking-bay observation pass complete; vehicle stopped')
         return True
 
-    def _wait_for_stable_obstacle_observation(self) -> bool:
+    def _wait_for_stable_obstacle_observation(
+            self, record_slot_timing: bool = True) -> bool:
         """Require independent fresh lidar and costmap observations."""
         required_scans = max(1, int(self.get_parameter(
             'obstacle_observation_frames').value))
@@ -2084,6 +3578,8 @@ class AutoTParking(Node):
         front_delta = rear_delta = global_delta = local_delta = 0
         blocking_conditions: List[str] = []
         next_debug_log = started
+        observation_frames_ready_at: Optional[float] = None
+        observation_settle_ready_at: Optional[float] = None
         while time.monotonic() < deadline and not self._abort_requested():
             now = time.monotonic()
             with self.data_lock:
@@ -2150,6 +3646,13 @@ class AutoTParking(Node):
             }
             blocking_conditions = [
                 name for name, ready in conditions.items() if not ready]
+            if (all(
+                    ready for name, ready in conditions.items()
+                    if name != 'SETTLE_TIME')
+                    and observation_frames_ready_at is None):
+                observation_frames_ready_at = now
+            if settled and observation_settle_ready_at is None:
+                observation_settle_ready_at = now
 
             if now >= next_debug_log:
                 front_stamp = self._scan_stamp_text(front_scan)
@@ -2194,6 +3697,18 @@ class AutoTParking(Node):
 
             if not blocking_conditions:
                 self.obstacle_observation_ready = True
+                self.obstacle_observation_ready_at = now
+                self.obstacle_observation_counts = (
+                    front_count, rear_count, global_count, local_count)
+                if record_slot_timing:
+                    self._slot_timing_add(
+                        'observation_frame_wait_ms',
+                        ((observation_frames_ready_at or now) - started)
+                        * 1000.0)
+                    self._slot_timing_add(
+                        'observation_settle_ms',
+                        ((observation_settle_ready_at or now) - started)
+                        * 1000.0)
                 self._log_info(
                     '[OBSTACLE OBSERVATION STABLE]\n'
                     f'front_scan_frames={front_delta}\n'
@@ -2249,8 +3764,21 @@ class AutoTParking(Node):
             f'valid_samples={valid_count}/{len(sector_values)}')
 
     def _slot_state(self, slot: Slot) -> str:
+        started = time.monotonic()
+        geometry_before = self.slot_timing.get('slot_geometry_ms', 0.0)
+        state = self._slot_state_impl(slot)
+        total_ms = (time.monotonic() - started) * 1000.0
+        geometry_ms = max(
+            0.0,
+            self.slot_timing.get('slot_geometry_ms', 0.0) - geometry_before)
+        self._slot_timing_add(
+            'slot_occupancy_ms', max(0.0, total_ms - geometry_ms))
+        return state
+
+    def _slot_state_impl(self, slot: Slot) -> str:
         if not self.obstacle_observation_ready:
             return SLOT_UNKNOWN
+        geometry_started = time.monotonic()
         final_pose = self._map_pose(
             slot.odom_x, slot.odom_y, slot.yaw)
         length = float(self.get_parameter('vehicle_length').value)
@@ -2286,6 +3814,9 @@ class AutoTParking(Node):
         # Also require known free space immediately behind the parked vehicle.
         rear = self._offset_pose(final_pose, -0.70, 0.0)
         samples.extend(self._footprint_samples(rear, 0.50, width + 2.0 * clearance))
+        self._slot_timing_add(
+            'slot_geometry_ms',
+            (time.monotonic() - geometry_started) * 1000.0)
         with self.data_lock:
             map_msg = self.map_msg
             costmap = self.global_costmap
@@ -2352,6 +3883,89 @@ class AutoTParking(Node):
         pose.pose.position.z = 0.0
         set_pose_yaw(pose.pose, float(yaw))
         return pose
+
+    def _configured_exit_goal(self) -> Optional[PoseStamped]:
+        values = (
+            float(self.get_parameter('exit_goal.x').value),
+            float(self.get_parameter('exit_goal.y').value),
+            float(self.get_parameter('exit_goal.yaw').value),
+        )
+        if not all(math.isfinite(value) for value in values):
+            self._log_error(
+                'configured exit_goal contains a non-finite coordinate')
+            return None
+        return self._map_pose(*values)
+
+    def _log_pose_contract(self, candidate: PlanCandidate) -> bool:
+        if not candidate.path.poses:
+            self._log_error('cannot log pose contract for an empty parking path')
+            return False
+        exit_goal = self._configured_exit_goal()
+        if exit_goal is None:
+            return False
+        parking_start = candidate.path.poses[0]
+        parking_final = candidate.named_poses['final']
+        self._log_info(
+            '[POSE CONTRACT]\n'
+            'parking_start:\n'
+            f'x={parking_start.pose.position.x:.6f}\n'
+            f'y={parking_start.pose.position.y:.6f}\n'
+            f'yaw={yaw_from_quaternion(parking_start.pose.orientation):.6f}\n'
+            'parking_final:\n'
+            f'x={parking_final.pose.position.x:.6f}\n'
+            f'y={parking_final.pose.position.y:.6f}\n'
+            f'yaw={yaw_from_quaternion(parking_final.pose.orientation):.6f}\n'
+            'exit_goal:\n'
+            f'x={exit_goal.pose.position.x:.6f}\n'
+            f'y={exit_goal.pose.position.y:.6f}\n'
+            f'yaw={yaw_from_quaternion(exit_goal.pose.orientation):.6f}\n'
+            'exit_goal_source=config')
+        return True
+
+    def _check_and_log_exit_goal(
+            self, path: Path) -> Tuple[bool, float, float]:
+        exit_goal = self._configured_exit_goal()
+        if exit_goal is None or not path.poses:
+            self._log_info(
+                '[EXIT GOAL CHECK]\n'
+                'planned_final_x=unavailable\n'
+                'planned_final_y=unavailable\n'
+                'planned_final_yaw=unavailable\n'
+                'configured_goal_x=unavailable\n'
+                'configured_goal_y=unavailable\n'
+                'configured_goal_yaw=unavailable\n'
+                'position_error=inf\n'
+                'yaw_error=inf\n'
+                'PASS=false')
+            return False, float('inf'), float('inf')
+        final = path.poses[-1]
+        position_error = math.hypot(
+            final.pose.position.x - exit_goal.pose.position.x,
+            final.pose.position.y - exit_goal.pose.position.y)
+        yaw_error = abs(normalize_angle(
+            yaw_from_quaternion(final.pose.orientation)
+            - yaw_from_quaternion(exit_goal.pose.orientation)))
+        position_tolerance = float(self.get_parameter(
+            'exit_goal.position_tolerance').value)
+        yaw_tolerance = float(self.get_parameter(
+            'exit_goal.yaw_tolerance').value)
+        passed = (
+            position_error <= position_tolerance
+            and yaw_error <= yaw_tolerance)
+        self._log_info(
+            '[EXIT GOAL CHECK]\n'
+            f'planned_final_x={final.pose.position.x:.6f}\n'
+            f'planned_final_y={final.pose.position.y:.6f}\n'
+            f'planned_final_yaw='
+            f'{yaw_from_quaternion(final.pose.orientation):.6f}\n'
+            f'configured_goal_x={exit_goal.pose.position.x:.6f}\n'
+            f'configured_goal_y={exit_goal.pose.position.y:.6f}\n'
+            f'configured_goal_yaw='
+            f'{yaw_from_quaternion(exit_goal.pose.orientation):.6f}\n'
+            f'position_error={position_error:.6f}\n'
+            f'yaw_error={yaw_error:.6f}\n'
+            f'PASS={str(passed).lower()}')
+        return passed, position_error, yaw_error
 
     def _odom_pose_to_map(
             self, x: float, y: float, yaw: float) -> Optional[PoseStamped]:
@@ -2440,83 +4054,851 @@ class AutoTParking(Node):
         return result
 
     def _plan_all_candidates(self, slots: Sequence[Slot]) -> List[PlanCandidate]:
-        results = []
+        """Try a fully validated preferred candidate, then safely fall back."""
+        results: List[PlanCandidate] = []
+        rejection_counts: Dict[str, int] = {}
+        total_candidates = 0
         self._log_live_start_costmap_snapshot()
-        offset_parameter = 'opposite_setup_inset_candidates'
         offsets = [float(value) for value in self.get_parameter(
-            offset_parameter).value]
+            'opposite_setup_inset_candidates').value]
         depths = [float(value) for value in self.get_parameter(
             'entry_depth_candidates').value]
-        for slot in slots:
-            for setup_offset in offsets:
-                for entry_depth in depths:
-                    if self._abort_requested():
-                        return results
-                    named = self._build_named_poses(
-                        slot, setup_offset, entry_depth)
-                    if named is None:
-                        self._log_error(
-                            f'reject {slot.name} offset={setup_offset:.2f} '
-                            f'depth={entry_depth:.2f}: could not build map-frame '
-                            'parking waypoints')
-                        continue
-                    first_waypoint = named['staging']
-                    path = self._request_plan([
-                        first_waypoint, named['setup'],
-                        named['entry'], named['final']])
-                    if path is None:
-                        self._log_error(
-                            f'reject {slot.name} offset={setup_offset:.2f} '
-                            f'depth={entry_depth:.2f}: '
-                            f'{self.last_plan_failure_reason}')
-                        continue
-                    self._log_info(
-                        f'[DEBUG CANDIDATE] path received: '
-                        f'slot={slot.name} offset={setup_offset:.2f} '
-                        f'depth={entry_depth:.2f} poses={len(path.poses)}')
+        preferred_slot = str(self.get_parameter(
+            'preferred_candidate.slot').value)
+        preferred_offset = float(self.get_parameter(
+            'preferred_candidate.setup_offset').value)
+        preferred_depth = float(self.get_parameter(
+            'preferred_candidate.entry_depth').value)
+        if len(slots) == 1:
+            selected_slot = slots[0].name
+            selected_offset = float(self.get_parameter(
+                f'preferred_candidates.{selected_slot}.setup_offset').value)
+            selected_depth = float(self.get_parameter(
+                f'preferred_candidates.{selected_slot}.entry_depth').value)
+            if selected_offset >= 0.0 and selected_depth >= 0.0:
+                preferred_slot = selected_slot
+                preferred_offset = selected_offset
+                preferred_depth = selected_depth
+        fast_enabled = bool(self.get_parameter('fast_planning').value)
+        slot_by_name = {slot.name: slot for slot in slots}
+        preferred_valid = (
+            preferred_slot in slot_by_name
+            and any(abs(value - preferred_offset) < 1.0e-9 for value in offsets)
+            and any(abs(value - preferred_depth) < 1.0e-9 for value in depths))
+        preferred_key = (
+            preferred_slot, preferred_offset, preferred_depth)
 
-                    metrics = self._analyze_path(path, named['final'])
+        if fast_enabled and preferred_valid:
+            requests_before = self.planning_request_count
+            total_candidates += 1
+            candidate, code, detail = self._plan_one_candidate(
+                slot_by_name[preferred_slot], preferred_offset,
+                preferred_depth, rejection_counts)
+            fast_calls = self.planning_request_count - requests_before
+            if candidate is not None:
+                results.append(candidate)
+                self._log_info(
+                    '[FAST PLAN]\n'
+                    'preferred candidate PASS\n'
+                    f'slot={preferred_slot}\n'
+                    f'setup_offset={preferred_offset:.3f}\n'
+                    f'entry_depth={preferred_depth:.3f}\n'
+                    f'Nav2 calls={fast_calls}\n'
+                    'fallback=false')
+                self._log_info(
+                    '[APPROACH RECENTER]\n'
+                    'direct_parking_success=true\n'
+                    'recenter_used=false\n'
+                    'recenter_distance=0.000\n'
+                    'recenter_path_length=0.000')
+                self._log_candidate_summary(
+                    total_candidates, len(results), rejection_counts)
+                return results
+            self._log_info(
+                '[FAST PLAN]\n'
+                f'preferred candidate REJECT reason={code}: {detail}\n'
+                f'Nav2 calls={fast_calls}\n'
+                'fallback=true')
+            if (bool(self.get_parameter('recenter.enabled').value)
+                    and self._recenter_rejection_is_recoverable(
+                        code, detail)):
+                recentered = self._plan_recenter_candidates(
+                    slot_by_name[preferred_slot], preferred_offset,
+                    preferred_depth, code)
+                if recentered is not None:
+                    self._log_candidate_summary(
+                        total_candidates, 1, rejection_counts)
+                    return [recentered]
+        elif fast_enabled:
+            reason = (
+                'preferred candidate is unavailable for the selected slot '
+                'or is absent from the configured candidate arrays')
+            self._log_info(
+                '[FAST PLAN]\n'
+                f'preferred candidate REJECT reason=CONFIG: {reason}\n'
+                'Nav2 calls=0\n'
+                'fallback=true')
 
-                    self._log_info(
-                        f'[DEBUG CANDIDATE] analyzed: '
-                        f'total={metrics.total_length:.3f} '
-                        f'reverse={metrics.reverse_length:.3f} '
-                        f'cusps={metrics.cusp_count} '
-                        f'curvature={metrics.max_curvature:.3f}')
+        combinations = [
+            (slot, setup_offset, entry_depth, slot_index, offset_index,
+             depth_index)
+            for slot_index, slot in enumerate(slots)
+            for offset_index, setup_offset in enumerate(offsets)
+            for depth_index, entry_depth in enumerate(depths)
+        ]
+        if preferred_slot and preferred_offset >= 0.0 and preferred_depth >= 0.0:
+            combinations.sort(key=lambda item: (
+                0 if item[0].name == preferred_slot else 1,
+                abs(item[1] - preferred_offset)
+                + abs(item[2] - preferred_depth),
+                item[3], item[4], item[5]))
+            self._log_info(
+                '[CANDIDATE ORDER] '
+                'strategy=preferred_history_then_geometry_distance; '
+                'final exhaustive selection still uses '
+                'cusp_count,max_curvature,total_length,reverse_length')
 
-                    minimum_reverse = float(
-                        self.get_parameter('minimum_reverse_length').value)
-                    reverse_after_setup = self._reverse_length_after_pose(
-                        path, metrics, named['setup'])
-
-                    self._log_info(
-                        f'[DEBUG CANDIDATE] reverse_after_setup='
-                        f'{reverse_after_setup:.3f} '
-                        f'minimum={minimum_reverse:.3f}')
-                    if reverse_after_setup < minimum_reverse:
-                        self._log_info(
-                            f'reject {slot.name} offset={setup_offset:.2f} '
-                            f'depth={entry_depth:.2f}: reverse after setup '
-                            f'{reverse_after_setup:.3f}m < {minimum_reverse:.3f}m')
-                        continue
-                    valid, reason = self._validate_path(
-                        slot, named, path, metrics)
-                    if not valid:
-                        self._log_info(
-                            f'reject {slot.name} offset={setup_offset:.2f} '
-                            f'depth={entry_depth:.2f}: {reason}')
-                        continue
-                    self._log_info(
-                        f'accept {slot.name} offset={setup_offset:.2f} '
-                        f'depth={entry_depth:.2f}: poses={len(path.poses)} '
-                        f'total={metrics.total_length:.3f}m '
-                        f'reverse={metrics.reverse_length:.3f}m '
-                        f'reverse_after_setup={reverse_after_setup:.3f}m '
-                        f'cusps={metrics.cusp_count} '
-                        f'max_curvature={metrics.max_curvature:.3f} 1/m')
-                    results.append(PlanCandidate(
-                        slot, setup_offset, entry_depth, named, path, metrics))
+        for slot, setup_offset, entry_depth, _, _, _ in combinations:
+            if (fast_enabled and preferred_valid
+                    and (slot.name, setup_offset, entry_depth) == preferred_key):
+                continue
+            if self._abort_requested():
+                self._log_candidate_summary(
+                    total_candidates, len(results), rejection_counts,
+                    aborted=True)
+                return results
+            total_candidates += 1
+            candidate, _, _ = self._plan_one_candidate(
+                slot, setup_offset, entry_depth, rejection_counts)
+            if candidate is not None:
+                results.append(candidate)
+        self._log_candidate_summary(
+            total_candidates, len(results), rejection_counts)
         return results
+
+    def _recenter_rejection_is_recoverable(
+            self, code: str, detail: str) -> bool:
+        """Limit recenter recovery to geometry or the initial path fringe.
+
+        UNKNOWN and road-boundary failures away from the actual start remain
+        hard failures.  This only decides whether another fully validated
+        geometry may be requested; it does not relax unknown/collision rules.
+        """
+        if code in ('CURVATURE', 'STEERING_LIMIT'):
+            return True
+        if code not in ('UNKNOWN_SPACE', 'ROAD_BOUNDARY'):
+            return False
+        marker = 'index '
+        if marker not in detail:
+            return False
+        try:
+            reject_index = int(detail.split(marker, 1)[1].split()[0])
+        except (ValueError, IndexError):
+            return False
+        maximum = int(self.get_parameter(
+            'recenter.recoverable_start_max_index').value)
+        return 0 <= reject_index <= maximum
+
+    def _plan_recenter_candidates(
+            self, slot: Slot, setup_offset: float, entry_depth: float,
+            direct_rejection_code: str = ''
+            ) -> Optional[PlanCandidate]:
+        """Find the smallest safe continuous lane alignment before parking."""
+        if self.course_entrance_pose is None:
+            self._log_warn(
+                '[APPROACH RECENTER] unavailable: actual initial pose was '
+                'not captured')
+            return None
+        start = self._fresh_pose(self.course_entrance_pose)
+        start_yaw = yaw_from_quaternion(start.pose.orientation)
+        road_y = float(self.get_parameter('road_center_y').value)
+        lateral_to_center = road_y - start.pose.position.y
+        lateral_available = abs(lateral_to_center)
+        step = float(self.get_parameter('recenter.lateral_step').value)
+        maximum = float(self.get_parameter(
+            'recenter.max_lateral_shift').value)
+        turn_radius = float(self.get_parameter('recenter.turn_radius').value)
+        margin = float(self.get_parameter(
+            'recenter.longitudinal_margin').value)
+        straight_leads = [float(self.get_parameter(
+            'recenter.straight_lead').value)]
+        minimum_radius = float(
+            self.get_parameter('minimum_turning_radius').value)
+        if slot.name == 'slot_2':
+            configured_shifts = [float(value) for value in self.get_parameter(
+                'recenter.slot_2.correction_candidates').value]
+            straight_leads = [float(value) for value in self.get_parameter(
+                'recenter.slot_2.straight_lead_candidates').value]
+            turn_radius = float(self.get_parameter(
+                'recenter.slot_2.turn_radius').value)
+            margin = float(self.get_parameter(
+                'recenter.slot_2.longitudinal_margin').value)
+            heading_modes = [str(value) for value in self.get_parameter(
+                'recenter.slot_2.heading_modes').value]
+        else:
+            configured_shifts = []
+            heading_modes = ['preserve']
+        if (lateral_available < 1.0e-6 or step <= 0.0 or maximum <= 0.0
+                or turn_radius < minimum_radius or margin < 0.0
+                or not straight_leads
+                or any(value < 0.0 for value in straight_leads)
+                or not heading_modes
+                or any(value not in ('preserve', 'road')
+                       for value in heading_modes)):
+            self._log_warn(
+                '[APPROACH RECENTER] invalid or unnecessary geometry: '
+                f'lateral_available={lateral_available:.3f}m step={step:.3f}m '
+                f'turn_radius={turn_radius:.3f}m margin={margin:.3f}m '
+                f'straight_leads={straight_leads}')
+            return None
+
+        maximum = min(maximum, lateral_available)
+        if configured_shifts:
+            shifts = [value for value in configured_shifts
+                      if 0.0 <= value <= maximum + 1.0e-9]
+        else:
+            count = max(1, int(math.ceil(maximum / step)))
+            shifts = [min(step * index, maximum)
+                      for index in range(1, count + 1)]
+        shifts = list(dict.fromkeys(round(value, 9) for value in shifts))
+        local_center_direction = lateral_to_center * math.cos(start_yaw)
+        lateral_sign = 1.0 if local_center_direction >= 0.0 else -1.0
+        self._publish_status('PLANNING_APPROACH_RECENTER')
+
+        attempts = [
+            (lateral_shift, straight_lead, heading_mode)
+            for lateral_shift in shifts
+            for straight_lead in straight_leads
+            for heading_mode in heading_modes]
+        if slot.name == 'slot_2':
+            recovery = (
+                'unknown' if direct_rejection_code == 'UNKNOWN_SPACE'
+                else 'geometry')
+            preferred_attempt = (
+                float(self.get_parameter(
+                    f'recenter.slot_2.preferred_{recovery}.correction').value),
+                float(self.get_parameter(
+                    f'recenter.slot_2.preferred_{recovery}.straight_lead').value),
+                str(self.get_parameter(
+                    f'recenter.slot_2.preferred_{recovery}.heading_mode').value))
+            if preferred_attempt in attempts:
+                attempts.remove(preferred_attempt)
+                attempts.insert(0, preferred_attempt)
+                self._log_info(
+                    '[APPROACH RECENTER ORDER]\n'
+                    f'direct_rejection={direct_rejection_code}\n'
+                    f'preferred={preferred_attempt}\n'
+                    'strategy=validated_history_then_minimum_correction')
+        for attempt, (lateral_shift, straight_lead, heading_mode) in enumerate(
+                attempts, start=1):
+            if self._abort_requested():
+                return None
+            # Two opposite tangent arcs of radius R produce a continuous
+            # same-heading lane change. This is the shortest longitudinal
+            # distance for the requested lateral shift; the configured
+            # margin gives the lattice room to stay above the physical Rmin.
+            tangent_distance = math.sqrt(max(
+                0.0,
+                4.0 * turn_radius * lateral_shift
+                - lateral_shift * lateral_shift))
+            forward_progress = tangent_distance + margin
+            goal_yaw = start_yaw
+            if slot.name == 'slot_2' and heading_mode == 'road':
+                # Finish B's approach aligned with the configured road/parking
+                # staging heading instead of carrying an initial yaw error
+                # into the short segment immediately before staging.
+                goal_yaw = float(self.get_parameter(
+                    'opposite_start_yaw').value)
+                heading_change = abs(normalize_angle(goal_yaw - start_yaw))
+                forward_progress = max(
+                    forward_progress,
+                    turn_radius * heading_change + margin)
+            forward_progress = max(
+                forward_progress, straight_lead + margin)
+            lead = self._offset_pose(start, straight_lead, 0.0)
+            lead.header.frame_id = 'map'
+            lead.header.stamp = self.get_clock().now().to_msg()
+            straight_path = self._sample_straight_path(start, lead)
+            goal = self._offset_pose(
+                start, forward_progress, lateral_sign * lateral_shift)
+            set_pose_yaw(goal.pose, goal_yaw)
+            goal.header.frame_id = 'map'
+            goal.header.stamp = self.get_clock().now().to_msg()
+            self._log_info(
+                '[APPROACH RECENTER ATTEMPT]\n'
+                f'attempt={attempt}\n'
+                f'lateral_shift={lateral_shift:.3f}\n'
+                f'straight_lead={straight_lead:.3f}\n'
+                f'heading_mode={heading_mode}\n'
+                f'forward_progress={forward_progress:.3f}\n'
+                f'goal=({goal.pose.position.x:.6f},'
+                f'{goal.pose.position.y:.6f},'
+                f'{yaw_from_quaternion(goal.pose.orientation):.6f})')
+            local_counts: Dict[str, int] = {}
+            timing_prefix = (
+                f'recenter={lateral_shift:.2f}/'
+                f'lead={straight_lead:.2f}/'
+                f'heading={heading_mode}/')
+            straight_only_entry = (
+                abs(lateral_shift) < 1.0e-9
+                and heading_mode == 'preserve')
+            parking, parking_code, parking_reason = self._plan_one_candidate(
+                slot, setup_offset, entry_depth, local_counts,
+                start_pose=lead,
+                approach_goals=None if straight_only_entry else [goal],
+                validation_start_pose=start,
+                defer_full_validation=True,
+                timing_prefix=timing_prefix)
+            if parking is None:
+                self._log_info(
+                    '[APPROACH RECENTER REJECT]\n'
+                    f'lateral_shift={lateral_shift:.3f}\n'
+                    f'reason=PARKING_{parking_code}: {parking_reason}')
+                if parking_code not in ('CURVATURE', 'STEERING_LIMIT',
+                                        'PLANNER_FAILED'):
+                    return None
+                continue
+            join_position_error, join_yaw_error = self._path_join_errors(
+                straight_path, parking.path)
+            if (join_position_error > float(self.get_parameter(
+                    'recenter.join_position_tolerance').value)
+                    or join_yaw_error > float(self.get_parameter(
+                        'recenter.join_yaw_tolerance').value)):
+                self._log_info(
+                    '[APPROACH RECENTER REJECT]\n'
+                    f'lateral_shift={lateral_shift:.3f}\n'
+                    'reason=INVALID_GOAL: straight/Nav2 join discontinuity\n'
+                    f'join_position_error={join_position_error:.6f}\n'
+                    f'join_yaw_error={join_yaw_error:.6f}')
+                self._log_b_parking_reject(
+                    slot, setup_offset, entry_depth, 'INVALID_GOAL',
+                    'straight/Nav2 join discontinuity', None, None,
+                    'recenter', 'SUCCEEDED')
+                continue
+            combined = self._dedupe_stationary_poses(
+                self._prepend_path(straight_path, parking.path))
+            combined_metrics = self._analyze_path(
+                combined, parking.named_poses['final'])
+            combined_validation_started = time.monotonic()
+            combined_valid, combined_reason = self._validate_path(
+                slot, parking.named_poses, combined, combined_metrics)
+            self._timing_add(
+                'parking_validation_ms',
+                (time.monotonic() - combined_validation_started) * 1000.0)
+            if not combined_valid:
+                combined_code = self._candidate_reject_code(combined_reason)
+                self._log_info(
+                    '[APPROACH RECENTER REJECT]\n'
+                    f'lateral_shift={lateral_shift:.3f}\n'
+                    f'reason=COMBINED_{combined_code}: {combined_reason}')
+                self._log_b_parking_reject(
+                    slot, setup_offset, entry_depth, combined_code,
+                    combined_reason, combined_metrics, combined,
+                    'recenter', 'SUCCEEDED')
+                if combined_code not in (
+                        'CURVATURE', 'STEERING_LIMIT', 'UNKNOWN_SPACE',
+                        'ROAD_BOUNDARY', 'CUSP_LIMIT'):
+                    return None
+                continue
+            approach = (
+                straight_path if straight_only_entry
+                else self._path_prefix_through_pose(combined, goal))
+            if approach is None:
+                self._log_info(
+                    '[APPROACH RECENTER REJECT]\n'
+                    f'lateral_shift={lateral_shift:.3f}\n'
+                    'reason=INVALID_GOAL: combined path missed recenter '
+                    'waypoint')
+                self._log_b_parking_reject(
+                    slot, setup_offset, entry_depth, 'INVALID_GOAL',
+                    'combined path missed recenter waypoint',
+                    combined_metrics, combined, 'recenter', 'SUCCEEDED')
+                continue
+            approach_target = lead if straight_only_entry else goal
+            approach_metrics = self._analyze_path(approach, approach_target)
+            valid, code, reason = self._validate_recenter_path(
+                approach, approach_metrics,
+                footprint_already_validated=True)
+            if not valid:
+                self._log_info(
+                    '[APPROACH RECENTER REJECT]\n'
+                    f'lateral_shift={lateral_shift:.3f}\n'
+                    f'reason={code}: {reason}')
+                self._log_b_parking_reject(
+                    slot, setup_offset, entry_depth, code, reason,
+                    approach_metrics, approach, 'recenter', 'SUCCEEDED')
+                if code not in ('CURVATURE', 'STEERING_LIMIT',
+                                'PLANNER_FAILED', 'INVALID_GOAL',
+                                'DIRECTION'):
+                    return None
+                continue
+
+            named = {'approach_recenter': approach.poses[-1]}
+            named.update(parking.named_poses)
+            result = PlanCandidate(
+                slot, setup_offset, entry_depth, named, combined,
+                combined_metrics, approach, lateral_shift,
+                approach_metrics.total_length, straight_lead, heading_mode)
+            wheel_base = float(self.get_parameter('wheel_base').value)
+            steering = required_steering_deg(
+                wheel_base, combined_metrics.max_curvature)
+            radius = (
+                1.0 / combined_metrics.max_curvature
+                if combined_metrics.max_curvature > 1.0e-9
+                else float('inf'))
+            self._log_info(
+                '[APPROACH RECENTER]\n'
+                'direct_parking_success=false\n'
+                'recenter_used=true\n'
+                f'recenter_distance={lateral_shift:.3f}\n'
+                f'recenter_path_length={approach_metrics.total_length:.3f}\n'
+                f'straight_lead={straight_lead:.3f}\n'
+                f'heading_mode={heading_mode}\n'
+                f'total_path_length={combined_metrics.total_length:.3f}\n'
+                'join_mode=exact_straight_to_nav2_pose\n'
+                f'join_position_error={join_position_error:.6f}\n'
+                f'join_yaw_error={join_yaw_error:.6f}\n'
+                f'max_steering_deg={steering:.3f}\n'
+                f'minimum_turning_radius={radius:.3f}\n'
+                'map_collision=false\n'
+                'footprint_collision=false\n'
+                'unknown_collision=false\n'
+                'result=PASS')
+            return result
+
+        self._log_info(
+            '[APPROACH RECENTER]\n'
+            'direct_parking_success=false\n'
+            'recenter_used=false\n'
+            'result=FAILED\n'
+            'detail=no minimum-distance recenter candidate passed all '
+            'validators; exhaustive direct fallback remains enabled')
+        return None
+
+    def _sample_straight_path(
+            self, start: PoseStamped, end: PoseStamped) -> Path:
+        """Sample an exact zero-steering forward lead at map resolution."""
+        path = Path()
+        path.header.frame_id = 'map'
+        path.header.stamp = self.get_clock().now().to_msg()
+        distance = math.hypot(
+            end.pose.position.x - start.pose.position.x,
+            end.pose.position.y - start.pose.position.y)
+        count = max(1, int(math.ceil(distance / 0.05)))
+        yaw = yaw_from_quaternion(start.pose.orientation)
+        for index in range(count + 1):
+            ratio = index / count
+            pose = PoseStamped()
+            pose.header = path.header
+            pose.pose.position.x = (
+                start.pose.position.x
+                + ratio * (end.pose.position.x - start.pose.position.x))
+            pose.pose.position.y = (
+                start.pose.position.y
+                + ratio * (end.pose.position.y - start.pose.position.y))
+            set_pose_yaw(pose.pose, yaw)
+            path.poses.append(pose)
+        return path
+
+    @staticmethod
+    def _prepend_path(prefix: Path, suffix: Path) -> Path:
+        """Join paths requested from the exact same boundary pose."""
+        combined = Path()
+        combined.header = suffix.header
+        combined.poses = list(prefix.poses)
+        combined.poses.extend(suffix.poses[1:])
+        return combined
+
+    @staticmethod
+    def _path_join_errors(prefix: Path, suffix: Path) -> Tuple[float, float]:
+        """Measure the exact boundary continuity before dropping a duplicate."""
+        if not prefix.poses or not suffix.poses:
+            return float('inf'), float('inf')
+        first = prefix.poses[-1]
+        second = suffix.poses[0]
+        return (
+            math.hypot(
+                first.pose.position.x - second.pose.position.x,
+                first.pose.position.y - second.pose.position.y),
+            abs(normalize_angle(
+                yaw_from_quaternion(first.pose.orientation)
+                - yaw_from_quaternion(second.pose.orientation))),
+        )
+
+    def _path_prefix_through_pose(
+            self, path: Path, waypoint: PoseStamped) -> Optional[Path]:
+        """Extract the continuous prefix ending at a requested waypoint."""
+        if not path.poses:
+            return None
+        index = min(range(len(path.poses)), key=lambda item: math.hypot(
+            path.poses[item].pose.position.x - waypoint.pose.position.x,
+            path.poses[item].pose.position.y - waypoint.pose.position.y))
+        endpoint = path.poses[index]
+        position_error = math.hypot(
+            endpoint.pose.position.x - waypoint.pose.position.x,
+            endpoint.pose.position.y - waypoint.pose.position.y)
+        yaw_error = abs(normalize_angle(
+            yaw_from_quaternion(endpoint.pose.orientation)
+            - yaw_from_quaternion(waypoint.pose.orientation)))
+        if (position_error > float(self.get_parameter(
+                'recenter.position_tolerance').value)
+                or yaw_error > float(self.get_parameter(
+                    'recenter.yaw_tolerance').value)):
+            return None
+        prefix = Path()
+        prefix.header = path.header
+        prefix.poses = list(path.poses[:index + 1])
+        return prefix
+
+    def _validate_recenter_path(
+            self, path: Path, metrics: PathMetrics,
+            footprint_already_validated: bool = False
+            ) -> Tuple[bool, str, str]:
+        """Apply the unchanged steering/radius and collision contract."""
+        if len(path.poses) < 2:
+            return False, 'INVALID_GOAL', 'path has fewer than two poses'
+        directions = [value for value in metrics.directions if value != 0]
+        if not directions or any(value < 0 for value in directions):
+            return False, 'DIRECTION', 'recenter path is not forward-only'
+        if metrics.cusp_count != 0 or metrics.reverse_length > 1.0e-6:
+            return False, 'CUSP_LIMIT', (
+                f'recenter cusps={metrics.cusp_count} '
+                f'reverse_length={metrics.reverse_length:.6f}m')
+        position_tolerance = float(self.get_parameter(
+            'recenter.position_tolerance').value)
+        yaw_tolerance = float(self.get_parameter(
+            'recenter.yaw_tolerance').value)
+        if (metrics.final_position_error > position_tolerance
+                or metrics.final_yaw_error > yaw_tolerance):
+            return False, 'INVALID_GOAL', (
+                f'endpoint position_error={metrics.final_position_error:.3f}m '
+                f'yaw_error={metrics.final_yaw_error:.3f}rad')
+        wheel_base = float(self.get_parameter('wheel_base').value)
+        command_limit = float(self.get_parameter(
+            'maximum_command_steering_deg').value)
+        steering = required_steering_deg(
+            wheel_base, metrics.max_curvature)
+        if not steering_within_command_limit(
+                wheel_base, metrics.max_curvature, command_limit):
+            return False, 'STEERING_LIMIT', (
+                f'required steering {steering:.3f}deg exceeds '
+                f'{command_limit:.3f}deg')
+        minimum_radius = float(
+            self.get_parameter('minimum_turning_radius').value)
+        curvature_limit = float(self.get_parameter(
+            'curvature_tolerance_factor').value) / minimum_radius
+        if metrics.max_curvature > curvature_limit:
+            return False, 'CURVATURE', (
+                f'curvature {metrics.max_curvature:.6f} exceeds '
+                f'{curvature_limit:.6f} 1/m')
+        heading_change = sum(abs(normalize_angle(
+            yaw_from_quaternion(current.pose.orientation)
+            - yaw_from_quaternion(previous.pose.orientation)))
+            for previous, current in zip(path.poses, path.poses[1:]))
+        maximum_heading_change = math.radians(float(self.get_parameter(
+            'recenter.max_heading_change_deg').value))
+        if heading_change > maximum_heading_change:
+            return False, 'DIRECTION', (
+                f'cumulative heading change={math.degrees(heading_change):.3f}'
+                f'deg exceeds {math.degrees(maximum_heading_change):.3f}deg')
+        if not footprint_already_validated:
+            footprint_valid, footprint_reason = (
+                self._validate_exit_footprint(path))
+            if not footprint_valid:
+                return False, 'FOOTPRINT_COLLISION', footprint_reason
+        return True, 'VALID', 'valid'
+
+    def _plan_one_candidate(
+            self, slot: Slot, setup_offset: float, entry_depth: float,
+            rejection_counts: Dict[str, int],
+            start_pose: Optional[PoseStamped] = None,
+            timing_prefix: str = '',
+            approach_goals: Optional[Sequence[PoseStamped]] = None,
+            validation_start_pose: Optional[PoseStamped] = None,
+            defer_full_validation: bool = False
+            ) -> Tuple[Optional[PlanCandidate], str, str]:
+        mode = 'recenter' if timing_prefix else 'direct'
+        generation_started = time.monotonic()
+        named = self._build_named_poses(slot, setup_offset, entry_depth)
+        self._timing_add(
+            'candidate_generation_ms',
+            (time.monotonic() - generation_started) * 1000.0)
+        if named is None:
+            reason = 'could not build map-frame parking waypoints'
+            self._log_candidate_reject(
+                slot, setup_offset, entry_depth,
+                'INVALID_GOAL', reason, rejection_counts,
+                mode=mode, nav2_result='NOT_REQUESTED')
+            return None, 'INVALID_GOAL', reason
+        self._log_candidate_geometry(slot, setup_offset, entry_depth, named)
+        goals = [named['staging'], named['setup'], named['entry'], named['final']]
+        if approach_goals:
+            goals = list(approach_goals) + goals
+        path = self._request_plan(
+            goals,
+            start_pose=start_pose,
+            timing_phase='parking_candidate',
+            timing_label=(
+                timing_prefix
+                + f'{slot.name}/offset={setup_offset:.2f}/'
+                f'depth={entry_depth:.2f}'))
+        if path is None:
+            reason = self.last_plan_failure_reason
+            code = self._candidate_reject_code(reason)
+            self._log_candidate_reject(
+                slot, setup_offset, entry_depth,
+                code, reason, rejection_counts,
+                mode=mode, nav2_result='FAILED')
+            return None, code, reason
+        if approach_goals:
+            path = self._dedupe_stationary_poses(path)
+
+        validation_started = time.monotonic()
+        self._log_info(
+            f'[DEBUG CANDIDATE] path received: slot={slot.name} '
+            f'offset={setup_offset:.2f} depth={entry_depth:.2f} '
+            f'poses={len(path.poses)}')
+        metrics = self._analyze_path(path, named['final'])
+        self._log_info(
+            f'[DEBUG CANDIDATE] analyzed: total={metrics.total_length:.3f} '
+            f'reverse={metrics.reverse_length:.3f} '
+            f'cusps={metrics.cusp_count} '
+            f'curvature={metrics.max_curvature:.3f}')
+        minimum_reverse = float(
+            self.get_parameter('minimum_reverse_length').value)
+        reverse_after_setup = self._reverse_length_after_pose(
+            path, metrics, named['setup'])
+        self._log_info(
+            f'[DEBUG CANDIDATE] reverse_after_setup={reverse_after_setup:.3f} '
+            f'minimum={minimum_reverse:.3f}')
+        if reverse_after_setup < minimum_reverse:
+            reason = (
+                f'reverse after setup {reverse_after_setup:.3f}m '
+                f'< {minimum_reverse:.3f}m')
+            self._timing_add(
+                'parking_validation_ms',
+                (time.monotonic() - validation_started) * 1000.0)
+            self._log_candidate_reject(
+                slot, setup_offset, entry_depth,
+                'MINIMUM_REVERSE', reason, rejection_counts, metrics,
+                path=path, mode=mode)
+            return None, 'MINIMUM_REVERSE', reason
+        valid, reason = True, 'deferred to combined path validation'
+        if not defer_full_validation:
+            valid, reason = self._validate_path(
+                slot, named, path, metrics,
+                unknown_shadow_pose=validation_start_pose)
+        self._timing_add(
+            'parking_validation_ms',
+            (time.monotonic() - validation_started) * 1000.0)
+        if not valid:
+            code = self._candidate_reject_code(reason)
+            self._log_candidate_reject(
+                slot, setup_offset, entry_depth,
+                code, reason, rejection_counts, metrics,
+                path=path, mode=mode)
+            return None, code, reason
+        candidate_steering = required_steering_deg(
+            float(self.get_parameter('wheel_base').value),
+            metrics.max_curvature)
+        wall_clearance = (
+            None if defer_full_validation
+            else self._path_wall_clearance(slot, path))
+        if defer_full_validation:
+            wall_clearance_text = 'deferred_to_combined_path'
+        elif wall_clearance is None:
+            wall_clearance_text = 'unavailable'
+        else:
+            wall_clearance_text = f'{wall_clearance:.3f}m'
+        self._log_info(
+            f'accept {slot.name} offset={setup_offset:.2f} '
+            f'depth={entry_depth:.2f}: poses={len(path.poses)} '
+            f'total={metrics.total_length:.3f}m '
+            f'reverse={metrics.reverse_length:.3f}m '
+            f'reverse_after_setup={reverse_after_setup:.3f}m '
+            f'cusps={metrics.cusp_count} '
+            f'max_curvature={metrics.max_curvature:.3f} 1/m '
+            f'required_steering_deg={candidate_steering:.3f} '
+            f'minimum_wall_clearance={wall_clearance_text}')
+        return (PlanCandidate(
+            slot, setup_offset, entry_depth, named, path, metrics),
+            'VALID', 'valid')
+
+    @staticmethod
+    def _candidate_reject_code(detail: str) -> str:
+        """Map a detailed rejection to one stable, summary-friendly code."""
+        upper = detail.upper()
+        if 'OUTSIDE_MAP' in upper or 'OUTSIDE MAP' in upper \
+                or 'OUTSIDE COSTMAP' in upper or 'OUTSIDE MAP BOUNDS' in upper:
+            return 'OUTSIDE_MAP'
+        if 'NO REVERSE SEGMENT' in upper:
+            return 'NO_REVERSE'
+        if 'REVERSE AFTER SETUP' in upper:
+            return 'MINIMUM_REVERSE'
+        if 'CUSP COUNT' in upper:
+            return 'CUSP_LIMIT'
+        if 'STEERING LIMIT' in upper:
+            return 'STEERING_LIMIT'
+        if 'CURVATURE' in upper:
+            return 'CURVATURE'
+        if 'SETUP FOOTPRINT CROSSES' in upper:
+            return 'ROAD_BOUNDARY'
+        if 'FINAL FOOTPRINT' in upper:
+            return 'INVALID_GOAL'
+        if 'SIDE WALL' in upper:
+            return 'SLOT_WALL_CLEARANCE'
+        if 'UNAVAILABLE' in upper:
+            return 'MAP_UNAVAILABLE'
+        if 'UNKNOWN' in upper:
+            return 'UNKNOWN_SPACE'
+        if 'FOOTPRINT' in upper and 'OBSTACLE' in upper:
+            return 'FOOTPRINT_COLLISION'
+        if 'LETHAL' in upper or 'OCCUPIED' in upper or 'COLLISION' in upper:
+            return 'COLLISION'
+        if ('COMPUTEPATHTHROUGHPOSES' in upper
+                or 'PLANNING REQUEST' in upper):
+            return 'PLANNER_FAILED'
+        if 'ABORT' in upper:
+            return 'ABORTED'
+        return 'OTHER'
+
+    def _log_candidate_geometry(
+            self, slot: Slot, setup_offset: float, entry_depth: float,
+            named: Dict[str, PoseStamped]) -> None:
+        lines = [
+            '[CANDIDATE]',
+            f'slot={slot.name}',
+            f'setup_offset={setup_offset:.3f}',
+            f'entry_depth={entry_depth:.3f}',
+        ]
+        for name in ('staging', 'setup', 'entry', 'final'):
+            pose = named[name]
+            lines.append(
+                f'{name}_pose=({pose.pose.position.x:.3f},'
+                f'{pose.pose.position.y:.3f},'
+                f'{yaw_from_quaternion(pose.pose.orientation):.6f})')
+        self._log_info('\n'.join(lines))
+
+    def _log_candidate_reject(
+            self, slot: Slot, setup_offset: float, entry_depth: float,
+            code: str, detail: str, counts: Dict[str, int],
+            metrics: Optional[PathMetrics] = None,
+            path: Optional[Path] = None, mode: str = 'direct',
+            nav2_result: str = 'SUCCEEDED') -> None:
+        counts[code] = counts.get(code, 0) + 1
+        lines = [
+            '[CANDIDATE REJECT]',
+            f'slot={slot.name}',
+            f'setup_offset={setup_offset:.3f}',
+            f'entry_depth={entry_depth:.3f}',
+            f'reason={code}',
+            f'detail={detail}',
+        ]
+        if metrics is not None:
+            wheel_base = float(self.get_parameter('wheel_base').value)
+            command_limit = float(self.get_parameter(
+                'maximum_command_steering_deg').value)
+            lines.extend([
+                f'cusps={metrics.cusp_count}',
+                f'max_curvature={metrics.max_curvature:.6f}',
+                f'required_steering_deg='
+                f'{required_steering_deg(wheel_base, metrics.max_curvature):.3f}',
+                f'limit_deg={command_limit:.1f}',
+                f'path_length={metrics.total_length:.3f}',
+            ])
+        self._log_info('\n'.join(lines))
+        if slot.name == 'slot_2':
+            self._log_b_parking_reject(
+                slot, setup_offset, entry_depth, code, detail,
+                metrics, path, mode, nav2_result)
+
+    def _log_b_parking_reject(
+            self, slot: Slot, setup_offset: float, entry_depth: float,
+            code: str, detail: str, metrics: Optional[PathMetrics],
+            path: Optional[Path], mode: str, nav2_result: str) -> None:
+        """Emit stable, diagnostic-only fields for every B rejection."""
+        initial = self.course_entrance_pose
+        initial_text = 'unavailable'
+        if initial is not None:
+            initial_text = (
+                f'({initial.pose.position.x:.6f},'
+                f'{initial.pose.position.y:.6f},'
+                f'{yaw_from_quaternion(initial.pose.orientation):.6f})')
+        reject_index = None
+        if 'index ' in detail:
+            try:
+                reject_index = int(
+                    detail.split('index ', 1)[1].split()[0])
+            except (ValueError, IndexError):
+                reject_index = None
+        reject_pose = 'unavailable'
+        if (path is not None and reject_index is not None
+                and 0 <= reject_index < len(path.poses)):
+            pose = path.poses[reject_index]
+            reject_pose = (
+                f'({pose.pose.position.x:.6f},'
+                f'{pose.pose.position.y:.6f},'
+                f'{yaw_from_quaternion(pose.pose.orientation):.6f})')
+        upper = detail.upper()
+        map_collision = (
+            'OVERLAPS OBSTACLE' in upper
+            or 'LETHAL/INSCRIBED' in upper)
+        footprint_collision = (
+            'FOOTPRINT' in upper
+            and (map_collision or 'OUTSIDE MAP' in upper))
+        unknown_collision = 'UNKNOWN' in upper
+        road_boundary = any(token in upper for token in (
+            'ROAD BOUNDARY', 'SIDE WALL', 'SLOT WALL',
+            'OUTSIDE SELECTED SLOT'))
+        if metrics is None:
+            curvature = steering = radius = 'unavailable'
+        else:
+            curvature = f'{metrics.max_curvature:.6f}'
+            wheel_base = float(self.get_parameter('wheel_base').value)
+            steering = f'{required_steering_deg(wheel_base, metrics.max_curvature):.3f}'
+            radius = (
+                f'{1.0 / metrics.max_curvature:.3f}'
+                if metrics.max_curvature > 1.0e-9 else 'inf')
+        self._log_info(
+            '[B PARKING REJECT]\n'
+            f'initial_pose={initial_text}\n'
+            f'candidate=slot={slot.name},setup_offset={setup_offset:.3f},'
+            f'entry_depth={entry_depth:.3f}\n'
+            f'direct/recenter={mode}\n'
+            f'nav2_result={nav2_result}\n'
+            f'max_curvature={curvature}\n'
+            f'required_steering={steering}\n'
+            f'Rmin={radius}\n'
+            f'map_collision={str(map_collision).lower()}\n'
+            f'footprint_collision={str(footprint_collision).lower()}\n'
+            f'unknown_collision={str(unknown_collision).lower()}\n'
+            f'road_boundary={str(road_boundary).lower()}\n'
+            f'reject_pose={reject_pose}\n'
+            'reject_index=' + (
+                'none' if reject_index is None else str(reject_index)) + '\n'
+            f'reason={code}: {detail}')
+
+    def _log_candidate_summary(
+            self, total: int, valid: int, counts: Dict[str, int],
+            aborted: bool = False) -> None:
+        ordered_codes = (
+            'OUTSIDE_MAP', 'PLANNER_FAILED', 'COLLISION',
+            'FOOTPRINT_COLLISION', 'UNKNOWN_SPACE', 'CUSP_LIMIT',
+            'STEERING_LIMIT', 'CURVATURE', 'NO_REVERSE', 'MINIMUM_REVERSE',
+            'ROAD_BOUNDARY', 'SLOT_WALL_CLEARANCE', 'INVALID_GOAL',
+            'MAP_UNAVAILABLE', 'ABORTED', 'OTHER')
+        lines = [
+            '[CANDIDATE SUMMARY]',
+            f'total={total}',
+            f'valid={valid}',
+            f'rejected={sum(counts.values())}',
+        ]
+        lines.extend(
+            f'{code.lower()}={counts.get(code, 0)}'
+            for code in ordered_codes)
+        if aborted:
+            lines.append('search_aborted=true')
+        self._log_info('\n'.join(lines))
 
     def _log_live_start_costmap_snapshot(self) -> None:
         """Explain a planner START_OCCUPIED result without changing safety.
@@ -2601,6 +4983,37 @@ class AutoTParking(Node):
                 '; '.join(examples) if examples else 'none'))
 
     def _request_plan(
+            self, goals: Sequence[PoseStamped], planner_id: Optional[str] = None,
+            start_pose: Optional[PoseStamped] = None,
+            timing_phase: str = 'other', timing_label: str = '') -> Optional[Path]:
+        """Time one Nav2 request and delegate to the unchanged request path."""
+        started = time.monotonic()
+        path = self._request_plan_impl(goals, planner_id, start_pose)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        with self.planning_timing_lock:
+            self.planning_request_count += 1
+            request_index = self.planning_request_count
+            if timing_phase == 'parking_candidate':
+                self.nav2_candidate_request_count += 1
+                self.planning_timing['nav2_candidate_total_ms'] = (
+                    self.planning_timing.get(
+                        'nav2_candidate_total_ms', 0.0) + elapsed_ms)
+                if timing_label.startswith('recenter='):
+                    self.planning_timing['recenter_planning_ms'] = (
+                        self.planning_timing.get(
+                            'recenter_planning_ms', 0.0) + elapsed_ms)
+            elif timing_phase == 'exit':
+                self.nav2_exit_request_count += 1
+        self._log_info(
+            '[COMPUTE PATH TIMING]\n'
+            f'request_index={request_index}\n'
+            f'phase={timing_phase}\n'
+            f'label={timing_label or "unspecified"}\n'
+            f'elapsed_ms={elapsed_ms:.3f}\n'
+            f'success={str(path is not None).lower()}')
+        return path
+
+    def _request_plan_impl(
             self, goals: Sequence[PoseStamped], planner_id: Optional[str] = None,
             start_pose: Optional[PoseStamped] = None) -> Optional[Path]:
         """Request a Nav2 path, using the live TF pose unless a test start is set.
@@ -2733,12 +5146,16 @@ class AutoTParking(Node):
         centre_y = pose.pose.position.y
         yaw = yaw_from_quaternion(pose.pose.orientation)
         half_base = 0.5 * float(self.get_parameter('wheel_base').value)
-        half_track = 0.5 * float(self.get_parameter('wheel_track').value)
+        front_half_track = 0.5 * float(
+            self.get_parameter('front_wheel_track').value)
+        rear_half_track = 0.5 * float(
+            self.get_parameter('rear_wheel_track').value)
         cosine = math.cos(yaw)
         sine = math.sin(yaw)
         result = {}
-        for axle, longitudinal in (
-                ('front', half_base), ('rear', -half_base)):
+        for axle, longitudinal, half_track in (
+                ('front', half_base, front_half_track),
+                ('rear', -half_base, rear_half_track)):
             for side, lateral in (
                     ('left', half_track), ('right', -half_track)):
                 result[f'{axle}_{side}'] = (
@@ -2788,8 +5205,9 @@ class AutoTParking(Node):
             'turn_direction': 'RIGHT',
             'arc_angle': math.pi / 2.0,
         }
-        if self.course_entrance_pose is None:
-            geometry['reason'] = 'course entrance pose is unavailable'
+        target = self._configured_exit_goal()
+        if target is None:
+            geometry['reason'] = 'configured exit_goal is unavailable'
             return None, geometry
         stop = self._fresh_pose(parking_stop_pose)
         clear = self._offset_pose(stop, forward_clear, 0.0)
@@ -2804,7 +5222,6 @@ class AutoTParking(Node):
             self.get_parameter('minimum_turning_radius').value)
         planning_radius = float(
             self.get_parameter('exit_planning_turn_radius').value)
-        target = self._fresh_pose(self.course_entrance_pose)
         target_dx = target.pose.position.x - turn_entry.pose.position.x
         target_dy = target.pose.position.y - turn_entry.pose.position.y
         # For a 90-degree right arc followed by a straight, expressed in the
@@ -2831,15 +5248,21 @@ class AutoTParking(Node):
         approach_yaw = normalize_angle(heading - math.pi / 2.0)
         set_pose_yaw(merge.pose, approach_yaw)
         merge.header.stamp = self.get_clock().now().to_msg()
-        set_pose_yaw(target.pose, approach_yaw)
+        goal_yaw_error = abs(normalize_angle(
+            yaw_from_quaternion(target.pose.orientation) - approach_yaw))
         named = {
             'parking_stop': stop,
             'slot_forward_clear': clear,
             'right_turn_entry': turn_entry,
             'lane_merge': merge,
-            'course_entrance': target,
+            'exit_goal': target,
         }
-        if turn_offset < max(minimum_radius, planning_radius):
+        if goal_yaw_error > float(self.get_parameter(
+                'exit_goal.yaw_tolerance').value):
+            geometry['reason'] = (
+                f'configured exit goal yaw differs from natural right-turn '
+                f'heading by {goal_yaw_error:.3f}rad')
+        elif turn_offset < max(minimum_radius, planning_radius):
             geometry['reason'] = (
                 f'turn radius {turn_offset:.3f}m is below required '
                 f'{max(minimum_radius, planning_radius):.3f}m')
@@ -2858,17 +5281,16 @@ class AutoTParking(Node):
 
         The saved-map T branch is wide enough to begin the turn before the
         rear wheels have completely crossed its mouth.  Place a quarter-circle
-        arc of the configured ForwardExit radius so it ends on the y=0 road,
-        then continue straight to the captured start position.  Smac still
+        arc of the configured ForwardExit radius so it ends on the main road,
+        then continue straight to the fixed configured exit goal. Smac still
         generates the actual Dubins path and the normal exit validator checks
         every footprint sample; these poses only constrain the desired curve.
         """
-        if self.course_entrance_pose is None:
+        target = self._configured_exit_goal()
+        if target is None:
             return None
         stop = self._fresh_pose(parking_stop_pose)
-        target = self._fresh_pose(self.course_entrance_pose)
-        return_yaw = float(self.get_parameter('rviz_return_yaw').value)
-        set_pose_yaw(target.pose, return_yaw)
+        return_yaw = yaw_from_quaternion(target.pose.orientation)
 
         heading = yaw_from_quaternion(stop.pose.orientation)
         expected_yaw = normalize_angle(heading - math.pi / 2.0)
@@ -2891,7 +5313,7 @@ class AutoTParking(Node):
             'lane_merge_distance_candidates').value)
         if straight_before_turn < 0.0 or straight_after_turn < minimum_straight:
             self._log_error(
-                'captured RViz start position cannot be reached by the '
+                'configured fixed exit goal cannot be reached by the '
                 f'forward right-turn geometry: before={straight_before_turn:.3f}m '
                 f'after={straight_after_turn:.3f}m radius={radius:.3f}m')
             return None
@@ -2907,54 +5329,366 @@ class AutoTParking(Node):
             'parking_stop': stop,
             'right_turn_entry': turn_entry,
             'lane_merge': lane_merge,
-            'course_entrance': target,
+            'exit_goal': target,
+        }
+
+    def _build_slot_clear_return_poses(
+            self, parking_stop_pose: PoseStamped, slot: Slot,
+            clearance_margin: float
+            ) -> Optional[Dict[str, PoseStamped]]:
+        """Build one slot-derived straight-clear waypoint before the goal."""
+        target = self._configured_exit_goal()
+        minimum_clear = self._minimum_forward_clear(slot, parking_stop_pose)
+        if target is None or minimum_clear is None:
+            return None
+        stop = self._fresh_pose(parking_stop_pose)
+        clear_distance = minimum_clear + clearance_margin
+        clear = self._offset_pose(stop, clear_distance, 0.0)
+        clear.header.stamp = self.get_clock().now().to_msg()
+        # Keep the established validator/visualization pose contract.  These
+        # are separate Pose objects even though the single intermediate point
+        # is both the end of slot clearance and the start of the road turn.
+        turn_entry = self._fresh_pose(clear)
+        lane_merge = self._fresh_pose(clear)
+        return {
+            'parking_stop': stop,
+            'slot_forward_clear': clear,
+            'right_turn_entry': turn_entry,
+            'lane_merge': lane_merge,
+            'exit_goal': target,
         }
 
     def _plan_rviz_return(
             self, parking_stop_pose: PoseStamped, slot: Slot
             ) -> Optional[ForwardExitCandidate]:
-        """Plan and validate the RViz-only full return with ForwardExit."""
-        named = self._build_rviz_return_poses(parking_stop_pose)
-        if named is None:
-            return None
+        """Try direct Dubins first, then B-only calculated slot clearance."""
+        direct = self._build_rviz_return_poses(parking_stop_pose)
+        attempts: List[Tuple[str, Optional[Dict[str, PoseStamped]], float]] = [
+            ('direct', direct, 0.0)]
+        if slot.name == 'slot_2':
+            margins = [float(value) for value in self.get_parameter(
+                'exit.slot_2.clearance_margin_candidates').value]
+            attempts.extend(
+                (f'slot_clear_margin={margin:.2f}',
+                 self._build_slot_clear_return_poses(
+                     parking_stop_pose, slot, margin), margin)
+                for margin in margins)
+
+        planner_id = str(self.get_parameter('exit_planner_id').value)
+        reject_counts: Dict[str, int] = {}
+        total = 0
+        for candidate_name, named, clearance_margin in attempts:
+            total += 1
+            if named is None:
+                code = 'INVALID_GOAL'
+                reason = 'could not build return waypoints'
+                reject_counts[code] = reject_counts.get(code, 0) + 1
+                self._log_rviz_exit_candidate(
+                    parking_stop_pose, None, slot, None, None,
+                    'REJECT', code, reason, candidate_name, 'NOT_REQUESTED')
+                continue
+            self._log_info(
+                '[RVIZ RETURN WAYPOINTS]\n'
+                f'candidate={candidate_name}\n'
+                + '\n'.join(
+                    f'{name}=({pose.pose.position.x:.3f},'
+                    f'{pose.pose.position.y:.3f},'
+                    f'{yaw_from_quaternion(pose.pose.orientation):.3f})'
+                    for name, pose in named.items()))
+            goals = [named['exit_goal']]
+            if candidate_name != 'direct':
+                goals.insert(0, named['slot_forward_clear'])
+            path = self._request_plan(
+                goals, planner_id=planner_id,
+                start_pose=named['parking_stop'], timing_phase='exit',
+                timing_label=f'rviz_return/{candidate_name}')
+            if path is None:
+                reason = self.last_plan_failure_reason
+                code = self._exit_reject_code(reason)
+                reject_counts[code] = reject_counts.get(code, 0) + 1
+                self._log_rviz_exit_candidate(
+                    parking_stop_pose, named, slot, None, None,
+                    'REJECT', code, reason, candidate_name, 'FAILED')
+                continue
+            path = self._dedupe_stationary_poses(path)
+            metrics = self._analyze_path(path, named['exit_goal'])
+            self._publish_status('VALIDATE_EXIT_PATH')
+            valid, turn_direction, reason = self._validate_forward_exit_path(
+                path, metrics, named, slot)
+            if not valid:
+                code = self._exit_reject_code(reason)
+                reject_counts[code] = reject_counts.get(code, 0) + 1
+                self._log_rviz_exit_candidate(
+                    parking_stop_pose, named, slot, path, metrics,
+                    'REJECT', code, reason, candidate_name, 'SUCCEEDED')
+                self._log_error(
+                    f'RViz return candidate {candidate_name} rejected: '
+                    f'{reason}')
+                continue
+            self._log_rviz_exit_candidate(
+                parking_stop_pose, named, slot, path, metrics,
+                'ACCEPT', 'VALID', 'valid', candidate_name, 'SUCCEEDED')
+            self._log_exit_candidate_summary(total, 1, reject_counts)
+            straight_before = math.hypot(
+                named['right_turn_entry'].pose.position.x
+                - named['parking_stop'].pose.position.x,
+                named['right_turn_entry'].pose.position.y
+                - named['parking_stop'].pose.position.y)
+            straight_after = math.hypot(
+                named['exit_goal'].pose.position.x
+                - named['lane_merge'].pose.position.x,
+                named['exit_goal'].pose.position.y
+                - named['lane_merge'].pose.position.y)
+            return ForwardExitCandidate(
+                straight_before, 0.0,
+                clearance_margin if candidate_name != 'direct'
+                else straight_after,
+                named, path, metrics, turn_direction)
+        self._log_exit_candidate_summary(total, 0, reject_counts)
+        return None
+
+    @staticmethod
+    def _exit_reject_code(detail: str) -> str:
+        """Map exit validation details to stable summary codes."""
+        upper = detail.upper()
+        if 'OUTSIDE' in upper:
+            return 'OUTSIDE_MAP'
+        if ('COMPUTEPATHTHROUGHPOSES' in upper
+                or 'PLANNING REQUEST' in upper
+                or 'PLANNER' in upper):
+            return 'PLANNER_FAILED'
+        if 'STEERING' in upper:
+            return 'STEERING_LIMIT'
+        if 'CURVATURE' in upper:
+            return 'CURVATURE'
+        if 'CUSP' in upper:
+            return 'CUSP_LIMIT'
+        if 'FOOTPRINT' in upper or 'OBSTACLE' in upper or 'LETHAL' in upper:
+            return 'FOOTPRINT_COLLISION'
+        if ('ENDPOINT' in upper or 'GOAL' in upper
+                or 'WAYPOINT' in upper or 'EMPTY' in upper):
+            return 'INVALID_GOAL'
+        if ('WALL' in upper or 'ROAD' in upper
+                or 'REAR TYRE' in upper or 'REAR TIRE' in upper):
+            return 'ROAD_BOUNDARY'
+        if 'COLLISION' in upper:
+            return 'COLLISION'
+        return 'OTHER'
+
+    def _log_rviz_exit_candidate(
+            self, start: PoseStamped,
+            named: Optional[Dict[str, PoseStamped]], slot: Slot,
+            path: Optional[Path], metrics: Optional[PathMetrics],
+            decision: str, code: str, detail: str,
+            candidate: str = 'direct',
+            planner_result: str = 'SUCCEEDED') -> None:
+        """Log the complete plan-only exit candidate in a stable format."""
+        def pose_text(pose: Optional[PoseStamped]) -> str:
+            if pose is None:
+                return 'unavailable'
+            return (
+                f'({pose.pose.position.x:.6f},'
+                f'{pose.pose.position.y:.6f},'
+                f'{yaw_from_quaternion(pose.pose.orientation):.6f})')
+
+        lead = None if named is None else named.get('right_turn_entry')
+        goal = None if named is None else named.get('exit_goal')
+        radius = float(self.get_parameter('exit_planning_turn_radius').value)
+        lines = [
+            '[EXIT CANDIDATE]',
+            f'slot={slot.name}',
+            f'parking_final={pose_text(start)}',
+            f'exit_goal={pose_text(goal)}',
+            f'candidate={candidate}',
+            f'planner_result={planner_result}',
+            f'start={pose_text(start)}',
+            f'lead={pose_text(lead)}',
+            f'goal={pose_text(goal)}',
+            f'turn_radius={radius:.3f}',
+        ]
+        if path is not None and metrics is not None:
+            wheel_base = float(self.get_parameter('wheel_base').value)
+            (map_collision, costmap_collision, collision_index,
+             collision_pose) = self._exit_collision_details(path)
+            clearance = self._path_side_wall_clearance(slot, path)
+            minimum_radius = (
+                1.0 / metrics.max_curvature
+                if metrics.max_curvature > 1.0e-9 else float('inf'))
+            lines.extend([
+                f'poses={len(path.poses)}',
+                f'length={metrics.total_length:.3f}',
+                f'path_length={metrics.total_length:.3f}',
+                f'forward_length={metrics.forward_length:.3f}',
+                f'reverse_length={metrics.reverse_length:.3f}',
+                f'cusps={metrics.cusp_count}',
+                f'max_curvature={metrics.max_curvature:.6f}',
+                f'required_steering='
+                f'{required_steering_deg(wheel_base, metrics.max_curvature):.3f}',
+                f'required_steering_deg='
+                f'{required_steering_deg(wheel_base, metrics.max_curvature):.3f}',
+                f'Rmin={minimum_radius:.3f}',
+                f'map_collision={str(map_collision).lower()}',
+                f'footprint_collision={str(costmap_collision).lower()}',
+                f'collision_pose={pose_text(collision_pose)}',
+                'collision_index=' + (
+                    'none' if collision_index is None
+                    else str(collision_index)),
+                'minimum_static_clearance='
+                + ('unavailable' if clearance is None else f'{clearance:.3f}'),
+            ])
+        else:
+            lines.extend([
+                'poses=0',
+                'length=unavailable',
+                'path_length=unavailable',
+                'cusps=unavailable',
+                'max_curvature=unavailable',
+                'required_steering=unavailable',
+                'required_steering_deg=unavailable',
+                'Rmin=unavailable',
+                'map_collision=unknown',
+                'footprint_collision=unknown',
+                'collision_pose=unavailable',
+                'collision_index=none',
+            ])
+        lines.extend([
+            f'decision={decision}',
+            f'reason={code}',
+            f'reject_reason={code if decision == "REJECT" else "NONE"}',
+            f'detail={detail}',
+        ])
+        self._log_info('\n'.join(lines))
+
+    def _log_exit_candidate_summary(
+            self, total: int, valid: int, counts: Dict[str, int]) -> None:
+        ordered = (
+            'OUTSIDE_MAP', 'PLANNER_FAILED', 'COLLISION',
+            'FOOTPRINT_COLLISION', 'STEERING_LIMIT', 'CURVATURE',
+            'CUSP_LIMIT', 'INVALID_GOAL', 'ROAD_BOUNDARY', 'OTHER')
+        populated = ','.join(
+            f'{code}:{counts.get(code, 0)}' for code in ordered)
         self._log_info(
-            '[RVIZ RETURN WAYPOINTS]\n'
-            + '\n'.join(
-                f'{name}=({pose.pose.position.x:.3f},'
-                f'{pose.pose.position.y:.3f},'
-                f'{yaw_from_quaternion(pose.pose.orientation):.3f})'
-                for name, pose in named.items()))
-        path = self._request_plan(
-            [named['right_turn_entry'], named['lane_merge'],
-             named['course_entrance']],
-            planner_id=str(self.get_parameter('exit_planner_id').value),
-            start_pose=named['parking_stop'])
-        if path is None:
+            '[EXIT CANDIDATE SUMMARY]\n'
+            f'total={total}\nvalid={valid}\n'
+            f'rejected={sum(counts.values())}\n'
+            f'reject_reason_counts={{{populated}}}')
+
+    def _start_exit_preplan(self, candidate: PlanCandidate) -> None:
+        """Start a safe exit plan while the selected parking path executes."""
+        if (not self.execute_path
+                or not bool(self.get_parameter(
+                    'return_to_entrance').value)
+                or not bool(self.get_parameter(
+                    'preplan_exit_during_parking').value)):
+            return
+        parking_final = self._fresh_pose(candidate.named_poses['final'])
+
+        def worker() -> None:
+            started = time.monotonic()
+            result = None
+            error = ''
+            try:
+                result = self._plan_forward_right_exit(
+                    parking_final, candidate.slot, use_current_start=False)
+                if result is None:
+                    error = (
+                        self.last_plan_failure_reason
+                        or 'no safe exit candidate passed validation')
+            except Exception as exc:  # Cache failure must never stop parking.
+                error = str(exc)
+                self._log_error(
+                    f'background exit preplan failed safely: {exc}\n'
+                    f'{traceback.format_exc()}')
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            with self.exit_preplan_lock:
+                self.exit_preplan_result = result
+                self.exit_preplan_error = error
+                self.exit_preplan_elapsed_ms = elapsed_ms
+            self._timing_set('exit_planning_ms', elapsed_ms)
+            self._log_info(
+                '[EXIT PREPLAN]\n'
+                f'result={"PASS" if result is not None else "REJECT"}\n'
+                f'elapsed_ms={elapsed_ms:.3f}\n'
+                f'start=({parking_final.pose.position.x:.3f},'
+                f'{parking_final.pose.position.y:.3f},'
+                f'{yaw_from_quaternion(parking_final.pose.orientation):.3f})\n'
+                f'detail={error or "valid"}')
+
+        self.exit_preplan_thread = threading.Thread(
+            target=worker, name='t_parking_exit_preplan', daemon=False)
+        self.exit_preplan_thread.start()
+        self._log_info(
+            '[EXIT PREPLAN] started from selected parking final pose; '
+            'parking FollowPath is not waiting for exit planning')
+
+    def _consume_exit_preplan(
+            self, parking_stop_pose: PoseStamped,
+            slot: Slot) -> Optional[ForwardExitCandidate]:
+        """Use a completed cache only after pose and safety revalidation."""
+        thread = self.exit_preplan_thread
+        if thread is None:
             return None
-        path = self._dedupe_stationary_poses(path)
-        metrics = self._analyze_path(path, named['course_entrance'])
+        while thread.is_alive() and not self._abort_requested():
+            thread.join(timeout=0.05)
+        if thread.is_alive() or self._abort_requested():
+            return None
+        with self.exit_preplan_lock:
+            cached = self.exit_preplan_result
+            error = self.exit_preplan_error
+        if cached is None:
+            self._log_warn(
+                '[EXIT PREPLAN CACHE] MISS: '
+                f'{error or "background planning returned no valid path"}')
+            return None
+
+        expected = cached.named_poses['parking_stop']
+        position_error = math.hypot(
+            parking_stop_pose.pose.position.x - expected.pose.position.x,
+            parking_stop_pose.pose.position.y - expected.pose.position.y)
+        yaw_error = abs(normalize_angle(
+            yaw_from_quaternion(parking_stop_pose.pose.orientation)
+            - yaw_from_quaternion(expected.pose.orientation)))
+        position_tolerance = float(self.get_parameter(
+            'exit_cache_start_position_tolerance').value)
+        yaw_tolerance = float(self.get_parameter(
+            'exit_cache_start_yaw_tolerance').value)
+        if position_error > position_tolerance or yaw_error > yaw_tolerance:
+            self._log_warn(
+                '[EXIT PREPLAN CACHE] MISS: parked pose mismatch '
+                f'position_error={position_error:.3f}m/'
+                f'{position_tolerance:.3f}m yaw_error={yaw_error:.3f}rad/'
+                f'{yaw_tolerance:.3f}rad')
+            return None
+
         valid, turn_direction, reason = self._validate_forward_exit_path(
-            path, metrics, named, slot)
+            cached.path, cached.metrics, cached.named_poses, slot)
         if not valid:
-            self._log_error(f'RViz return path rejected: {reason}')
+            self._log_warn(
+                '[EXIT PREPLAN CACHE] MISS: safety revalidation rejected '
+                f'reason={reason}')
             return None
-        straight_before = math.hypot(
-            named['right_turn_entry'].pose.position.x
-            - named['parking_stop'].pose.position.x,
-            named['right_turn_entry'].pose.position.y
-            - named['parking_stop'].pose.position.y)
-        straight_after = math.hypot(
-            named['course_entrance'].pose.position.x
-            - named['lane_merge'].pose.position.x,
-            named['course_entrance'].pose.position.y
-            - named['lane_merge'].pose.position.y)
-        return ForwardExitCandidate(
-            straight_before, 0.0, straight_after, named, path, metrics,
-            turn_direction)
+        cached.turn_direction = turn_direction
+        self._log_info(
+            '[EXIT PREPLAN CACHE] HIT\n'
+            f'position_error={position_error:.3f}\n'
+            f'yaw_error={yaw_error:.3f}\n'
+            'full_exit_validation=PASS')
+        return cached
 
     def _plan_forward_right_exit(
             self, parking_stop_pose: PoseStamped, slot: Slot,
             use_current_start: bool) -> Optional[ForwardExitCandidate]:
+        # Slot 2 needs the same direct-first, geometry-derived clearance
+        # fallback in real/background planning that plan-only uses.  The
+        # supplied stop pose is the selected final pose for preplanning and
+        # the measured current pose for a post-parking replan, so an explicit
+        # Nav2 start preserves both contracts.  Keep slot 1 on its established
+        # ForwardExit candidate builder unchanged.
+        if slot.name == 'slot_2':
+            self._log_info(
+                '[SLOT-AWARE EXIT] slot_2 direct-first planner; '
+                f'use_current_start={str(use_current_start).lower()}')
+            return self._plan_rviz_return(parking_stop_pose, slot)
         planner_id = str(self.get_parameter('exit_planner_id').value)
         minimum_clear = self._minimum_forward_clear(slot, parking_stop_pose)
         if minimum_clear is None:
@@ -2963,9 +5697,9 @@ class AutoTParking(Node):
             return None
         stop_yaw = yaw_from_quaternion(parking_stop_pose.pose.orientation)
         forward = (math.cos(stop_yaw), math.sin(stop_yaw))
-        target = self.course_entrance_pose
+        target = self._configured_exit_goal()
         if target is None:
-            self._log_error('course entrance pose is unavailable')
+            self._log_error('configured exit_goal is unavailable')
             return None
         target_forward_distance = (
             (target.pose.position.x - parking_stop_pose.pose.position.x)
@@ -3031,9 +5765,16 @@ class AutoTParking(Node):
                         [named['slot_forward_clear'],
                          named['right_turn_entry'],
                          named['lane_merge'],
-                         named['course_entrance']],
+                         named['exit_goal']],
                         planner_id=planner_id,
-                        start_pose=None if use_current_start else named['parking_stop'])
+                        start_pose=(
+                            None if use_current_start
+                            else named['parking_stop']),
+                        timing_phase='exit',
+                        timing_label=(
+                            f'forward_exit/clear={forward_clear:.3f}/'
+                            f'lead={right_turn_lead:.3f}/'
+                            f'merge={lane_merge:.3f}'))
                     if path is None:
                         self._log_exit_candidate_debug(
                             slot, named, geometry, None, 'REJECT',
@@ -3041,7 +5782,7 @@ class AutoTParking(Node):
                         continue
                     path = self._dedupe_stationary_poses(path)
                     metrics = self._analyze_path(
-                        path, named['course_entrance'])
+                        path, named['exit_goal'])
                     valid, turn_direction, reason = (
                         self._validate_forward_exit_path(
                             path, metrics, named, slot))
@@ -3120,23 +5861,27 @@ class AutoTParking(Node):
                 + radius * (1.0 - math.cos(angle)) * right[1])
             set_pose_yaw(pose.pose, heading - angle)
             path.poses.append(pose)
-        append_linear(named['lane_merge'], named['course_entrance'])
+        append_linear(named['lane_merge'], named['exit_goal'])
         return path
 
-    def _exit_collision_flags(self, path: Path) -> Tuple[bool, bool]:
-        """Return static-map and live-costmap collision flags."""
+    def _exit_collision_details(
+            self, path: Path
+            ) -> Tuple[bool, bool, Optional[int], Optional[PoseStamped]]:
+        """Return collision flags and the first colliding vehicle pose."""
         with self.data_lock:
             costmap = self.global_costmap
             map_msg = self.map_msg
         if costmap is None or map_msg is None:
-            return True, True
+            return True, True, None, None
         length = float(self.get_parameter('vehicle_length').value)
         width = float(self.get_parameter('vehicle_width').value)
         occupied_threshold = int(
             self.get_parameter('occupied_threshold').value)
         map_collision = False
         costmap_collision = False
-        for pose in path.poses:
+        first_index: Optional[int] = None
+        first_pose: Optional[PoseStamped] = None
+        for index, pose in enumerate(path.poses):
             center_cost = self._cost_value(
                 costmap, pose.pose.position.x, pose.pose.position.y)
             if center_cost is None or 253 <= center_cost <= 254:
@@ -3148,6 +5893,16 @@ class AutoTParking(Node):
                     map_collision = True
                 if cost_value is None or cost_value == 254:
                     costmap_collision = True
+            if ((map_collision or costmap_collision)
+                    and first_index is None):
+                first_index = index
+                first_pose = pose
+        return map_collision, costmap_collision, first_index, first_pose
+
+    def _exit_collision_flags(self, path: Path) -> Tuple[bool, bool]:
+        """Return static-map and live-costmap collision flags."""
+        map_collision, costmap_collision, _, _ = (
+            self._exit_collision_details(path))
         return map_collision, costmap_collision
 
     def _path_side_wall_clearance(
@@ -3268,6 +6023,13 @@ class AutoTParking(Node):
             ) -> Tuple[bool, str, str]:
         if not path.poses:
             return False, 'NONE', 'path is empty'
+        goal_valid, position_error, yaw_error = (
+            self._check_and_log_exit_goal(path))
+        if not goal_valid:
+            return False, 'NONE', (
+                'configured exit_goal mismatch: '
+                f'position_error={position_error:.3f}m '
+                f'yaw_error={yaw_error:.3f}rad')
         nonzero_directions = [direction for direction in metrics.directions
                               if direction != 0]
         if not nonzero_directions:
@@ -3286,23 +6048,22 @@ class AutoTParking(Node):
             return False, 'NONE', f'cusp count {metrics.cusp_count} is not zero'
         minimum_radius = float(
             self.get_parameter('minimum_turning_radius').value)
+        wheel_base = float(self.get_parameter('wheel_base').value)
+        command_limit = float(self.get_parameter(
+            'maximum_command_steering_deg').value)
+        required_steering = required_steering_deg(
+            wheel_base, metrics.max_curvature)
+        if not steering_within_command_limit(
+                wheel_base, metrics.max_curvature, command_limit):
+            return False, 'NONE', (
+                f'steering limit exceeded: required '
+                f'{required_steering:.3f} deg > {command_limit:.3f} deg')
         curvature_factor = float(
             self.get_parameter('curvature_tolerance_factor').value)
         if metrics.max_curvature > curvature_factor / minimum_radius:
             return False, 'NONE', (
                 f'curvature {metrics.max_curvature:.3f} exceeds '
                 f'{curvature_factor / minimum_radius:.3f} 1/m')
-        position_tolerance = float(self.get_parameter(
-            'entrance_return_position_tolerance').value)
-        if metrics.final_position_error > position_tolerance:
-            return False, 'NONE', (
-                f'planned endpoint position error '
-                f'{metrics.final_position_error:.3f}m')
-        yaw_tolerance = float(self.get_parameter(
-            'entrance_return_yaw_tolerance').value)
-        if metrics.final_yaw_error > yaw_tolerance:
-            return False, 'NONE', (
-                f'planned endpoint yaw error {metrics.final_yaw_error:.3f}rad')
         # ComputePathThroughPoses concatenates independently-planned
         # SmacPlannerHybrid segments at each intermediate waypoint. Each
         # segment's shared endpoint is quantized to the nearest of
@@ -3476,11 +6237,11 @@ class AutoTParking(Node):
         # samples.  Three nearly coincident Hybrid-A* poses amplify map-grid
         # quantization, and a Reeds-Shepp cusp is a stop/direction change where
         # curvature is undefined.  A 0.30 m window on each side remains well
-        # below this vehicle's 1.52 m minimum turning radius while rejecting
+        # below this vehicle's 1.82 m minimum turning radius while rejecting
         # real over-curvature.  The old 0.15 m window was only three 0.05 m
         # map cells and
-        # reported a legal Dubins arc as 0.681 instead of 0.658 1/m from
-        # Hybrid-A* grid quantization.  The acceptance limit itself remains
+        # reported a legal Dubins arc as overly tight due to
+        # Hybrid-A* grid quantization. The acceptance limit itself remains
         # exactly 1 / minimum_turning_radius.
         max_curvature = 0.0
         poses = path.poses
@@ -3641,7 +6402,9 @@ class AutoTParking(Node):
 
     def _validate_path(
             self, slot: Slot, named: Dict[str, PoseStamped], path: Path,
-            metrics: PathMetrics) -> Tuple[bool, str]:
+            metrics: PathMetrics,
+            unknown_shadow_pose: Optional[PoseStamped] = None
+            ) -> Tuple[bool, str]:
         if metrics.first_reverse_index < 0:
             return False, 'no reverse segment'
         maximum_cusps = int(self.get_parameter('maximum_cusps').value)
@@ -3649,6 +6412,22 @@ class AutoTParking(Node):
             return False, (
                 f'cusp count {metrics.cusp_count} exceeds safe maximum '
                 f'{maximum_cusps}')
+        wheel_base = float(self.get_parameter('wheel_base').value)
+        command_limit = float(self.get_parameter(
+            'maximum_command_steering_deg').value)
+        mechanical_limit = float(self.get_parameter(
+            'mechanical_steering_max_deg').value)
+        if command_limit <= 0.0 or command_limit > mechanical_limit:
+            return False, (
+                f'invalid steering contract: command {command_limit:.3f}deg '
+                f'mechanical {mechanical_limit:.3f}deg')
+        required_steering = required_steering_deg(
+            wheel_base, metrics.max_curvature)
+        if not steering_within_command_limit(
+                wheel_base, metrics.max_curvature, command_limit):
+            return False, (
+                f'steering limit exceeded: required_steering_deg='
+                f'{required_steering:.3f} limit_deg={command_limit:.3f}')
         minimum_radius = float(
             self.get_parameter('minimum_turning_radius').value)
         curvature_factor = float(
@@ -3675,7 +6454,41 @@ class AutoTParking(Node):
             'vehicle_center_x_offset').value)
         occupied_threshold = int(
             self.get_parameter('occupied_threshold').value)
-        start_pose = path.poses[0]
+        map_yaw = yaw_from_quaternion(map_msg.info.origin.orientation)
+        map_cos = math.cos(map_yaw)
+        map_sin = math.sin(map_yaw)
+        map_origin_x = map_msg.info.origin.position.x
+        map_origin_y = map_msg.info.origin.position.y
+        map_resolution = map_msg.info.resolution
+        map_width = map_msg.info.width
+        map_height = map_msg.info.height
+        map_data = map_msg.data
+        cost_yaw = yaw_from_quaternion(costmap.metadata.origin.orientation)
+        cost_cos = math.cos(cost_yaw)
+        cost_sin = math.sin(cost_yaw)
+        cost_origin_x = costmap.metadata.origin.position.x
+        cost_origin_y = costmap.metadata.origin.position.y
+        cost_resolution = costmap.metadata.resolution
+        cost_width = costmap.metadata.size_x
+        cost_height = costmap.metadata.size_y
+        cost_data = costmap.data
+
+        def cost_cell(
+                x: float, y: float) -> Optional[Tuple[int, int]]:
+            dx = x - cost_origin_x
+            dy = y - cost_origin_y
+            col = math.floor(
+                (cost_cos * dx + cost_sin * dy) / cost_resolution)
+            row = math.floor(
+                (-cost_sin * dx + cost_cos * dy) / cost_resolution)
+            if not (0 <= col < cost_width and 0 <= row < cost_height):
+                return None
+            index = row * cost_width + col
+            return index, int(cost_data[index])
+
+        start_pose = (
+            unknown_shadow_pose
+            if unknown_shadow_pose is not None else path.poses[0])
         start_position = start_pose.pose.position
         start_yaw = yaw_from_quaternion(start_pose.pose.orientation)
         start_cos = math.cos(start_yaw)
@@ -3694,11 +6507,28 @@ class AutoTParking(Node):
                 <= center_x + 0.5 * length + start_shadow_margin
                 and abs(local_y) <= 0.5 * width + start_shadow_margin)
 
+        footprint_started = time.monotonic()
+
+        def footprint_result(valid: bool, reason: str) -> Tuple[bool, str]:
+            self._timing_add(
+                'footprint_validation_ms',
+                (time.monotonic() - footprint_started) * 1000.0)
+            return valid, reason
+
+        local_samples = np.asarray(
+            self._footprint_local_points(length, width), dtype=np.float64)
+        local_sample_x = local_samples[:, 0]
+        local_sample_y = local_samples[:, 1]
+        map_array = np.asarray(map_data, dtype=np.int16)
+        cost_array = np.asarray(cost_data, dtype=np.uint8)
+
         for index, pose in enumerate(path.poses):
-            center_cost = self._cost_value(
-                costmap, pose.pose.position.x, pose.pose.position.y)
-            if center_cost is None:
-                return False, f'path center index {index} is outside costmap'
+            center_cell = cost_cell(
+                pose.pose.position.x, pose.pose.position.y)
+            if center_cell is None:
+                return footprint_result(
+                    False, f'path center index {index} is outside costmap')
+            center_cost = center_cell[1]
             # The stationary vehicle self-occludes cells immediately under
             # its current footprint. Nav2 has already accepted this live pose
             # as the path start, so allow UNKNOWN only at a sample point that
@@ -3710,23 +6540,77 @@ class AutoTParking(Node):
             if (center_cost == 255
                     and not inside_start_footprint(
                         pose.pose.position.x, pose.pose.position.y)):
-                return False, f'path center index {index} is unknown'
+                return footprint_result(
+                    False, f'path center index {index} is unknown')
             if 253 <= center_cost <= 254:
-                return False, f'path center index {index} is lethal/inscribed'
-            for x, y in self._footprint_samples(pose, length, width):
-                map_value = self._occupancy_value(map_msg, x, y)
-                cost_value = self._cost_value(costmap, x, y)
-                if map_value is None or cost_value is None:
-                    return False, f'footprint index {index} is outside map bounds'
-                if (cost_value == 255
-                        and not inside_start_footprint(x, y)):
-                    return False, (
+                return footprint_result(
+                    False,
+                    f'path center index {index} is lethal/inscribed')
+            pose_yaw = yaw_from_quaternion(pose.pose.orientation)
+            pose_cos = math.cos(pose_yaw)
+            pose_sin = math.sin(pose_yaw)
+            sample_x = (
+                pose.pose.position.x
+                + pose_cos * local_sample_x - pose_sin * local_sample_y)
+            sample_y = (
+                pose.pose.position.y
+                + pose_sin * local_sample_x + pose_cos * local_sample_y)
+
+            map_dx = sample_x - map_origin_x
+            map_dy = sample_y - map_origin_y
+            map_cols = np.floor(
+                (map_cos * map_dx + map_sin * map_dy)
+                / map_resolution).astype(np.int64)
+            map_rows = np.floor(
+                (-map_sin * map_dx + map_cos * map_dy)
+                / map_resolution).astype(np.int64)
+            cost_dx = sample_x - cost_origin_x
+            cost_dy = sample_y - cost_origin_y
+            cost_cols = np.floor(
+                (cost_cos * cost_dx + cost_sin * cost_dy)
+                / cost_resolution).astype(np.int64)
+            cost_rows = np.floor(
+                (-cost_sin * cost_dx + cost_cos * cost_dy)
+                / cost_resolution).astype(np.int64)
+            outside = (
+                (map_cols < 0) | (map_cols >= map_width)
+                | (map_rows < 0) | (map_rows >= map_height)
+                | (cost_cols < 0) | (cost_cols >= cost_width)
+                | (cost_rows < 0) | (cost_rows >= cost_height))
+            if np.any(outside):
+                return footprint_result(
+                    False,
+                    f'footprint index {index} is outside map bounds')
+
+            map_values = map_array[map_rows * map_width + map_cols]
+            cost_values = cost_array[cost_rows * cost_width + cost_cols]
+            unknown = cost_values == 255
+            if np.any(unknown):
+                start_dx = sample_x - start_position.x
+                start_dy = sample_y - start_position.y
+                start_local_x = start_cos * start_dx + start_sin * start_dy
+                start_local_y = -start_sin * start_dx + start_cos * start_dy
+                inside_start = (
+                    (start_local_x >= center_x - 0.5 * length
+                     - start_shadow_margin)
+                    & (start_local_x <= center_x + 0.5 * length
+                       + start_shadow_margin)
+                    & (np.abs(start_local_y)
+                       <= 0.5 * width + start_shadow_margin))
+                bad_unknown = unknown & ~inside_start
+                if np.any(bad_unknown):
+                    point_index = int(np.flatnonzero(bad_unknown)[0])
+                    return footprint_result(False, (
                         f'footprint index {index} reaches unknown at '
-                        f'({x:.3f},{y:.3f}); map={map_value} '
-                        f'cost={cost_value}')
-                if map_value >= occupied_threshold or cost_value == 254:
-                    return False, f'footprint index {index} overlaps obstacle'
-        return True, 'valid'
+                        f'({sample_x[point_index]:.3f},'
+                        f'{sample_y[point_index]:.3f}); '
+                        f'map={int(map_values[point_index])} cost=255'))
+            obstacle = (
+                (map_values >= occupied_threshold) | (cost_values == 254))
+            if np.any(obstacle):
+                return footprint_result(
+                    False, f'footprint index {index} overlaps obstacle')
+        return footprint_result(True, 'valid')
 
     def _path_clears_slot_walls(
             self, slot: Slot, path: Path) -> Tuple[bool, str]:
@@ -3886,24 +6770,40 @@ class AutoTParking(Node):
             return None
         return int(grid.data[row * grid.metadata.size_x + col])
 
-    def _footprint_samples(
-            self, pose: PoseStamped, length: float, width: float,
+    def _footprint_local_points(
+            self, length: float, width: float,
             edge_only: bool = False) -> List[Tuple[float, float]]:
         resolution = 0.05
         half_length = 0.5 * length
         half_width = 0.5 * width
         center_x = float(self.get_parameter(
             'vehicle_center_x_offset').value)
-        nx = max(2, math.ceil(length / resolution))
-        ny = max(2, math.ceil(width / resolution))
-        local_points = []
-        for ix in range(nx + 1):
-            for iy in range(ny + 1):
-                if edge_only and ix not in (0, nx) and iy not in (0, ny):
-                    continue
-                local_points.append((
-                    center_x - half_length + length * ix / nx,
-                    -half_width + width * iy / ny))
+        cache = getattr(self, '_footprint_local_cache', None)
+        if cache is None:
+            cache = {}
+            self._footprint_local_cache = cache
+        key = (length, width, center_x, edge_only)
+        local_points = cache.get(key)
+        if local_points is None:
+            nx = max(2, math.ceil(length / resolution))
+            ny = max(2, math.ceil(width / resolution))
+            local_points = []
+            for ix in range(nx + 1):
+                for iy in range(ny + 1):
+                    if (edge_only and ix not in (0, nx)
+                            and iy not in (0, ny)):
+                        continue
+                    local_points.append((
+                        center_x - half_length + length * ix / nx,
+                        -half_width + width * iy / ny))
+            cache[key] = local_points
+        return local_points
+
+    def _footprint_samples(
+            self, pose: PoseStamped, length: float, width: float,
+            edge_only: bool = False) -> List[Tuple[float, float]]:
+        local_points = self._footprint_local_points(
+            length, width, edge_only)
         yaw = yaw_from_quaternion(pose.pose.orientation)
         cosine = math.cos(yaw)
         sine = math.sin(yaw)
@@ -3943,14 +6843,16 @@ class AutoTParking(Node):
                     '/lidar_wheel for a forward right turn, got '
                     f'{first_wheel:+d}')
                 return False
+        command_limit = float(self.get_parameter(
+            'maximum_command_steering_deg').value)
         self._log_info(
             '[T-PARK][EXIT STEERING SIGN] result=PASS '
             'geometry=RIGHT ros_angular_z=negative '
             'ros_steering=negative lidar_wheel=positive '
             f'first_major_lidar_wheel={first_wheel:+d} '
             f'max_abs_lidar_wheel={stats["max_abs_lidar_wheel"]:.0f}deg '
-            'limit=27deg')
-        return stats['max_abs_lidar_wheel'] <= 27.0
+            f'limit={command_limit:.0f}deg')
+        return stats['max_abs_lidar_wheel'] <= command_limit
 
     @staticmethod
     def _direction_segments(
@@ -4118,6 +7020,7 @@ class AutoTParking(Node):
                 float(start_real_odom.pose.pose.position.y)
                 if start_real_odom is not None else float('nan')),
             'lidar_wheel_saturation_samples': 0,
+            'lidar_wheel_over_limit_samples': 0,
             'lidar_wheel_saturation_events': 0,
             'lidar_wheel_saturation_active': False,
             'lidar_wheel_sign_reversals': 0,
@@ -4215,6 +7118,8 @@ class AutoTParking(Node):
             f'lidar_wheel_saturation_samples='
             f'{stats["lidar_wheel_saturation_samples"]}/'
             f'{stats["lidar_wheel_samples"]} '
+            f'lidar_wheel_over_limit_samples='
+            f'{stats["lidar_wheel_over_limit_samples"]} '
             f'saturation_ratio={saturation_ratio:.3f}% '
             f'saturation_events={stats["lidar_wheel_saturation_events"]} '
             f'steering_sign_reversals='
@@ -4270,6 +7175,12 @@ class AutoTParking(Node):
             segment_path = self._fresh_segment_path(path, segment)
             self._begin_segment_monitor(
                 run_number - 1, segment, segment_path, monitor_slot)
+            if self.bench_mode:
+                self._log_info(
+                    '[BENCH SEGMENT START]\n'
+                    f'index={run_number - 1}\n'
+                    f'direction={"REVERSE" if segment.direction < 0 else "FORWARD"}\n'
+                    f'poses={segment.first_pose}..{segment.last_pose}')
             self._log_info(
                 f'[T-PARK][SEGMENT {run_number - 1}]\n'
                 f'direction = '
@@ -4281,6 +7192,12 @@ class AutoTParking(Node):
                 segment_path, run_number, len(segments), segment.direction,
                 monitor_slot=monitor_slot, forward_exit=forward_exit)
             self._finish_segment_monitor()
+            if self.bench_mode:
+                self._log_info(
+                    '[BENCH SEGMENT END]\n'
+                    f'index={run_number - 1}\n'
+                    f'direction={"REVERSE" if segment.direction < 0 else "FORWARD"}\n'
+                    f'reason={"completed" if succeeded else "failed"}')
             if not succeeded:
                 return False
             if monitor_slot is not None and self.parking_wheels_inside:
@@ -4575,7 +7492,12 @@ class AutoTParking(Node):
             period = float(self.get_parameter('wheel_check_period').value)
             required = int(self.get_parameter(
                 'wheel_inside_confirm_count').value)
-            confirmation_deadline = time.monotonic() + period * (required + 2)
+            # Executor/logging jitter can make nominal 100 ms checks arrive at
+            # roughly 200 ms intervals.  Keep the configured sample count,
+            # but give the stationary check a bounded window large enough to
+            # collect every sample before declaring a valid endpoint failed.
+            confirmation_deadline = time.monotonic() + max(
+                2.0, period * (required + 2))
             self._log_info(
                 'parking FollowPath reached endpoint; completing existing '
                 f'all-wheel-inside confirmation ({required} samples)')
@@ -4863,27 +7785,18 @@ class AutoTParking(Node):
             f'result={"PASS" if valid else "FAIL"}')
         return valid
 
-    def _verify_entrance_return(self) -> Tuple[float, float]:
+    def _verify_exit_goal_reached(self) -> Tuple[float, float]:
         current = self._current_map_pose()
-        if current is None or self.course_entrance_pose is None:
+        exit_goal = self._configured_exit_goal()
+        if current is None or exit_goal is None:
             return float('inf'), float('inf')
-        entrance = self.course_entrance_pose.pose
-        # Position must match the real, originally-captured entrance point.
-        # Heading must not: a forward-only vehicle returning along the same
-        # single lane necessarily arrives facing opposite to its original
-        # outbound heading, so compare against the planned approach heading
-        # for this exit (direction of travel into the entrance) instead of
-        # the outbound spawn yaw.
-        expected_pose = self.forward_exit_poses.get('course_entrance')
-        expected_orientation = (
-            expected_pose.pose.orientation if expected_pose is not None
-            else entrance.orientation)
+        goal = exit_goal.pose
         return (
             math.hypot(
-                current[0] - entrance.position.x,
-                current[1] - entrance.position.y),
+                current[0] - goal.position.x,
+                current[1] - goal.position.y),
             abs(normalize_angle(
-                current[2] - yaw_from_quaternion(expected_orientation))),
+                current[2] - yaw_from_quaternion(goal.orientation))),
         )
 
     def _confirm_motion_stop(self, context: str) -> bool:
@@ -4941,37 +7854,46 @@ class AutoTParking(Node):
         with self.data_lock:
             self.bench_consecutive_zero_drive_samples = 0
             self.bench_consecutive_zero_wheel_samples = 0
+            self.bench_consecutive_stop_false_samples = 0
         self._emergency_stop(final=False, emergency=False)
         deadline = time.monotonic() + timeout
         drive = float('inf')
         wheel = 999
+        stop = True
         drive_samples = 0
         wheel_samples = 0
+        stop_samples = 0
         while time.monotonic() < deadline and not self._abort_requested():
             now = time.monotonic()
             with self.data_lock:
                 drive = self.last_lidar_drive
                 wheel = self.last_lidar_wheel
+                stop = self.last_lidar_stop
                 drive_samples = self.bench_consecutive_zero_drive_samples
                 wheel_samples = self.bench_consecutive_zero_wheel_samples
+                stop_samples = self.bench_consecutive_stop_false_samples
                 fresh = (
                     now - self.lidar_drive_received_at < 1.0
-                    and now - self.lidar_wheel_received_at < 1.0)
-            if (fresh and abs(drive) < 1.0e-6 and wheel == 0
-                    and drive_samples >= 3 and wheel_samples >= 3):
+                    and now - self.lidar_wheel_received_at < 1.0
+                    and now - self.lidar_stop_received_at < 1.0)
+            if (fresh and abs(drive) < 1.0e-6 and wheel == 0 and not stop
+                    and drive_samples >= 3 and wheel_samples >= 3
+                    and stop_samples >= 3):
                 self._log_info(
                     f'[T-PARK][{label}] result=PASS '
-                    f'drive={drive:+.1f} wheel={wheel:+d} '
+                    f'drive={drive:+.1f} wheel={wheel:+d} stop=false '
                     f'drive_zero_samples={drive_samples} '
-                    f'wheel_zero_samples={wheel_samples}')
+                    f'wheel_zero_samples={wheel_samples} '
+                    f'stop_false_samples={stop_samples}')
                 return True
             if not self._interruptible_sleep(0.05, stop_on_cancel=False):
                 return False
         self._log_error(
             f'[T-PARK][{label}] result=FAIL '
-            f'drive={drive:+.1f} wheel={wheel:+d} '
+            f'drive={drive:+.1f} wheel={wheel:+d} stop={str(stop).lower()} '
             f'drive_zero_samples={drive_samples} '
-            f'wheel_zero_samples={wheel_samples}')
+            f'wheel_zero_samples={wheel_samples} '
+            f'stop_false_samples={stop_samples}')
         return False
 
     def _publish_plan(self, candidate: PlanCandidate) -> None:
@@ -4979,6 +7901,13 @@ class AutoTParking(Node):
             return
         candidate.path.header.stamp = self.get_clock().now().to_msg()
         self._safe_publish(self.path_publisher, candidate.path)
+        approach = candidate.approach_path
+        if approach is None:
+            approach = Path()
+            approach.header = candidate.path.header
+        else:
+            approach.header.stamp = candidate.path.header.stamp
+        self._safe_publish(self.approach_publisher, approach)
         self._log_info(
             f'[T-PARK] path generated: slot={candidate.slot.name} '
             f'poses={len(candidate.path.poses)}')
@@ -5007,7 +7936,7 @@ class AutoTParking(Node):
             'slot_forward_clear': ColorRGBA(r=0.1, g=0.6, b=1.0, a=0.9),
             'right_turn_entry': ColorRGBA(r=1.0, g=0.7, b=0.0, a=0.9),
             'lane_merge': ColorRGBA(r=1.0, g=0.25, b=0.25, a=0.9),
-            'course_entrance': ColorRGBA(r=0.8, g=0.2, b=1.0, a=0.9),
+            'exit_goal': ColorRGBA(r=0.8, g=0.2, b=1.0, a=0.9),
         }
         stamp = self.get_clock().now().to_msg()
         for marker_id, (name, pose) in enumerate(candidate.named_poses.items()):
@@ -5032,6 +7961,7 @@ class AutoTParking(Node):
         marker_id = 0
         colors = {
             'approach': ColorRGBA(r=0.1, g=0.5, b=1.0, a=0.9),
+            'approach_recenter': ColorRGBA(r=0.0, g=0.9, b=0.9, a=0.9),
             'staging': ColorRGBA(r=0.1, g=0.5, b=1.0, a=0.9),
             'setup': ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.9),
             'entry': ColorRGBA(r=0.8, g=0.2, b=1.0, a=0.9),
@@ -5132,12 +8062,12 @@ class AutoTParking(Node):
     def _fail(self, reason: str) -> None:
         self._cancel_active_goals()
         if self.execute_path:
-            self._emergency_stop()
+            self._emergency_stop(emergency=self.bench_mode)
         self._publish_status('FAILED', reason)
 
     def _cancelled(self) -> None:
         self._cancel_active_goals()
-        self._emergency_stop()
+        self._emergency_stop(emergency=self.bench_mode)
         self._publish_status('CANCELLED')
 
 

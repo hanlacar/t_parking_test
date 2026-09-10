@@ -38,12 +38,13 @@ parallel_in_t_slot:
     vehicle_length: 1.33
     vehicle_width: 0.78
     body_center_x: 0.020
-    wheel_base: 0.77
-    wheel_track: 0.67
-    steering_limit_deg: 27.0
-    # 0.77 / tan(27 deg) = 1.511 m. Both planning radii remain above it.
-    minimum_turning_radius: 1.52
-    entry_turning_radius: 1.70
+    wheel_base: 0.73
+    front_wheel_track: 0.775
+    rear_wheel_track: 0.785
+    steering_limit_deg: 22.0
+    # 0.730 / tan(22 deg) = 1.8068 m; both radii retain a small margin.
+    minimum_turning_radius: 1.82
+    entry_turning_radius: 1.82
     curvature_tolerance_factor: 1.00
     footprint_clearance: 0.03
     occupied_threshold: 50
@@ -53,7 +54,7 @@ parallel_in_t_slot:
     road_max_y: 2.10
     road_center_y: 0.0
     lane_offset_candidates: [0.80, 0.70]
-    # R=1.70 m needs 3.398 m for the 3.515 m lateral move to slot centre.
+    # Candidate paths are validated against the 1.82 m physical radius.
     approach_offset_candidates: [3.50, 3.65, 3.80]
     entry_pose_spacing: 0.05
     entry_loop_length_factor: 2.2
@@ -79,7 +80,7 @@ parallel_in_t_slot:
     parked_yaw_tolerance: 0.20
     wheel_inside_confirm_count: 5
     wheel_check_period: 0.10
-    wheel_radius: 0.14
+    wheel_radius: 0.135
     wheel_width: 0.11
     wheel_frames:
       - "front_left_wheel_link"
